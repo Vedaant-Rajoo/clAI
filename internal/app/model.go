@@ -24,6 +24,7 @@ type Model struct {
 	intent      string
 	command     string
 	explanation string
+	accepted    bool
 	context     machinecontext.Context
 	safety      safety.Result
 	err         error
@@ -40,6 +41,14 @@ func (m Model) Init() tea.Cmd {
 	return textinput.Blink
 }
 
+func (m Model) Accepted() bool {
+	return m.accepted
+}
+
+func (m Model) Command() string {
+	return m.command
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
@@ -51,6 +60,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			if m.screen == screenInput {
 				m.intent = m.input.Value()
+				m.accepted = false
 				m.context = machinecontext.Collect()
 				result := compiler.Compile(m.intent)
 				m.command = result.Command
@@ -64,7 +74,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.safety.Decision == safety.Block {
 					return m, nil
 				}
-
+				m.accepted = true
 				return m, tea.Quit
 			}
 		case "b":

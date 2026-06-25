@@ -180,3 +180,6 @@ vite.config.ts.timestamp-*
 
 # Temp
 tmp
+
+# Local binary
+/clai

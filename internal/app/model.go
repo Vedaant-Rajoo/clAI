@@ -7,8 +7,10 @@ import (
 	"codeberg.org/newedia/clai/internal/compiler"
 	machinecontext "codeberg.org/newedia/clai/internal/context"
 	"codeberg.org/newedia/clai/internal/safety"
+	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 type Screen int
@@ -16,29 +18,43 @@ type Screen int
 const (
 	screenInput Screen = iota
 	screenReview
+	screenEditCommand
 )
 
 type Model struct {
-	input       textinput.Model
-	screen      Screen
-	intent      string
-	command     string
-	explanation string
-	accepted    bool
-	context     machinecontext.Context
-	safety      safety.Result
-	err         error
+	input        textinput.Model
+	commandInput textinput.Model
+	screen       Screen
+	intent       string
+	command      string
+	explanation  string
+	accepted     bool
+	context      machinecontext.Context
+	safety       safety.Result
+	err          error
 }
 
 func New() Model {
 	input := textinput.New()
 	input.Placeholder = "Describe what you want to do..."
+	configureCursor(&input)
 	input.Focus()
-	return Model{input: input, screen: screenInput}
+
+	commandInput := textinput.New()
+	commandInput.Placeholder = "Edit command..."
+	commandInput.Prompt = "$ "
+	configureCursor(&commandInput)
+
+	return Model{input: input, commandInput: commandInput, screen: screenInput}
 }
 
 func (m Model) Init() tea.Cmd {
-	return textinput.Blink
+	return nil
+}
+
+func configureCursor(input *textinput.Model) {
+	input.Cursor.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+	input.Cursor.SetMode(cursor.CursorStatic)
 }
 
 func (m Model) Accepted() bool {
@@ -55,7 +71,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "esc":
+		case "ctrl+c":
+			return m, tea.Quit
+		case "esc":
+			if m.screen == screenEditCommand {
+				m.commandInput.Blur()
+				m.screen = screenReview
+				return m, nil
+			}
+
 			return m, tea.Quit
 		case "enter":
 			if m.screen == screenInput {
@@ -77,16 +101,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.accepted = true
 				return m, tea.Quit
 			}
+
+			if m.screen == screenEditCommand {
+				m.command = m.commandInput.Value()
+				m.safety = safety.Evaluate(m.command)
+				m.commandInput.Blur()
+				m.screen = screenReview
+				return m, nil
+			}
 		case "b":
 			if m.screen == screenReview {
+				m.input.Focus()
 				m.screen = screenInput
 				return m, nil
+			}
+		case "e":
+			if m.screen == screenReview {
+				m.commandInput.SetValue(m.command)
+				cmd := m.commandInput.Focus()
+				m.screen = screenEditCommand
+				return m, cmd
 			}
 		}
 	}
 
 	if m.screen == screenInput {
 		m.input, cmd = m.input.Update(msg)
+	} else if m.screen == screenEditCommand {
+		m.commandInput, cmd = m.commandInput.Update(msg)
 	}
 
 	return m, cmd
@@ -101,6 +143,8 @@ func (m Model) View() string {
 		return m.inputView()
 	case screenReview:
 		return m.reviewView()
+	case screenEditCommand:
+		return m.editCommandView()
 	}
 	return ""
 }
@@ -111,6 +155,10 @@ func (m Model) inputView() string {
 
 func (m Model) reviewView() string {
 	return fmt.Sprintf("\n  Intent:\n    %s\n\n  Suggested command:\n    %s\n\n  Why:\n    %s\n\n  Context used:\n    %s\n\n  Safety:\n    %s\n    %s\n\n  %s\n", m.intent, m.command, m.explanation, strings.Join(contextLines(m.context), "\n    "), m.safety.Decision, strings.Join(m.safety.Reasons, "\n    "), reviewActions(m.safety.Decision))
+}
+
+func (m Model) editCommandView() string {
+	return "\n  Edit command:\n\n  " + m.commandInput.View() + "\n\n  enter save · esc discard\n"
 }
 
 func contextLines(c machinecontext.Context) []string {
@@ -135,8 +183,8 @@ func contextLines(c machinecontext.Context) []string {
 
 func reviewActions(decision safety.Decision) string {
 	if decision == safety.Block {
-		return "enter blocked · b back · esc cancel"
+		return "enter blocked · e edit · b back · esc cancel"
 	}
 
-	return "enter accept · b back · esc cancel"
+	return "enter accept · e edit · b back · esc cancel"
 }

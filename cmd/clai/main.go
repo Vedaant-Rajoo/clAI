@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 
@@ -9,7 +10,10 @@ import (
 )
 
 func main() {
-	p := tea.NewProgram(app.New(), tea.WithOutput(os.Stderr))
+	printCommand := flag.Bool("print-command", false, "print the accepted command to stdout")
+	flag.Parse()
+
+	p := tea.NewProgram(app.New(), tea.WithOutput(os.Stderr), tea.WithAltScreen())
 
 	finalModel, err := p.Run()
 	if err != nil {
@@ -18,7 +22,7 @@ func main() {
 	}
 
 	model, ok := finalModel.(app.Model)
-	if ok && model.Accepted() {
+	if *printCommand && ok && model.Accepted() {
 		fmt.Println(model.Command())
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"codeberg.org/newedia/clai/internal/compiler"
 	machinecontext "codeberg.org/newedia/clai/internal/context"
 	"codeberg.org/newedia/clai/internal/safety"
+	"codeberg.org/newedia/clai/internal/validate"
 	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -31,6 +32,7 @@ type Model struct {
 	accepted     bool
 	context      machinecontext.Context
 	safety       safety.Result
+	validation   validate.Result
 	err          error
 }
 
@@ -90,12 +92,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.command = result.Command
 				m.explanation = result.Explanation
 				m.safety = safety.Evaluate(m.command)
+				m.validation = validate.Command(m.command)
 				m.screen = screenReview
 				return m, nil
 			}
 
 			if m.screen == screenReview {
-				if m.safety.Decision == safety.Block {
+				if m.safety.Decision == safety.Block || !m.validation.Valid {
 					return m, nil
 				}
 				m.accepted = true
@@ -105,6 +108,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.screen == screenEditCommand {
 				m.command = m.commandInput.Value()
 				m.safety = safety.Evaluate(m.command)
+				m.validation = validate.Command(m.command)
 				m.commandInput.Blur()
 				m.screen = screenReview
 				return m, nil
@@ -154,7 +158,7 @@ func (m Model) inputView() string {
 }
 
 func (m Model) reviewView() string {
-	return fmt.Sprintf("\n  Intent:\n    %s\n\n  Suggested command:\n    %s\n\n  Why:\n    %s\n\n  Context used:\n    %s\n\n  Safety:\n    %s\n    %s\n\n  %s\n", m.intent, m.command, m.explanation, strings.Join(contextLines(m.context), "\n    "), m.safety.Decision, strings.Join(m.safety.Reasons, "\n    "), reviewActions(m.safety.Decision))
+	return fmt.Sprintf("\n  Intent:\n    %s\n\n  Suggested command:\n    %s\n\n  Why:\n    %s\n\n  Context used:\n    %s\n\n  Validation:\n    %s\n\n  Safety:\n    %s\n    %s\n\n  %s\n", m.intent, m.command, m.explanation, strings.Join(contextLines(m.context), "\n    "), validationText(m.validation), m.safety.Decision, strings.Join(m.safety.Reasons, "\n    "), reviewActions(m.safety.Decision, m.validation.Valid))
 }
 
 func (m Model) editCommandView() string {
@@ -181,7 +185,19 @@ func contextLines(c machinecontext.Context) []string {
 	}
 }
 
-func reviewActions(decision safety.Decision) string {
+func validationText(result validate.Result) string {
+	if result.Valid {
+		return "valid"
+	}
+
+	return "invalid\n    " + strings.Join(result.Reasons, "\n    ")
+}
+
+func reviewActions(decision safety.Decision, valid bool) string {
+	if !valid {
+		return "enter invalid · e edit · b back · esc cancel"
+	}
+
 	if decision == safety.Block {
 		return "enter blocked · e edit · b back · esc cancel"
 	}

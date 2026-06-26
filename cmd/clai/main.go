@@ -6,10 +6,12 @@ import (
 	"os"
 
 	"codeberg.org/newedia/clai/internal/app"
+	"github.com/atotto/clipboard"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 func main() {
+	copyCommand := flag.Bool("copy", false, "copy the accepted command to the clipboard")
 	printCommand := flag.Bool("print-command", false, "print the accepted command to stdout")
 	flag.Parse()
 
@@ -22,7 +24,19 @@ func main() {
 	}
 
 	model, ok := finalModel.(app.Model)
-	if *printCommand && ok && model.Accepted() {
-		fmt.Println(model.Command())
+	if !ok || !model.Accepted() {
+		return
+	}
+
+	command := model.Command()
+	if *copyCommand {
+		if err := clipboard.WriteAll(command); err != nil {
+			fmt.Fprintf(os.Stderr, "clai: copy command: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	if *printCommand {
+		fmt.Println(command)
 	}
 }

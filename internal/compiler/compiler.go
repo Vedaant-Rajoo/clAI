@@ -1,47 +1,87 @@
 package compiler
 
-import "strings"
+import (
+	"strings"
+
+	machinecontext "codeberg.org/newedia/clai/internal/context"
+)
+
+type Request struct {
+	Intent  string
+	Context machinecontext.Context
+}
 
 type Result struct {
 	Command     string
 	Explanation string
 }
 
-func Compile(intent string) Result {
-	normalized := strings.ToLower(intent)
+func Compile(request Request) Result {
+	normalized := strings.ToLower(request.Intent)
 
 	switch {
-	case containsAny(normalized, "git status", "repo status", "repository status", "working tree", "changed files", "changes"):
+	case containsAny(normalized, "git status", "repo status", "repository status", "working tree", "changed files", "changes", "status"):
+		if !request.Context.GitRepository {
+			return Result{
+				Command:     "ls -la",
+				Explanation: "This directory is not a Git repository, so the compiler suggested listing local files instead of Git status.",
+			}
+		}
+
 		return Result{
 			Command:     "git status",
-			Explanation: "Shows the current state of the Git working tree.",
+			Explanation: "Uses Git because the current directory is inside a Git repository.",
 		}
 	case containsAny(normalized, "git diff", "what changed", "show diff", "unstaged changes"):
+		if !request.Context.GitRepository {
+			return noGitRepositoryResult()
+		}
+
 		return Result{
 			Command:     "git diff",
-			Explanation: "Shows unstaged changes in the current Git repository.",
+			Explanation: "Shows unstaged changes because the current directory is inside a Git repository.",
 		}
 	case containsAny(normalized, "staged", "cached diff", "diff cached"):
+		if !request.Context.GitRepository {
+			return noGitRepositoryResult()
+		}
+
 		return Result{
 			Command:     "git diff --cached",
 			Explanation: "Shows staged changes that would be included in the next commit.",
 		}
 	case containsAny(normalized, "git log", "commit history", "recent commits", "history"):
+		if !request.Context.GitRepository {
+			return noGitRepositoryResult()
+		}
+
 		return Result{
 			Command:     "git log --oneline -10",
 			Explanation: "Shows the ten most recent commits in a compact format.",
 		}
 	case containsAny(normalized, "current branch", "git branch", "branch name"):
+		if !request.Context.GitRepository {
+			return noGitRepositoryResult()
+		}
+
 		return Result{
 			Command:     "git branch --show-current",
-			Explanation: "Prints the current Git branch name.",
+			Explanation: "Prints the current Git branch because the current directory is inside a Git repository.",
 		}
 	case containsAny(normalized, "git remote", "remotes", "remote url"):
+		if !request.Context.GitRepository {
+			return noGitRepositoryResult()
+		}
+
 		return Result{
 			Command:     "git remote -v",
 			Explanation: "Lists configured Git remotes and their URLs.",
 		}
 	case containsAny(normalized, "tags", "git tags"):
+		if !request.Context.GitRepository {
+			return noGitRepositoryResult()
+		}
+
 		return Result{
 			Command:     "git tag --list",
 			Explanation: "Lists Git tags in the current repository.",
@@ -166,6 +206,13 @@ func Compile(intent string) Result {
 			Command:     "echo \"No suggestion available yet\"",
 			Explanation: "No fake compiler rule matched this intent.",
 		}
+	}
+}
+
+func noGitRepositoryResult() Result {
+	return Result{
+		Command:     "echo \"No Git repository detected\"",
+		Explanation: "The requested Git command needs a Git repository, but the collected context says this directory is not inside one.",
 	}
 }
 

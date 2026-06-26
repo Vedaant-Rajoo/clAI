@@ -88,7 +88,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.intent = m.input.Value()
 				m.accepted = false
 				m.context = machinecontext.Collect()
-				result := compiler.Compile(m.intent)
+				result := compiler.Compile(compiler.Request{Intent: m.intent, Context: m.context})
 				m.command = result.Command
 				m.explanation = result.Explanation
 				m.safety = safety.Evaluate(m.command)

@@ -10,10 +10,18 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+var version = "dev"
+
 func main() {
 	copyCommand := flag.Bool("copy", false, "copy the accepted command to the clipboard")
 	printCommand := flag.Bool("print-command", false, "print the accepted command to stdout")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 
 	p := tea.NewProgram(app.New(), tea.WithOutput(os.Stderr), tea.WithAltScreen())
 

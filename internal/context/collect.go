@@ -12,6 +12,7 @@ type Context struct {
 	Shell            string
 	OS               string
 	GitRepository    bool
+	GitRoot          string
 	GitBranch        string
 }
 
@@ -23,8 +24,9 @@ func Collect() Context {
 
 	if wd, err := os.Getwd(); err == nil {
 		c.WorkingDirectory = wd
-		if _, branch, ok := gitInfo(wd); ok {
+		if root, branch, ok := gitInfo(wd); ok {
 			c.GitRepository = true
+			c.GitRoot = root
 			c.GitBranch = branch
 		}
 	}

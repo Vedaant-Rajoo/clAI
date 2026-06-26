@@ -22,6 +22,16 @@ const (
 	screenEditCommand
 )
 
+var (
+	baseStyle    = lipgloss.NewStyle().Padding(1, 2)
+	headerStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
+	commandStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Background(lipgloss.Color("235")).Padding(0, 1)
+	mutedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	allowStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	warnStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	blockStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+)
+
 type Model struct {
 	input        textinput.Model
 	commandInput textinput.Model
@@ -154,15 +164,37 @@ func (m Model) View() string {
 }
 
 func (m Model) inputView() string {
-	return "\n  What do you want to do?\n\n  " + m.input.View() + "\n\n  enter submit · esc quit\n"
+	return baseStyle.Render(strings.Join([]string{
+		headerStyle.Render("What do you want to do?"),
+		m.input.View(),
+		mutedStyle.Render("enter submit · esc quit"),
+	}, "\n\n"))
 }
 
 func (m Model) reviewView() string {
-	return fmt.Sprintf("\n  Intent:\n    %s\n\n  Suggested command:\n    %s\n\n  Why:\n    %s\n\n  Context used:\n    %s\n\n  Validation:\n    %s\n\n  Safety:\n    %s\n    %s\n\n  %s\n", m.intent, m.command, m.explanation, strings.Join(contextLines(m.context), "\n    "), validationText(m.validation), m.safety.Decision, strings.Join(m.safety.Reasons, "\n    "), reviewActions(m.safety.Decision, m.validation.Valid))
+	sections := []string{
+		section("Intent", m.intent),
+		section("Suggested command", commandStyle.Render(m.command)),
+		section("Why", m.explanation),
+		section("Context used", strings.Join(contextLines(m.context), "\n")),
+		section("Validation", validationText(m.validation)),
+		section("Safety", safetyText(m.safety)),
+		mutedStyle.Render(reviewActions(m.safety.Decision, m.validation.Valid)),
+	}
+
+	return baseStyle.Render(strings.Join(sections, "\n\n"))
 }
 
 func (m Model) editCommandView() string {
-	return "\n  Edit command:\n\n  " + m.commandInput.View() + "\n\n  enter save · esc discard\n"
+	return baseStyle.Render(strings.Join([]string{
+		headerStyle.Render("Edit command"),
+		m.commandInput.View(),
+		mutedStyle.Render("enter save · esc discard"),
+	}, "\n\n"))
+}
+
+func section(title, body string) string {
+	return headerStyle.Render(title) + "\n" + body
 }
 
 func contextLines(c machinecontext.Context) []string {
@@ -181,16 +213,42 @@ func contextLines(c machinecontext.Context) []string {
 		"shell: " + c.Shell,
 		"os: " + c.OS,
 		"git repo: " + gitRepo,
+		"git root: " + contextValue(c.GitRoot, "none"),
 		"git branch: " + branch,
 	}
 }
 
-func validationText(result validate.Result) string {
-	if result.Valid {
-		return "valid"
+func contextValue(value, fallback string) string {
+	if value == "" {
+		return fallback
 	}
 
-	return "invalid\n    " + strings.Join(result.Reasons, "\n    ")
+	return value
+}
+
+func validationText(result validate.Result) string {
+	if result.Valid {
+		return allowStyle.Render("valid")
+	}
+
+	return blockStyle.Render("invalid") + "\n" + strings.Join(result.Reasons, "\n")
+}
+
+func safetyText(result safety.Result) string {
+	return decisionStyle(result.Decision).Render(string(result.Decision)) + "\n" + strings.Join(result.Reasons, "\n")
+}
+
+func decisionStyle(decision safety.Decision) lipgloss.Style {
+	switch decision {
+	case safety.Allow:
+		return allowStyle
+	case safety.Warn:
+		return warnStyle
+	case safety.Block:
+		return blockStyle
+	default:
+		return mutedStyle
+	}
 }
 
 func reviewActions(decision safety.Decision, valid bool) string {

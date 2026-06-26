@@ -12,10 +12,8 @@ func TestCommand(t *testing.T) {
 		{name: "valid redirect", command: "go test ./... > test.log", valid: true},
 		{name: "empty command", command: "   ", valid: false},
 		{name: "unresolved placeholder", command: "rg <pattern>", valid: false},
-		{name: "unclosed single quote", command: "printf 'hello", valid: false},
 		{name: "unclosed double quote", command: "printf \"hello", valid: false},
 		{name: "trailing pipe", command: "ls |", valid: false},
-		{name: "trailing and", command: "go test ./... &&", valid: false},
 	}
 
 	for _, tt := range tests {

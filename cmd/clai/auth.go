@@ -30,8 +30,8 @@ const (
 // runAuth handles `clai auth <login|status|logout>`.
 func runAuth(args []string, apiKeyFlag string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: clai auth <login|status|logout> [--provider <name>]")
-		return 2
+		fmt.Fprintln(os.Stderr, "usage: clai auth <login|status|logout> [--provider <name>]\nRun 'clai auth help' for usage.")
+		return exitUsage
 	}
 
 	provider := "openrouter"
@@ -50,8 +50,8 @@ func runAuth(args []string, apiKeyFlag string) int {
 	case "logout":
 		return authLogout(provider)
 	default:
-		fmt.Fprintf(os.Stderr, "clai auth: unknown command %q\n", args[0])
-		return 2
+		fmt.Fprintf(os.Stderr, "clai auth: unknown command %q\nRun 'clai auth help' for usage.\n", args[0])
+		return exitUsage
 	}
 }
 
@@ -84,7 +84,7 @@ func authLogin(provider string) int {
 		return storeKey(provider, key)
 	default:
 		fmt.Fprintf(os.Stderr, "clai auth login: unknown provider %q (known: openrouter, anthropic, openai)\n", provider)
-		return 2
+		return exitUsage
 	}
 }
 

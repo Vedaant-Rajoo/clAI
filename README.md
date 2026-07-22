@@ -2,6 +2,16 @@
 
 Local-first command compiler TUI.
 
+## Commands
+
+- `clai auth` — manage provider credentials (login, status, logout)
+- `clai init` — print the shell integration script for fish, bash, or zsh
+- `clai version` — print the clai version
+
+Run `clai help` or `clai <command> help` for details. Running `clai` with no
+command starts the interactive TUI; `--copy` puts the accepted command on the
+clipboard and `--print-command` prints it to stdout.
+
 ## Shell Integration
 
 `clai` can install an interactive widget for Fish, Bash, or Zsh. The widget

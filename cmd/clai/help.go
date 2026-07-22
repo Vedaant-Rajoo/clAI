@@ -1,0 +1,156 @@
+package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+)
+
+// commandHelp is the single source of truth for per-command help pages.
+type commandHelp struct {
+	name    string
+	summary string // one-liner for the top-level command list
+	long    string // full page: Usage / description / Flags / Examples
+	hidden  bool   // excluded from the top-level list (internal commands)
+}
+
+var commands = []commandHelp{
+	{
+		name:    "auth",
+		summary: "Manage provider credentials (login, status, logout)",
+		long: `Manage provider credentials.
+
+Usage:
+  clai auth <login|status|logout> [--provider <name>]
+
+Subcommands:
+  login      Sign in (OpenRouter browser flow, or paste an API key)
+  status     Show whether credentials are configured and their source
+  logout     Remove stored credentials
+
+Flags:
+  --provider name    provider: openrouter (default) | anthropic | openai
+  --api-key key      API key override (status only)
+
+Examples:
+  clai auth login
+  clai auth status --provider openrouter
+  clai auth logout
+`,
+	},
+	{
+		name:    "init",
+		summary: "Print shell integration script for fish, bash, or zsh",
+		long: `Print the shell integration script for your shell.
+
+Usage:
+  clai init <fish|bash|zsh>
+
+The script binds a widget that opens clai and inserts the accepted
+command into your prompt line.
+
+Examples:
+  clai init fish | source
+  eval "$(clai init bash)"
+  eval "$(clai init zsh)"
+`,
+	},
+	{
+		name:    "version",
+		summary: "Print the clai version",
+		long: `Print the clai version.
+
+Usage:
+  clai version
+`,
+	},
+	{
+		name:    "widget",
+		summary: "Internal shell-adapter entry point",
+		hidden:  true,
+		long: `Internal shell-adapter entry point.
+
+This command is invoked by the shell scripts printed by "clai init";
+it is not meant to be run directly.
+
+Usage:
+  clai widget --shell <fish|bash|zsh> --result-file <path>
+
+Flags:
+  --shell name        active shell: fish | bash | zsh
+  --result-file path  caller-created file the accepted command is written to
+  --provider name     provider: rules | openrouter (default: rules, or $CLAI_PROVIDER)
+  --model name        model override for LLM providers
+  --api-key key       API key override for LLM providers
+  --fallback-rules    fall back to local rules when the provider errors
+
+Exit codes:
+  0  command accepted and written to the result file
+  1  error
+  2  usage error
+  3  cancelled by the user
+`,
+	},
+}
+
+func lookupCommand(name string) (commandHelp, bool) {
+	for _, c := range commands {
+		if c.name == name {
+			return c, true
+		}
+	}
+	return commandHelp{}, false
+}
+
+func printMainHelp(w io.Writer) {
+	fmt.Fprint(w, `clai - turn a natural-language request into a shell command
+
+Usage:
+  clai [flags]                start the interactive TUI
+  clai <command> [arguments]
+
+Commands:
+`)
+	for _, c := range commands {
+		if c.hidden {
+			continue
+		}
+		fmt.Fprintf(w, "  %-10s %s\n", c.name, c.summary)
+	}
+	fmt.Fprint(w, `
+Flags:
+  --copy             copy the accepted command to the clipboard
+  --print-command    print the accepted command to stdout
+  --provider name    provider: rules | openrouter (default: rules, or $CLAI_PROVIDER)
+  --model name       model override for LLM providers
+  --api-key key      API key override for LLM providers
+  --fallback-rules   fall back to local rules when the provider errors
+  --version          print version and exit
+
+Use "clai help <command>" or "clai <command> help" for more information.
+`)
+}
+
+func printCommandHelp(w io.Writer, c commandHelp) {
+	fmt.Fprint(w, c.long)
+}
+
+// runHelp handles `clai help [command]`.
+func runHelp(args []string) int {
+	if len(args) == 0 {
+		printMainHelp(os.Stdout)
+		return exitOK
+	}
+	c, ok := lookupCommand(args[0])
+	if !ok {
+		fmt.Fprintf(os.Stderr, "clai help: unknown command %q\nRun 'clai help' for usage.\n", args[0])
+		return exitUsage
+	}
+	printCommandHelp(os.Stdout, c)
+	return exitOK
+}
+
+// isHelpArg reports whether arg requests help in any accepted spelling.
+func isHelpArg(arg string) bool {
+	return arg == "help" || arg == "-h" || arg == "--help"
+}

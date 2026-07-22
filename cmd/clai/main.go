@@ -39,12 +39,21 @@ func main() {
 func run(args []string) int {
 	if len(args) > 0 {
 		switch args[0] {
+		case "help", "-h", "--help":
+			return runHelp(args[1:])
 		case "auth":
 			return runAuthCommand(args[1:])
 		case "init":
 			return runInit(args[1:])
+		case "version":
+			return runVersion(args[1:])
 		case "widget":
 			return runWidget(args[1:])
+		default:
+			if !strings.HasPrefix(args[0], "-") {
+				fmt.Fprintf(os.Stderr, "clai: unknown command %q\nRun 'clai help' for usage.\n", args[0])
+				return exitUsage
+			}
 		}
 	}
 
@@ -52,17 +61,40 @@ func run(args []string) int {
 }
 
 func runAuthCommand(args []string) int {
+	if len(args) > 0 && args[0] == "help" {
+		return runHelp([]string{"auth"})
+	}
 	fs := flag.NewFlagSet("auth", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	apiKey := fs.String("api-key", "", "API key override")
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return runHelp([]string{"auth"})
+		}
+		fmt.Fprintf(os.Stderr, "clai auth: %v\nRun 'clai auth help' for usage.\n", err)
 		return exitUsage
 	}
 	return runAuth(fs.Args(), *apiKey)
 }
 
+func runVersion(args []string) int {
+	if len(args) > 0 {
+		if isHelpArg(args[0]) {
+			return runHelp([]string{"version"})
+		}
+		fmt.Fprintf(os.Stderr, "clai version: unknown argument %q\nRun 'clai version help' for usage.\n", args[0])
+		return exitUsage
+	}
+	fmt.Println(version)
+	return exitOK
+}
+
 func runInit(args []string) int {
+	if len(args) == 1 && isHelpArg(args[0]) {
+		return runHelp([]string{"init"})
+	}
 	if len(args) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: clai init <fish|bash|zsh>")
+		fmt.Fprintln(os.Stderr, "usage: clai init <fish|bash|zsh>\nRun 'clai init help' for usage.")
 		return exitUsage
 	}
 
@@ -80,11 +112,17 @@ func runInit(args []string) int {
 
 func runInteractive(args []string) int {
 	fs := flag.NewFlagSet("clai", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	copyCommand := fs.Bool("copy", false, "copy the accepted command to the clipboard")
 	printCommand := fs.Bool("print-command", false, "print the accepted command to stdout")
 	showVersion := fs.Bool("version", false, "print version and exit")
 	providerName, model, apiKey, fallbackRules := providerFlagSet(fs)
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			printMainHelp(os.Stdout)
+			return exitOK
+		}
+		fmt.Fprintf(os.Stderr, "clai: %v\nRun 'clai help' for usage.\n", err)
 		return exitUsage
 	}
 
@@ -121,15 +159,23 @@ func runInteractive(args []string) int {
 }
 
 func runWidget(args []string) int {
+	if len(args) > 0 && args[0] == "help" {
+		return runHelp([]string{"widget"})
+	}
 	fs := flag.NewFlagSet("widget", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	shell := fs.String("shell", "", "active shell: fish | bash | zsh")
 	resultFile := fs.String("result-file", "", "caller-created result file")
 	providerName, model, apiKey, fallbackRules := providerFlagSet(fs)
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return runHelp([]string{"widget"})
+		}
+		fmt.Fprintf(os.Stderr, "clai widget: %v\nRun 'clai widget help' for usage.\n", err)
 		return exitUsage
 	}
 	if fs.NArg() != 0 || !validShell(*shell) || *resultFile == "" {
-		fmt.Fprintln(os.Stderr, "usage: clai widget --shell <fish|bash|zsh> --result-file <path>")
+		fmt.Fprintln(os.Stderr, "usage: clai widget --shell <fish|bash|zsh> --result-file <path>\nRun 'clai widget help' for usage.")
 		return exitUsage
 	}
 	if _, err := inspectWidgetResult(*resultFile); err != nil {

@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"strings"
 
-	"codeberg.org/newedia/clai/internal/compiler"
 	machinecontext "codeberg.org/newedia/clai/internal/context"
+	"codeberg.org/newedia/clai/internal/provider"
+	"codeberg.org/newedia/clai/internal/provider/rules"
 	"codeberg.org/newedia/clai/internal/safety"
 	"codeberg.org/newedia/clai/internal/validate"
 	"github.com/charmbracelet/bubbles/cursor"
@@ -35,6 +36,7 @@ var (
 type Model struct {
 	input        textinput.Model
 	commandInput textinput.Model
+	provider     provider.Provider
 	screen       Screen
 	intent       string
 	command      string
@@ -47,6 +49,10 @@ type Model struct {
 }
 
 func New() Model {
+	return NewWithProvider(rules.Provider{})
+}
+
+func NewWithProvider(p provider.Provider) Model {
 	input := textinput.New()
 	input.Placeholder = "Describe what you want to do..."
 	configureCursor(&input)
@@ -57,7 +63,7 @@ func New() Model {
 	commandInput.Prompt = "$ "
 	configureCursor(&commandInput)
 
-	return Model{input: input, commandInput: commandInput, screen: screenInput}
+	return Model{input: input, commandInput: commandInput, provider: p, screen: screenInput}
 }
 
 func (m Model) Init() tea.Cmd {
@@ -97,10 +103,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.screen == screenInput {
 				m.intent = m.input.Value()
 				m.accepted = false
+				m.err = nil
 				m.context = machinecontext.Collect()
-				result := compiler.Compile(compiler.Request{Intent: m.intent, Context: m.context})
-				m.command = result.Command
-				m.explanation = result.Explanation
+				candidates, err := m.provider.Compile(provider.Request{Intent: m.intent, Context: m.context})
+				if err != nil {
+					m.err = err
+					return m, nil
+				}
+				if len(candidates) == 0 {
+					m.command = `echo "No suggestion available yet"`
+					m.explanation = "The provider returned no candidates for this intent."
+				} else {
+					m.command = candidates[0].Command
+					m.explanation = candidates[0].Explanation
+				}
 				m.safety = safety.Evaluate(m.command)
 				m.validation = validate.Command(m.command)
 				m.screen = screenReview

@@ -29,9 +29,9 @@ source ~/.config/fish/config.fish
 ```
 
 The default binding is `ctrl-x ctrl-a`. Press it, enter an intent, review the
-suggested command, and accept it. The accepted command replaces the entire
-current buffer with the cursor at the end, but it is not run. Cancelling with
-`esc` or `ctrl-c` leaves the existing buffer unchanged.
+suggested command, and accept it. The accepted command is inserted at the
+cursor without running it, so anything already on the prompt is preserved.
+Cancelling with `esc` or `ctrl-c` leaves the existing buffer unchanged.
 
 ## Configuration
 

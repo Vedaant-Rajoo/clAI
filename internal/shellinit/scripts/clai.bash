@@ -23,9 +23,12 @@ __clai_widget() {
     command rm -f -- "$result_file"
 
     if ((widget_status == 0)) && [[ -n $result ]]; then
-        READLINE_LINE=$result
-        local LC_ALL=C
-        READLINE_POINT=${#READLINE_LINE}
+        # Insert at the cursor so any text already on the prompt is preserved.
+        # READLINE_POINT counts characters in multibyte locales; splice with
+        # substring expansion under the caller's locale to stay in character
+        # units.
+        READLINE_LINE=${READLINE_LINE:0:READLINE_POINT}$result${READLINE_LINE:READLINE_POINT}
+        READLINE_POINT=$((READLINE_POINT + ${#result}))
     fi
 
     if ((widget_status == 3)); then
@@ -36,8 +39,9 @@ __clai_widget() {
 
 # Bash 3.x has bind -x but does not expose writable READLINE_LINE and
 # READLINE_POINT. This helper is used by a Readline macro based on the same
-# compatibility technique as fzf: preserve the current buffer, run clai, and
-# replace the buffer only when this function prints an accepted command.
+# compatibility technique as fzf: stash the current buffer in the kill ring,
+# run clai, and yank the original text back before any accepted command so
+# existing prompt text is preserved.
 __clai_widget_bash3() {
     local clai_command=${CLAI_COMMAND:-clai}
     local tmpdir=/tmp
@@ -97,7 +101,7 @@ if [[ $- == *i* ]]; then
         elif [[ $__clai_bash_binding_in_use == true ]]; then
             printf 'clai: Bash binding %s is already in use; set CLAI_BASH_BINDING to another sequence\n' "$__clai_bash_binding" >&2
         elif ((BASH_VERSINFO[0] < 4)); then
-            bind -m emacs-standard '"'"$__clai_bash_binding"'": "\C-a\C-k`__clai_widget_bash3`\e\C-e\C-a\C-k\C-y"'
+            bind -m emacs-standard '"'"$__clai_bash_binding"'": "\C-a\C-k`__clai_widget_bash3`\e\C-e\C-a\C-y\C-e"'
             __CLAI_BASH_BOUND_KEY=$__clai_bash_binding
         else
             bind -x "\"$__clai_bash_binding\":__clai_widget"

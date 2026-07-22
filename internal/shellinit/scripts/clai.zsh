@@ -33,8 +33,8 @@ function __clai_widget() {
     command rm -f -- "$result_file"
 
     if ((widget_status == 0)) && [[ -n $result ]]; then
-        BUFFER=$result
-        CURSOR=${#BUFFER}
+        # Insert at the cursor so any text already on the prompt is preserved.
+        LBUFFER+=$result
     fi
 
     zle redisplay

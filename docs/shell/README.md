@@ -28,9 +28,12 @@ shell-specific pages for configuration examples:
 ## Interaction Model
 
 Press the binding, enter an intent, review the suggestion, and accept it. The
-integration replaces the complete current command-line buffer and places the
-cursor at the end. It does not append at the cursor and does not execute the
-command. You remain responsible for reviewing, editing, and pressing Enter.
+integration inserts the accepted command at the cursor, preserving any text
+already on the prompt, and does not execute the command. You remain
+responsible for reviewing, editing, and pressing Enter.
+
+Widget mode requires a Unix-like system with a controlling terminal; it is
+not supported on Windows.
 
 Cancelling with `esc` or `ctrl-c`, rejecting the suggestion, or leaving the TUI
 without accepting keeps the existing command-line buffer unchanged.

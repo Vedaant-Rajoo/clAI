@@ -139,7 +139,10 @@ func testShellAdapter(t *testing.T, shell shellCase, shellPath string, result ou
 
 	wantBuffer := original
 	if result.mode == "accept" {
-		wantBuffer = accepted
+		// The adapters insert the accepted command into the existing buffer
+		// rather than replacing it, preserving any text the user typed before
+		// invoking the widget.
+		wantBuffer = original + accepted
 	}
 
 	if shell.name == "bash" {

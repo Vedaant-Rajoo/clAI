@@ -1,8 +1,8 @@
 # Bash Integration
 
-The Bash integration opens `clai` from a Readline keybinding and replaces the
-complete Bash command-line buffer with an accepted command. It never executes
-the command automatically.
+The Bash integration opens `clai` from a Readline keybinding and inserts an
+accepted command into the current Bash command-line buffer at the cursor. It
+never executes the command automatically.
 
 See the [shell integration overview](README.md) for shared behavior and the
 internal adapter contract.
@@ -29,9 +29,9 @@ source ~/.bashrc
 ```
 
 The default binding is `ctrl-x ctrl-a`. Press it, enter an intent, review the
-suggested command, and accept it. The accepted command replaces the entire
-current buffer with the cursor at the end, but it is not run. Cancelling with
-`esc` or `ctrl-c` leaves the existing buffer unchanged.
+suggested command, and accept it. The accepted command is inserted at the
+cursor without running it, so anything already on the prompt is preserved.
+Cancelling with `esc` or `ctrl-c` leaves the existing buffer unchanged.
 
 ## Configuration
 

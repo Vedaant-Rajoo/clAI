@@ -34,8 +34,7 @@ function __clai_widget --description 'open the clai command widget'
     command rm -f -- "$result_file"
 
     if test $widget_status -eq 0; and test -n "$result"
-        commandline --replace -- "$result"
-        commandline --cursor (string length -- "$result")
+        commandline -i -- "$result"
     end
 
     commandline --function repaint

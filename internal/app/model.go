@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"strings"
+	"unicode"
 
 	machinecontext "codeberg.org/newedia/clai/internal/context"
 	"codeberg.org/newedia/clai/internal/provider"
@@ -37,6 +38,7 @@ type Model struct {
 	input        textinput.Model
 	commandInput textinput.Model
 	provider     provider.Provider
+	activeShell  string
 	screen       Screen
 	intent       string
 	command      string
@@ -49,10 +51,14 @@ type Model struct {
 }
 
 func New() Model {
-	return NewWithProvider(rules.Provider{})
+	return NewWithProviderAndShell(rules.Provider{}, "")
 }
 
 func NewWithProvider(p provider.Provider) Model {
+	return NewWithProviderAndShell(p, "")
+}
+
+func NewWithProviderAndShell(p provider.Provider, shell string) Model {
 	input := textinput.New()
 	input.Placeholder = "Describe what you want to do..."
 	configureCursor(&input)
@@ -63,7 +69,13 @@ func NewWithProvider(p provider.Provider) Model {
 	commandInput.Prompt = "$ "
 	configureCursor(&commandInput)
 
-	return Model{input: input, commandInput: commandInput, provider: p, screen: screenInput}
+	return Model{
+		input:        input,
+		commandInput: commandInput,
+		provider:     p,
+		activeShell:  shell,
+		screen:       screenInput,
+	}
 }
 
 func (m Model) Init() tea.Cmd {
@@ -104,7 +116,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.intent = m.input.Value()
 				m.accepted = false
 				m.err = nil
-				m.context = machinecontext.Collect()
+				m.context = machinecontext.CollectWithShell(m.activeShell)
 				candidates, err := m.provider.Compile(provider.Request{Intent: m.intent, Context: m.context})
 				if err != nil {
 					m.err = err
@@ -147,7 +159,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "e":
 			if m.screen == screenReview {
-				m.commandInput.SetValue(m.command)
+				m.commandInput.SetValue(terminalSafe(m.command))
 				cmd := m.commandInput.Focus()
 				m.screen = screenEditCommand
 				return m, cmd
@@ -166,7 +178,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) View() string {
 	if m.err != nil {
-		return fmt.Sprintf("\n  Error: %v\n\n", m.err)
+		return fmt.Sprintf("\n  Error: %s\n\n", terminalSafe(m.err.Error()))
 	}
 	switch m.screen {
 	case screenInput:
@@ -189,9 +201,9 @@ func (m Model) inputView() string {
 
 func (m Model) reviewView() string {
 	sections := []string{
-		section("Intent", m.intent),
-		section("Suggested command", commandStyle.Render(m.command)),
-		section("Why", m.explanation),
+		section("Intent", terminalSafe(m.intent)),
+		section("Suggested command", commandStyle.Render(terminalSafe(m.command))),
+		section("Why", terminalSafe(m.explanation)),
 		section("Context used", strings.Join(contextLines(m.context), "\n")),
 		section("Validation", validationText(m.validation)),
 		section("Safety", safetyText(m.safety)),
@@ -207,6 +219,27 @@ func (m Model) editCommandView() string {
 		m.commandInput.View(),
 		mutedStyle.Render("enter save · esc discard"),
 	}, "\n\n"))
+}
+
+func terminalSafe(value string) string {
+	var result strings.Builder
+	for _, r := range value {
+		if !unicode.IsControl(r) {
+			result.WriteRune(r)
+			continue
+		}
+		switch r {
+		case '\n':
+			result.WriteString(`\n`)
+		case '\r':
+			result.WriteString(`\r`)
+		case '\t':
+			result.WriteString(`\t`)
+		default:
+			fmt.Fprintf(&result, `\u{%04X}`, r)
+		}
+	}
+	return result.String()
 }
 
 func section(title, body string) string {
@@ -225,12 +258,12 @@ func contextLines(c machinecontext.Context) []string {
 	}
 
 	return []string{
-		"cwd: " + c.WorkingDirectory,
-		"shell: " + c.Shell,
-		"os: " + c.OS,
+		"cwd: " + terminalSafe(c.WorkingDirectory),
+		"shell: " + terminalSafe(c.Shell),
+		"os: " + terminalSafe(c.OS),
 		"git repo: " + gitRepo,
-		"git root: " + contextValue(c.GitRoot, "none"),
-		"git branch: " + branch,
+		"git root: " + terminalSafe(contextValue(c.GitRoot, "none")),
+		"git branch: " + terminalSafe(branch),
 	}
 }
 

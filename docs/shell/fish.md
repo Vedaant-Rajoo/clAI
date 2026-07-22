@@ -1,125 +1,106 @@
 # Fish Integration
 
-The Fish integration runs `clai --print-command`, captures the accepted command, and inserts it into the current prompt without executing it.
+The Fish integration opens `clai` from a keybinding and replaces the complete
+Fish command-line buffer with an accepted command. It never executes the
+command automatically.
 
-## Build
+See the [shell integration overview](README.md) for shared behavior and the
+internal adapter contract.
 
-From the project root:
+## Setup
 
-```sh
-go build -o clai ./cmd/clai
-```
-
-For development, add the project root to your Fish `PATH`:
+Make sure `clai` is on `PATH`, then load the integration in the current Fish
+session:
 
 ```fish
-set -gx PATH /Users/newedia/Development/clai $PATH
+clai init fish | source
 ```
+
+For permanent use, add that line to `~/.config/fish/config.fish`:
+
+```fish
+clai init fish | source
+```
+
+Restart Fish or reload the configuration:
+
+```fish
+source ~/.config/fish/config.fish
+```
+
+The default binding is `ctrl-x ctrl-a`. Press it, enter an intent, review the
+suggested command, and accept it. The accepted command replaces the entire
+current buffer with the cursor at the end, but it is not run. Cancelling with
+`esc` or `ctrl-c` leaves the existing buffer unchanged.
+
+## Configuration
+
+Set configuration variables before `clai init fish | source`.
+
+Use a custom Fish keybinding:
+
+```fish
+set -gx CLAI_FISH_BINDING '\cg'
+clai init fish | source
+```
+
+`CLAI_BINDING` remains accepted for compatibility with the earlier Fish
+integration, but `CLAI_FISH_BINDING` is preferred.
+
+Use a `clai` binary that is not on `PATH`:
+
+```fish
+set -gx CLAI_COMMAND $HOME/.local/bin/clai
+clai init fish | source
+```
+
+Add persistent variable settings before the initialization line in
+`~/.config/fish/config.fish`. If the selected key sequence is already bound,
+the integration reports the conflict rather than replacing the existing
+binding.
+
+## Migrating From the Old Fish Script
+
+If your Fish configuration manually sources a checkout or copied script, remove
+that line. For example, replace an entry shaped like:
+
+```fish
+source /path/to/clai/shell/fish/clai.fish
+```
+
+with the public initialization command:
+
+```fish
+clai init fish | source
+```
+
+The generated script is embedded in the installed binary, so setup no longer
+depends on the repository path. Existing `CLAI_COMMAND` and `CLAI_BINDING`
+settings continue to work, although `CLAI_FISH_BINDING` is now the preferred
+binding variable.
+
+## Troubleshooting
 
 Check that Fish can find the binary:
 
 ```fish
-type clai
+type -q clai; and echo 'clai is available'
 ```
 
-## Load The Integration
-
-For the current Fish session:
+Inspect the generated integration without loading it:
 
 ```fish
-source /Users/newedia/Development/clai/shell/fish/clai.fish
+clai init fish
 ```
 
-For permanent use, add that same line to:
-
-```text
-~/.config/fish/config.fish
-```
-
-## Keybinding
-
-The default binding is:
-
-```text
-ctrl-x ctrl-a
-```
-
-Press the keybinding, enter an intent in `clai`, review the suggested command, then accept it. The command is inserted into the Fish prompt but is not executed.
-
-## Configuration
-
-The integration reads two optional Fish variables.
-
-Use a custom `clai` binary path:
+Test the scripting-compatible stdout mode separately:
 
 ```fish
-set -gx CLAI_COMMAND /Users/newedia/Development/clai/clai
+set -l command_to_review (clai --print-command)
+printf '%s\n' "$command_to_review"
 ```
 
-Use a custom keybinding:
-
-```fish
-set -gx CLAI_BINDING \cg
-```
-
-Set those variables before sourcing the integration:
-
-```fish
-set -gx CLAI_COMMAND /Users/newedia/Development/clai/clai
-set -gx CLAI_BINDING \cg
-source /Users/newedia/Development/clai/shell/fish/clai.fish
-```
-
-## Manual Test
-
-Test the command output mode directly:
-
-```fish
-clai --print-command
-```
-
-Accept a command. It should print only the selected command after the TUI exits.
-
-Test Fish capture:
-
-```fish
-set -l cmd (clai --print-command)
-echo $cmd
-```
-
-If you accept `git status`, `echo $cmd` should print:
-
-```text
-git status
-```
-
-## Troubleshooting
-
-If the keybinding does nothing, reload the integration:
-
-```fish
-source /Users/newedia/Development/clai/shell/fish/clai.fish
-```
-
-If no command is inserted, make sure you accepted the command in the review screen. Cancelling with `esc` or `ctrl-c` inserts nothing.
-
-If Fish cannot find `clai`, rebuild it and check your `PATH`:
-
-```fish
-go build -o clai ./cmd/clai
-set -gx PATH /Users/newedia/Development/clai $PATH
-type clai
-```
-
-If you want a different keybinding, edit `shell/fish/clai.fish` and change:
-
-```fish
-bind \cx\ca __clai_insert_command
-```
-
-Or configure it without editing the script:
-
-```fish
-set -gx CLAI_BINDING \cg
-source /Users/newedia/Development/clai/shell/fish/clai.fish
-```
+An accepted command is printed but not executed. Cancellation produces no
+command. The interactive widget itself uses a protected temporary result file,
+removes it on every completion path, and changes the prompt only after a
+successful acceptance.

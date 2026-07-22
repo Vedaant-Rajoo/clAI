@@ -3,14 +3,16 @@ module codeberg.org/newedia/clai
 go 1.26.2
 
 require (
+	github.com/OpenRouterTeam/go-sdk v0.5.20
 	github.com/atotto/clipboard v0.1.4
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
+	github.com/creack/pty v1.1.24
+	github.com/zalando/go-keyring v0.2.8
 )
 
 require (
-	github.com/OpenRouterTeam/go-sdk v0.5.20 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/charmbracelet/colorprofile v0.4.1 // indirect
 	github.com/charmbracelet/x/ansi v0.11.6 // indirect
@@ -32,7 +34,6 @@ require (
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/spyzhov/ajson v0.8.0 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
-	github.com/zalando/go-keyring v0.2.8 // indirect
 	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.3.8 // indirect
 )

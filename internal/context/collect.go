@@ -17,8 +17,21 @@ type Context struct {
 }
 
 func Collect() Context {
+	return collect("")
+}
+
+func CollectWithShell(shell string) Context {
+	return collect(shell)
+}
+
+func collect(activeShell string) Context {
+	shell := os.Getenv("SHELL")
+	if isSupportedShell(activeShell) {
+		shell = activeShell
+	}
+
 	c := Context{
-		Shell: os.Getenv("SHELL"),
+		Shell: shell,
 		OS:    runtime.GOOS,
 	}
 
@@ -32,6 +45,15 @@ func Collect() Context {
 	}
 
 	return c
+}
+
+func isSupportedShell(shell string) bool {
+	switch shell {
+	case "fish", "bash", "zsh":
+		return true
+	default:
+		return false
+	}
 }
 
 func gitInfo(dir string) (root, branch string, ok bool) {

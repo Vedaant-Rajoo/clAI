@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -28,9 +29,9 @@ const (
 )
 
 // runAuth handles `clai auth <login|status|logout>`.
-func runAuth(args []string, apiKeyFlag string) int {
+func (c cli) runAuth(args []string, apiKeyFlag string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: clai auth <login|status|logout> [--provider <name>]\nRun 'clai auth help' for usage.")
+		fmt.Fprintln(c.stderr, "usage: clai auth <login|status|logout> [--provider <name>]\nRun 'clai auth help' for usage.")
 		return exitUsage
 	}
 
@@ -44,81 +45,100 @@ func runAuth(args []string, apiKeyFlag string) int {
 
 	switch args[0] {
 	case "login":
-		return authLogin(provider)
+		return c.authLogin(provider)
 	case "status":
-		return authStatus(provider, apiKeyFlag)
+		return c.authStatus(provider, apiKeyFlag)
 	case "logout":
-		return authLogout(provider)
+		return c.authLogout(provider)
 	default:
-		fmt.Fprintf(os.Stderr, "clai auth: unknown command %q\nRun 'clai auth help' for usage.\n", args[0])
+		fmt.Fprintf(c.stderr, "clai auth: unknown command %q\nRun 'clai auth help' for usage.\n", args[0])
 		return exitUsage
 	}
 }
 
-func authLogin(provider string) int {
+func (c cli) authLogin(provider string) int {
 	switch provider {
 	case "openrouter":
-		fmt.Println("Starting OpenRouter sign-in. Press enter to open your browser,")
-		fmt.Print("or paste an API key now to skip the browser flow: ")
-		var line string
-		fmt.Scanln(&line)
-		line = strings.TrimSpace(line)
-		if line != "" {
-			return storeKey(provider, line)
-		}
-		key, err := pkceLogin()
+		fmt.Fprintln(c.stdout, "Starting OpenRouter sign-in. Press enter to open your browser,")
+		fmt.Fprint(c.stdout, "or paste an API key now to skip the browser flow: ")
+		line, err := readLine()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "clai auth login: %v\n", err)
+			fmt.Fprintf(c.stderr, "clai auth login: read key: %v\n", err)
 			return 1
 		}
-		return storeKey(provider, key)
+		if line != "" {
+			return c.storeKey(provider, line)
+		}
+		key, err := c.pkceLogin()
+		if err != nil {
+			fmt.Fprintf(c.stderr, "clai auth login: %v\n", err)
+			return 1
+		}
+		return c.storeKey(provider, key)
 	case "anthropic", "openai":
-		fmt.Printf("Paste your %s API key: ", provider)
-		var key string
-		fmt.Scanln(&key)
-		key = strings.TrimSpace(key)
-		if key == "" {
-			fmt.Fprintln(os.Stderr, "clai auth login: empty key")
+		fmt.Fprintf(c.stdout, "Paste your %s API key: ", provider)
+		key, err := readLine()
+		if err != nil {
+			fmt.Fprintf(c.stderr, "clai auth login: read key: %v\n", err)
 			return 1
 		}
-		return storeKey(provider, key)
+		if key == "" {
+			fmt.Fprintln(c.stderr, "clai auth login: empty key")
+			return 1
+		}
+		return c.storeKey(provider, key)
 	default:
-		fmt.Fprintf(os.Stderr, "clai auth login: unknown provider %q (known: openrouter, anthropic, openai)\n", provider)
+		fmt.Fprintf(c.stderr, "clai auth login: unknown provider %q (known: openrouter, anthropic, openai)\n", provider)
 		return exitUsage
 	}
 }
 
-func storeKey(provider, key string) int {
+func (c cli) storeKey(provider, key string) int {
 	if err := auth.Store(provider, key); err != nil {
-		fmt.Fprintf(os.Stderr, "clai auth login: store key: %v\n", err)
+		fmt.Fprintf(c.stderr, "clai auth login: store key: %v\n", err)
 		return 1
 	}
-	fmt.Printf("Stored %s credentials (%s).\n", provider, auth.Source(provider, ""))
+	fmt.Fprintf(c.stdout, "Stored %s credentials (%s).\n", provider, auth.Source(provider, ""))
 	return 0
 }
 
-func authStatus(provider, explicit string) int {
+func (c cli) authStatus(provider, explicit string) int {
 	source := auth.Source(provider, explicit)
 	if source == "none" {
-		fmt.Printf("%s: not authenticated\n", provider)
+		fmt.Fprintf(c.stdout, "%s: not authenticated\n", provider)
 		return 1
 	}
-	fmt.Printf("%s: authenticated (%s)\n", provider, source)
+	fmt.Fprintf(c.stdout, "%s: authenticated (%s)\n", provider, source)
 	return 0
 }
 
-func authLogout(provider string) int {
+func (c cli) authLogout(provider string) int {
 	if err := auth.Delete(provider); err != nil {
-		fmt.Fprintf(os.Stderr, "clai auth logout: %v\n", err)
+		fmt.Fprintf(c.stderr, "clai auth logout: %v\n", err)
 		return 1
 	}
-	fmt.Printf("Removed stored %s credentials.\n", provider)
+	fmt.Fprintf(c.stdout, "Removed stored %s credentials.\n", provider)
 	return 0
+}
+
+// readLine reads a full line from stdin, so pasted keys containing spaces are
+// stored verbatim instead of being truncated at the first whitespace token.
+// An EOF with no input (Ctrl-D) is reported as an error rather than being
+// mistaken for pressing enter.
+func readLine() (string, error) {
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && !(errors.Is(err, io.EOF) && line != "") {
+		if errors.Is(err, io.EOF) {
+			return "", errors.New("end of input")
+		}
+		return "", err
+	}
+	return strings.TrimSpace(line), nil
 }
 
 // pkceLogin runs the OpenRouter PKCE flow: start a localhost listener, open
 // the browser to the authorize URL, exchange the returned code for an API key.
-func pkceLogin() (string, error) {
+func (c cli) pkceLogin() (string, error) {
 	verifier, challenge, err := generatePKCE()
 	if err != nil {
 		return "", err
@@ -142,11 +162,19 @@ func pkceLogin() (string, error) {
 			}
 			code := r.URL.Query().Get("code")
 			if code == "" {
-				errCh <- errors.New("callback missing code")
+				// Never block the HTTP handler: if the main flow already has a
+				// result or timed out, just answer the request.
+				select {
+				case errCh <- errors.New("callback missing code"):
+				default:
+				}
 				http.Error(w, "missing code", http.StatusBadRequest)
 				return
 			}
-			codeCh <- code
+			select {
+			case codeCh <- code:
+			default:
+			}
 			w.Header().Set("Content-Type", "text/html")
 			fmt.Fprint(w, "<html><body><h2>clai: sign-in complete</h2><p>You can close this tab.</p></body></html>")
 		}),
@@ -157,7 +185,7 @@ func pkceLogin() (string, error) {
 	authURL := openRouterAuthorizeURL + "?callback_url=" + url.QueryEscape(callbackURL) +
 		"&code_challenge=" + challenge + "&code_challenge_method=S256"
 
-	fmt.Printf("Open this URL to sign in:\n\n  %s\n\n", authURL)
+	fmt.Fprintf(c.stdout, "Open this URL to sign in:\n\n  %s\n\n", authURL)
 	openBrowser(authURL)
 
 	var code string

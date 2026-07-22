@@ -20,7 +20,7 @@ func Compile(request Request) Result {
 	normalized := strings.ToLower(request.Intent)
 
 	switch {
-	case containsAny(normalized, "git status", "repo status", "repository status", "working tree", "changed files", "status"):
+	case containsAny(normalized, "git status", "repo status", "repository status", "working tree", "changed files", "the changes", "status"):
 		if !request.Context.GitRepository {
 			return Result{
 				Command:     "ls -la",
@@ -91,7 +91,7 @@ func Compile(request Request) Result {
 			Command:     "pwd",
 			Explanation: "Prints the current working directory.",
 		}
-	case containsAny(normalized, "hidden files", "all files", "list files", "show files"):
+	case containsAny(normalized, "hidden files", "all files", "list files", "show files", "the files"):
 		return Result{
 			Command:     "ls -la",
 			Explanation: "Lists files in the current directory, including hidden files.",

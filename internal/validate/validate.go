@@ -130,5 +130,6 @@ func hasUnclosedQuote(command string) bool {
 func endsWithOperator(command string) bool {
 	return strings.HasSuffix(command, "|") ||
 		strings.HasSuffix(command, "&&") ||
-		strings.HasSuffix(command, "||")
+		strings.HasSuffix(command, "||") ||
+		strings.HasSuffix(command, ";")
 }

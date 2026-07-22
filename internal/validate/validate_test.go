@@ -13,7 +13,7 @@ func TestCommand(t *testing.T) {
 	}{
 		{name: "valid command", command: "git status --short", valid: true},
 		{name: "valid redirect", command: "go test ./... > test.log", valid: true},
-		{name: "valid trailing semicolon", command: "printf '%s\\n' done;", valid: true},
+		{name: "trailing semicolon", command: "printf '%s\\n' done;", valid: false},
 		{name: "quoted angle brackets", command: "printf '%s\\n' '<tag>'", valid: true},
 		{name: "empty command", command: "   ", valid: false},
 		{name: "line feed", command: "printf one\nprintf two", valid: false},

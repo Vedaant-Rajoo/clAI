@@ -19,6 +19,7 @@ func TestCompile(t *testing.T) {
 		// Git rules, in-repo.
 		{"status in git repository", Request{Intent: "show status", Context: gitRepo}, "git status"},
 		{"repo status", Request{Intent: "working tree changes", Context: gitRepo}, "git status"},
+		{"the changes", Request{Intent: "what are the changes", Context: gitRepo}, "git status"},
 		{"status outside git repository", Request{Intent: "show status", Context: noRepo}, "ls -la"},
 		{"git diff", Request{Intent: "what changed", Context: gitRepo}, "git diff"},
 		{"git diff outside repo", Request{Intent: "show diff", Context: noRepo}, `echo "No Git repository detected"`},
@@ -36,6 +37,7 @@ func TestCompile(t *testing.T) {
 		// Non-git rules.
 		{"pwd", Request{Intent: "where am i"}, "pwd"},
 		{"list files", Request{Intent: "show files"}, "ls -la"},
+		{"the files", Request{Intent: "show me the files"}, "ls -la"},
 		{"hidden files", Request{Intent: "hidden files"}, "ls -la"},
 		{"directories", Request{Intent: "list folders"}, "find . -type d"},
 		{"count files", Request{Intent: "count files"}, "find . -type f | wc -l"},

@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"io"
-	"os"
 )
 
 // commandHelp is the single source of truth for per-command help pages.
@@ -136,17 +135,17 @@ func printCommandHelp(w io.Writer, c commandHelp) {
 }
 
 // runHelp handles `clai help [command]`.
-func runHelp(args []string) int {
+func (c cli) runHelp(args []string) int {
 	if len(args) == 0 {
-		printMainHelp(os.Stdout)
+		printMainHelp(c.stdout)
 		return exitOK
 	}
-	c, ok := lookupCommand(args[0])
+	cmd, ok := lookupCommand(args[0])
 	if !ok {
-		fmt.Fprintf(os.Stderr, "clai help: unknown command %q\nRun 'clai help' for usage.\n", args[0])
+		fmt.Fprintf(c.stderr, "clai help: unknown command %q\nRun 'clai help' for usage.\n", args[0])
 		return exitUsage
 	}
-	printCommandHelp(os.Stdout, c)
+	printCommandHelp(c.stdout, cmd)
 	return exitOK
 }
 

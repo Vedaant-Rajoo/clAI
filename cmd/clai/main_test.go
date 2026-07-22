@@ -115,10 +115,11 @@ func TestValidShell(t *testing.T) {
 }
 
 func TestWidgetRequiresShellAndResultFile(t *testing.T) {
-	if code := run([]string{"widget"}); code != exitUsage {
+	c, _, _ := captureCLI()
+	if code := c.run([]string{"widget"}); code != exitUsage {
 		t.Errorf("run(widget) = %d, want %d", code, exitUsage)
 	}
-	if code := run([]string{"widget", "--shell", "sh", "--result-file", "/tmp/result"}); code != exitUsage {
+	if code := c.run([]string{"widget", "--shell", "sh", "--result-file", "/tmp/result"}); code != exitUsage {
 		t.Errorf("run(widget invalid shell) = %d, want %d", code, exitUsage)
 	}
 }
@@ -137,7 +138,8 @@ func TestWidgetRejectsUnsafeResultBeforeTUI(t *testing.T) {
 	}
 	t.Cleanup(func() { executeTUI = original })
 
-	code := run([]string{"widget", "--shell", "fish", "--result-file", path})
+	c, _, _ := captureCLI()
+	code := c.run([]string{"widget", "--shell", "fish", "--result-file", path})
 	if code != exitError {
 		t.Fatalf("run(widget) = %d, want %d", code, exitError)
 	}
@@ -158,7 +160,8 @@ func TestWidgetAcceptedWritesExactResult(t *testing.T) {
 	}
 	t.Cleanup(func() { executeTUI = original })
 
-	code := run([]string{"widget", "--shell", "fish", "--result-file", path})
+	c, _, _ := captureCLI()
+	code := c.run([]string{"widget", "--shell", "fish", "--result-file", path})
 	if code != exitOK {
 		t.Fatalf("run(widget) = %d, want %d", code, exitOK)
 	}
@@ -184,7 +187,8 @@ func TestWidgetCancelledRemovesResult(t *testing.T) {
 	}
 	t.Cleanup(func() { executeTUI = original })
 
-	code := run([]string{"widget", "--shell", "zsh", "--result-file", path})
+	c, _, _ := captureCLI()
+	code := c.run([]string{"widget", "--shell", "zsh", "--result-file", path})
 	if code != exitCancelled {
 		t.Fatalf("run(widget) = %d, want %d", code, exitCancelled)
 	}
@@ -205,7 +209,8 @@ func TestWidgetErrorRemovesResult(t *testing.T) {
 	}
 	t.Cleanup(func() { executeTUI = original })
 
-	code := run([]string{"widget", "--shell", "bash", "--result-file", path})
+	c, _, _ := captureCLI()
+	code := c.run([]string{"widget", "--shell", "bash", "--result-file", path})
 	if code != exitError {
 		t.Fatalf("run(widget) = %d, want %d", code, exitError)
 	}

@@ -6,6 +6,13 @@ import (
 	"testing"
 )
 
+// captureCLI returns a cli whose stdout/stderr are captured in the returned
+// buffers, for asserting output and stream routing in tests.
+func captureCLI() (cli, *bytes.Buffer, *bytes.Buffer) {
+	var out, errBuf bytes.Buffer
+	return cli{stdout: &out, stderr: &errBuf}, &out, &errBuf
+}
+
 func TestHelpRouting(t *testing.T) {
 	cases := []struct {
 		name string
@@ -37,7 +44,8 @@ func TestHelpRouting(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := run(tc.args); got != tc.want {
+			c, _, _ := captureCLI()
+			if got := c.run(tc.args); got != tc.want {
 				t.Fatalf("run(%v) = %d, want %d", tc.args, got, tc.want)
 			}
 		})

@@ -20,6 +20,7 @@ type Screen int
 
 const (
 	screenInput Screen = iota
+	screenLoading
 	screenReview
 	screenEditCommand
 )
@@ -82,6 +83,27 @@ func (m Model) Init() tea.Cmd {
 	return nil
 }
 
+// compileResult carries the outcome of an asynchronous Compile call back into
+// the update loop.
+type compileResult struct {
+	context     machinecontext.Context
+	candidates  []provider.Candidate
+	err         error
+}
+
+// compile runs context collection and the provider off the UI goroutine so a
+// slow network call never freezes the TUI.
+func (m Model) compile() tea.Cmd {
+	intent := m.intent
+	shell := m.activeShell
+	p := m.provider
+	return func() tea.Msg {
+		ctx := machinecontext.CollectWithShell(shell)
+		candidates, err := p.Compile(provider.Request{Intent: intent, Context: ctx})
+		return compileResult{context: ctx, candidates: candidates, err: err}
+	}
+}
+
 func configureCursor(input *textinput.Model) {
 	input.Cursor.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 	input.Cursor.SetMode(cursor.CursorStatic)
@@ -99,6 +121,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
 	switch msg := msg.(type) {
+	case compileResult:
+		m.context = msg.context
+		if msg.err != nil {
+			m.err = msg.err
+			m.screen = screenInput
+			m.input.SetValue(m.intent)
+			m.input.CursorEnd()
+			m.input.Focus()
+			return m, nil
+		}
+		candidates := msg.candidates
+		if len(candidates) == 0 {
+			m.command = `echo "No suggestion available yet"`
+			m.explanation = "The provider returned no candidates for this intent."
+		} else {
+			m.command = candidates[0].Command
+			m.explanation = candidates[0].Explanation
+		}
+		m.safety = safety.Evaluate(m.command)
+		m.validation = validate.Command(m.command)
+		m.screen = screenReview
+		return m, nil
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c":
@@ -109,6 +153,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.screen = screenReview
 				return m, nil
 			}
+			if m.screen == screenLoading {
+				// The compile call is already in flight; ignore esc rather than
+				// racing the result message. ctrl+c still quits.
+				return m, nil
+			}
 
 			return m, tea.Quit
 		case "enter":
@@ -116,23 +165,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.intent = m.input.Value()
 				m.accepted = false
 				m.err = nil
-				m.context = machinecontext.CollectWithShell(m.activeShell)
-				candidates, err := m.provider.Compile(provider.Request{Intent: m.intent, Context: m.context})
-				if err != nil {
-					m.err = err
-					return m, nil
-				}
-				if len(candidates) == 0 {
-					m.command = `echo "No suggestion available yet"`
-					m.explanation = "The provider returned no candidates for this intent."
-				} else {
-					m.command = candidates[0].Command
-					m.explanation = candidates[0].Explanation
-				}
-				m.safety = safety.Evaluate(m.command)
-				m.validation = validate.Command(m.command)
-				m.screen = screenReview
-				return m, nil
+				m.screen = screenLoading
+				return m, m.compile()
 			}
 
 			if m.screen == screenReview {
@@ -159,7 +193,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "e":
 			if m.screen == screenReview {
-				m.commandInput.SetValue(terminalSafe(m.command))
+				// Strip terminal control characters rather than escaping them:
+				// validation rejects control characters anyway, and escaping
+				// them to literal sequences would corrupt the command on save.
+				m.commandInput.SetValue(stripControl(m.command))
 				cmd := m.commandInput.Focus()
 				m.screen = screenEditCommand
 				return m, cmd
@@ -177,12 +214,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) View() string {
-	if m.err != nil {
-		return fmt.Sprintf("\n  Error: %s\n\n", terminalSafe(m.err.Error()))
-	}
 	switch m.screen {
 	case screenInput:
 		return m.inputView()
+	case screenLoading:
+		return m.loadingView()
 	case screenReview:
 		return m.reviewView()
 	case screenEditCommand:
@@ -192,10 +228,22 @@ func (m Model) View() string {
 }
 
 func (m Model) inputView() string {
-	return baseStyle.Render(strings.Join([]string{
+	sections := []string{
 		headerStyle.Render("What do you want to do?"),
 		m.input.View(),
-		mutedStyle.Render("enter submit · esc quit"),
+	}
+	if m.err != nil {
+		sections = append(sections, blockStyle.Render("Error: "+terminalSafe(m.err.Error())))
+	}
+	sections = append(sections, mutedStyle.Render("enter submit · esc quit"))
+	return baseStyle.Render(strings.Join(sections, "\n\n"))
+}
+
+func (m Model) loadingView() string {
+	return baseStyle.Render(strings.Join([]string{
+		headerStyle.Render("What do you want to do?"),
+		terminalSafe(m.intent),
+		mutedStyle.Render("Compiling suggestion..."),
 	}, "\n\n"))
 }
 
@@ -219,6 +267,18 @@ func (m Model) editCommandView() string {
 		m.commandInput.View(),
 		mutedStyle.Render("enter save · esc discard"),
 	}, "\n\n"))
+}
+
+// stripControl removes terminal control characters, keeping ordinary text
+// intact for editing.
+func stripControl(value string) string {
+	var result strings.Builder
+	for _, r := range value {
+		if !unicode.IsControl(r) {
+			result.WriteRune(r)
+		}
+	}
+	return result.String()
 }
 
 func terminalSafe(value string) string {

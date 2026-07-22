@@ -30,8 +30,19 @@ func (p *recordingProvider) Compile(request provider.Request) ([]provider.Candid
 func submitIntent(t *testing.T, m Model, intent string) Model {
 	t.Helper()
 	m.input.SetValue(intent)
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model, ok := updated.(Model)
+	if !ok {
+		t.Fatalf("Update returned %T, want Model", updated)
+	}
+	if model.screen != screenLoading {
+		t.Fatalf("screen after enter = %v, want loading", model.screen)
+	}
+	if cmd == nil {
+		t.Fatal("enter returned nil compile command")
+	}
+	updated, _ = model.Update(cmd())
+	model, ok = updated.(Model)
 	if !ok {
 		t.Fatalf("Update returned %T, want Model", updated)
 	}
@@ -163,5 +174,40 @@ func TestErrorViewRendersWhenErrSet(t *testing.T) {
 	m.err = errors.New("forced failure")
 	if !strings.Contains(m.View(), "Error: forced failure") {
 		t.Errorf("View() = %q, want error rendered", m.View())
+	}
+}
+
+func TestEditRoundTripsPlainCommandVerbatim(t *testing.T) {
+	p := stubProvider{candidates: []provider.Candidate{{
+		Command:     "ls -la",
+		Explanation: "list files",
+	}}}
+	m := submitIntent(t, NewWithProvider(p), "list files")
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	model := updated.(Model)
+	if model.commandInput.Value() != "ls -la" {
+		t.Fatalf("edit value = %q, want the raw command", model.commandInput.Value())
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.command != "ls -la" {
+		t.Fatalf("command after unchanged edit = %q, want %q", model.command, "ls -la")
+	}
+}
+
+func TestProviderErrorRestoresIntentForEditing(t *testing.T) {
+	p := stubProvider{err: errors.New("boom")}
+	m := submitIntent(t, NewWithProvider(p), "anything")
+
+	if m.screen != screenInput {
+		t.Fatalf("screen = %v, want input", m.screen)
+	}
+	if m.input.Value() != "anything" {
+		t.Fatalf("input = %q, want intent restored", m.input.Value())
+	}
+	if !strings.Contains(m.View(), "Error:") {
+		t.Errorf("View() = %q, want the error visible alongside the input", m.View())
 	}
 }

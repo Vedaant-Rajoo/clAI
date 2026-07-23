@@ -634,3 +634,103 @@ func TestProviderErrorRestoresIntentForEditing(t *testing.T) {
 		t.Errorf("View() = %q, want the error visible alongside the input", m.View())
 	}
 }
+
+func TestWindowResizePreservesReviewStateAndInformation(t *testing.T) {
+	p := stubProvider{candidates: []provider.Candidate{
+		{Command: "rm -rf /tmp/thing", Explanation: "removes the directory"},
+	}}
+	m := submitIntent(t, NewWithProvider(p), "delete the temp dir")
+	if m.screen != screenReview {
+		t.Fatalf("screen = %v, want review", m.screen)
+	}
+
+	for _, width := range []int{0, 20, 40, 4096} {
+		updated, cmd := m.Update(tea.WindowSizeMsg{Width: width, Height: 10})
+		resized, ok := updated.(Model)
+		if !ok {
+			t.Fatalf("Update returned %T, want Model", updated)
+		}
+		if cmd != nil {
+			t.Fatalf("resize produced a command at width %d", width)
+		}
+		if resized.screen != screenReview {
+			t.Fatalf("resize changed screen to %v at width %d", resized.screen, width)
+		}
+		if resized.accepted {
+			t.Fatalf("resize flipped acceptance at width %d", width)
+		}
+		view := stripANSI(resized.View())
+		for _, needle := range []string{"rm", "block", "enter blocked"} {
+			if !strings.Contains(view, needle) {
+				t.Fatalf("width %d hides %q:\n%s", width, needle, view)
+			}
+		}
+		m = resized
+	}
+}
+
+func TestResizeDuringLoadingKeepsRequestAlive(t *testing.T) {
+	m := NewWithProvider(stubProvider{})
+	m.input.SetValue("anything")
+	updated, compileCmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.screen != screenLoading || compileCmd == nil {
+		t.Fatalf("setup: screen=%v cmd nil=%v", m.screen, compileCmd == nil)
+	}
+	request := m.activeRequest
+
+	updated, _ = m.Update(tea.WindowSizeMsg{Width: 30, Height: 8})
+	m = updated.(Model)
+	if m.screen != screenLoading {
+		t.Fatalf("resize left loading: screen=%v", m.screen)
+	}
+	if m.activeRequest != request {
+		t.Fatalf("resize disturbed request identity: %d -> %d", request, m.activeRequest)
+	}
+}
+
+// TestDecisionsAreDistinguishableWithoutColor proves REQ-PERFORMANCE-007:
+// review, warning, blocking, and invalidity are conveyed by words, not only
+// color, so a monochrome terminal shows the same decisions.
+func TestDecisionsAreDistinguishableWithoutColor(t *testing.T) {
+	cases := []struct {
+		name    string
+		command string
+		want    []string
+	}{
+		{name: "allow", command: "git status", want: []string{"allow", "valid", "enter accept"}},
+		{name: "warn", command: "curl https://example.com", want: []string{"warn", "valid", "enter accept"}},
+		{name: "block", command: "rm -rf /", want: []string{"block", "enter blocked"}},
+		{name: "invalid", command: "echo <placeholder>", want: []string{"invalid", "enter invalid"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := stubProvider{candidates: []provider.Candidate{{Command: tc.command, Explanation: "x"}}}
+			m := submitIntent(t, NewWithProvider(p), "intent")
+			view := stripANSI(m.View())
+			for _, needle := range tc.want {
+				if !strings.Contains(view, needle) {
+					t.Fatalf("monochrome view lacks %q:\n%s", needle, view)
+				}
+			}
+		})
+	}
+}
+
+// stripANSI removes CSI escape sequences so assertions see exactly what a
+// colorless terminal presents.
+func stripANSI(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '[' {
+			i += 2
+			for i < len(s) && (s[i] < 0x40 || s[i] > 0x7e) {
+				i++
+			}
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}

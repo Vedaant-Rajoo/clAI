@@ -54,6 +54,7 @@ type Model struct {
 	nextRequest   uint64
 	activeRequest uint64
 	cancelCompile context.CancelFunc
+	width         int
 }
 
 func New() Model {
@@ -154,6 +155,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		// Track the terminal width so views wrap long content instead of
+		// letting the renderer truncate it. Resize never touches acceptance,
+		// screen, or request state.
+		m.width = msg.Width
+		return m, nil
 	case compileResult:
 		if msg.requestID == 0 || msg.requestID != m.activeRequest {
 			return m, nil
@@ -280,6 +287,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// frame renders the outer padded frame, constrained to the last reported
+// terminal width so long untrusted content wraps instead of being truncated
+// by the renderer. Review information must stay visible on narrow terminals.
+func (m Model) frame(content string) string {
+	style := baseStyle
+	if m.width > 0 {
+		style = style.Width(m.width)
+	}
+	return style.Render(content)
+}
+
 func (m Model) View() string {
 	switch m.screen {
 	case screenInput:
@@ -305,11 +323,11 @@ func (m Model) inputView() string {
 		sections = append(sections, blockStyle.Render("Error: "+textsafe.Visible(m.err.Error())))
 	}
 	sections = append(sections, mutedStyle.Render("enter submit · esc quit"))
-	return baseStyle.Render(strings.Join(sections, "\n\n"))
+	return m.frame(strings.Join(sections, "\n\n"))
 }
 
 func (m Model) loadingView() string {
-	return baseStyle.Render(strings.Join([]string{
+	return m.frame(strings.Join([]string{
 		headerStyle.Render("What do you want to do?"),
 		textsafe.Visible(m.intent),
 		mutedStyle.Render("Compiling suggestion..."),
@@ -327,11 +345,11 @@ func (m Model) reviewView() string {
 		mutedStyle.Render(reviewActions(m.safety.Decision, m.validation.Valid)),
 	}
 
-	return baseStyle.Render(strings.Join(sections, "\n\n"))
+	return m.frame(strings.Join(sections, "\n\n"))
 }
 
 func (m Model) editCommandView() string {
-	return baseStyle.Render(strings.Join([]string{
+	return m.frame(strings.Join([]string{
 		headerStyle.Render("Edit command"),
 		m.commandInput.View(),
 		mutedStyle.Render("enter save · esc discard"),
@@ -339,7 +357,7 @@ func (m Model) editCommandView() string {
 }
 
 func (m Model) noSuggestionView() string {
-	return baseStyle.Render(strings.Join([]string{
+	return m.frame(strings.Join([]string{
 		headerStyle.Render("No suggestion"),
 		section("Intent", textsafe.Visible(m.intent)),
 		"The provider returned no command candidate.",

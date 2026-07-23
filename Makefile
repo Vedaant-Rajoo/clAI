@@ -5,7 +5,7 @@ LDFLAGS := -X main.version=$(VERSION)
 
 .DEFAULT_GOAL := build
 
-.PHONY: build install run test fmt vet check clean help
+.PHONY: build install run test fmt vet acceptance check clean help
 
 build:
 	go build -ldflags "$(LDFLAGS)" -o clai ./cmd/clai
@@ -25,7 +25,12 @@ fmt:
 vet:
 	go vet ./...
 
+acceptance:
+	go run ./cmd/acceptance-check --spec .local/SPECIFICATION.md --manifest .local/acceptance-manifest.yaml --artifacts .local/artifacts.yaml
+
 check:
+	@echo "==> acceptance manifest"
+	@go run ./cmd/acceptance-check --spec .local/SPECIFICATION.md --manifest .local/acceptance-manifest.yaml --artifacts .local/artifacts.yaml
 	@echo "==> gofmt"
 	@unformatted="$$(gofmt -l .)"; \
 	if [ -n "$$unformatted" ]; then \
@@ -49,7 +54,8 @@ help:
 	@echo "  test     go test ./..."
 	@echo "  fmt      gofmt -l -w ."
 	@echo "  vet      go vet ./..."
-	@echo "  check    gofmt check, vet, and test (CI)"
+	@echo "  acceptance validate acceptance-manifest/v1 coverage"
+	@echo "  check    acceptance manifest, gofmt check, vet, and test (CI)"
 	@echo "  clean    remove the clai binary"
 	@echo ""
 	@echo "VERSION = $(VERSION)"

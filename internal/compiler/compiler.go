@@ -20,12 +20,9 @@ func Compile(request Request) Result {
 	normalized := strings.ToLower(request.Intent)
 
 	switch {
-	case containsAny(normalized, "git status", "repo status", "repository status", "working tree", "changed files", "changes", "status"):
+	case containsAny(normalized, "git status", "repo status", "repository status", "working tree", "changed files", "the changes", "status"):
 		if !request.Context.GitRepository {
-			return Result{
-				Command:     "ls -la",
-				Explanation: "This directory is not a Git repository, so the compiler suggested listing local files instead of Git status.",
-			}
+			return noGitRepositoryResult()
 		}
 
 		return Result{
@@ -91,7 +88,7 @@ func Compile(request Request) Result {
 			Command:     "pwd",
 			Explanation: "Prints the current working directory.",
 		}
-	case containsAny(normalized, "hidden files", "all files", "list files", "show files", "files"):
+	case containsAny(normalized, "hidden files", "all files", "list files", "show files", "the files"):
 		return Result{
 			Command:     "ls -la",
 			Explanation: "Lists files in the current directory, including hidden files.",
@@ -202,18 +199,12 @@ func Compile(request Request) Result {
 			Explanation: "Lists local Docker images.",
 		}
 	default:
-		return Result{
-			Command:     "echo \"No suggestion available yet\"",
-			Explanation: "No fake compiler rule matched this intent.",
-		}
+		return Result{}
 	}
 }
 
 func noGitRepositoryResult() Result {
-	return Result{
-		Command:     "echo \"No Git repository detected\"",
-		Explanation: "The requested Git command needs a Git repository, but the collected context says this directory is not inside one.",
-	}
+	return Result{}
 }
 
 func containsAny(value string, needles ...string) bool {

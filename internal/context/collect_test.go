@@ -6,6 +6,46 @@ import (
 	"testing"
 )
 
+func TestCollectFallsBackToConfiguredShell(t *testing.T) {
+	t.Setenv("SHELL", "/bin/fish")
+
+	context := Collect()
+	if context.Shell != "/bin/fish" {
+		t.Fatalf("Shell = %q, want /bin/fish", context.Shell)
+	}
+	if context.ShellProvenance != "SHELL" {
+		t.Fatalf("ShellProvenance = %q, want SHELL", context.ShellProvenance)
+	}
+}
+
+func TestCollectWithShellOverridesConfiguredShell(t *testing.T) {
+	t.Setenv("SHELL", "/bin/sh")
+
+	for _, shell := range []string{"fish", "bash", "zsh"} {
+		t.Run(shell, func(t *testing.T) {
+			context := CollectWithShell(shell)
+			if context.Shell != shell {
+				t.Fatalf("Shell = %q, want %q", context.Shell, shell)
+			}
+			if context.ShellProvenance != "widget-declared-shell" {
+				t.Fatalf("ShellProvenance = %q, want widget-declared-shell", context.ShellProvenance)
+			}
+		})
+	}
+}
+
+func TestCollectWithShellRejectsUnsupportedOverride(t *testing.T) {
+	t.Setenv("SHELL", "/bin/zsh")
+
+	context := CollectWithShell("sh")
+	if context.Shell != "/bin/zsh" {
+		t.Fatalf("Shell = %q, want fallback /bin/zsh", context.Shell)
+	}
+	if context.ShellProvenance != "SHELL" {
+		t.Fatalf("ShellProvenance = %q, want SHELL", context.ShellProvenance)
+	}
+}
+
 func TestGitInfoNonGitDirectory(t *testing.T) {
 	root, branch, ok := gitInfo(t.TempDir())
 	if ok {

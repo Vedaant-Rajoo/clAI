@@ -24,8 +24,8 @@ func TestHelpRouting(t *testing.T) {
 		{"top --help", []string{"--help"}, exitOK},
 		{"help auth", []string{"help", "auth"}, exitOK},
 		{"auth help", []string{"auth", "help"}, exitOK},
-		{"auth -h", []string{"auth", "-h"}, exitOK},
-		{"auth --help", []string{"auth", "--help"}, exitOK},
+		{"auth -h rejected before verb", []string{"auth", "-h"}, exitUsage},
+		{"auth --help rejected before verb", []string{"auth", "--help"}, exitUsage},
 		{"help init", []string{"help", "init"}, exitOK},
 		{"init help", []string{"init", "help"}, exitOK},
 		{"init -h", []string{"init", "-h"}, exitOK},
@@ -60,7 +60,7 @@ func TestMainHelpContent(t *testing.T) {
 	for _, want := range []string{
 		"auth", "init", "version",
 		"--copy", "--print-command", "--provider", "--model",
-		"--api-key", "--fallback-rules", "--version",
+		"--api-key", "--fallback-rules", "--context-policy", "--share-context", "--version",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("main help missing %q", want)
@@ -80,7 +80,12 @@ func TestAuthHelpContent(t *testing.T) {
 	printCommandHelp(&buf, c)
 	out := buf.String()
 
-	for _, want := range []string{"login", "status", "logout", "--provider"} {
+	for _, want := range []string{
+		"clai auth login [--provider <name>]",
+		"clai auth status [--provider <name>] [--api-key <value>]",
+		"clai auth logout [--provider <name>]",
+		"space-separated",
+	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("auth help missing %q", want)
 		}

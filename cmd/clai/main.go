@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,9 +12,11 @@ import (
 
 	"codeberg.org/newedia/clai/internal/app"
 	"codeberg.org/newedia/clai/internal/auth"
+	machinecontext "codeberg.org/newedia/clai/internal/context"
 	"codeberg.org/newedia/clai/internal/provider"
 	"codeberg.org/newedia/clai/internal/provider/openrouter"
 	"codeberg.org/newedia/clai/internal/provider/rules"
+	"codeberg.org/newedia/clai/internal/safety"
 	"codeberg.org/newedia/clai/internal/shellinit"
 	"codeberg.org/newedia/clai/internal/validate"
 	"github.com/atotto/clipboard"
@@ -37,11 +40,18 @@ func main() {
 	os.Exit(c.run(os.Args[1:]))
 }
 
-// cli carries the output streams so every command's writes can be captured in
-// tests. stdin stays on os.Stdin; only stdout/stderr are injectable.
+// cli carries process-boundary dependencies so command behavior can be tested
+// without using real credential, browser, listener, timer, or network services.
 type cli struct {
 	stdout io.Writer
 	stderr io.Writer
+	ctx    context.Context
+
+	authRuntime         authRuntime
+	authReadLine        func() (string, error)
+	authStore           func(provider, key string) error
+	authDelete          func(provider string) error
+	authSourceWithError func(provider, explicit string) (string, error)
 }
 
 func (c cli) run(args []string) int {
@@ -68,26 +78,17 @@ func (c cli) run(args []string) int {
 	return c.runInteractive(args)
 }
 
-// runAuthCommand routes `clai auth <verb>`. There are deliberately no per-verb
-// help pages: login/status/logout share the single --provider flag (only status
-// adds --api-key), and all three are covered by the one "auth" help page. If a
-// verb later grows its own flags or non-trivial options, add nested pages here
-// (route `auth <verb> help`) and extend TestNoFlagHelpDrift to cover them.
+// runAuthCommand routes the strict `clai auth <verb> [options]` grammar.
 func (c cli) runAuthCommand(args []string) int {
-	if len(args) > 0 && args[0] == "help" {
+	if len(args) == 1 && args[0] == "help" {
 		return c.runHelp([]string{"auth"})
 	}
-	fs := flag.NewFlagSet("auth", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	f := registerAuthFlags(fs)
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return c.runHelp([]string{"auth"})
-		}
+	command, err := parseAuthArgs(args)
+	if err != nil {
 		fmt.Fprintf(c.stderr, "clai auth: %v\nRun 'clai auth help' for usage.\n", err)
 		return exitUsage
 	}
-	return c.runAuth(fs.Args(), *f.apiKey)
+	return c.runAuth(command)
 }
 
 func (c cli) runVersion(args []string) int {
@@ -136,12 +137,17 @@ func (c cli) runInteractive(args []string) int {
 		return exitUsage
 	}
 
+	policy, sharedFields, err := f.contextOptions()
+	if err != nil {
+		fmt.Fprintf(c.stderr, "clai: %v\nRun 'clai help' for usage.\n", err)
+		return exitUsage
+	}
+
 	if *f.showVersion {
 		fmt.Fprintln(c.stdout, version)
 		return exitOK
 	}
-
-	p, err := selectProvider(*f.providerName, *f.model, *f.apiKey, *f.fallbackRules)
+	p, err := selectProvider(*f.providerName, *f.model, *f.apiKey, *f.fallbackRules, policy, sharedFields)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai: %v\n", err)
 		return exitError
@@ -186,6 +192,11 @@ func (c cli) runWidget(args []string) int {
 		fmt.Fprintln(c.stderr, "usage: clai widget --shell <fish|bash|zsh> --result-file <path>\nRun 'clai widget help' for usage.")
 		return exitUsage
 	}
+	policy, sharedFields, err := f.contextOptions()
+	if err != nil {
+		fmt.Fprintf(c.stderr, "clai widget: %v\nRun 'clai widget help' for usage.\n", err)
+		return exitUsage
+	}
 	if _, err := inspectWidgetResult(*f.resultFile); err != nil {
 		fmt.Fprintf(c.stderr, "clai widget: invalid result file: %v\n", err)
 		return exitError
@@ -197,7 +208,7 @@ func (c cli) runWidget(args []string) int {
 		}
 	}()
 
-	p, err := selectProvider(*f.providerName, *f.model, *f.apiKey, *f.fallbackRules)
+	p, err := selectProvider(*f.providerName, *f.model, *f.apiKey, *f.fallbackRules, policy, sharedFields)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai widget: %v\n", err)
 		return exitError
@@ -211,8 +222,17 @@ func (c cli) runWidget(args []string) int {
 	if !accepted {
 		return exitCancelled
 	}
+	// Transport boundary revalidation (REQ-INVARIANT-008): re-check the exact
+	// bytes about to be exported against both the structural gate
+	// (REQ-INVARIANT-003) and the safety gate (REQ-INVARIANT-004) independently
+	// of the TUI's in-model acceptance gating, so a blocked or invalid command
+	// can never reach widget transport even if the interactive gate regresses.
 	if result := validate.Command(command); !result.Valid {
 		fmt.Fprintf(c.stderr, "clai widget: accepted command is not exportable: %s\n", strings.Join(result.Reasons, " "))
+		return exitError
+	}
+	if decision := safety.Evaluate(command); decision.Decision == safety.Block {
+		fmt.Fprintf(c.stderr, "clai widget: accepted command is blocked by safety and not exportable: %s\n", strings.Join(decision.Reasons, " "))
 		return exitError
 	}
 	if err := writeWidgetResult(*f.resultFile, command); err != nil {
@@ -229,15 +249,79 @@ type providerFlags struct {
 	model         *string
 	apiKey        *string
 	fallbackRules *bool
+	contextPolicy *contextPolicyFlag
+	sharedContext *sharedContextFlag
+}
+
+type contextPolicyFlag struct {
+	value machinecontext.Policy
+	set   bool
+}
+
+func (f *contextPolicyFlag) String() string { return string(f.value) }
+func (f *contextPolicyFlag) Set(value string) error {
+	policy, err := machinecontext.ParsePolicy(value)
+	if err != nil {
+		return err
+	}
+	if f.set {
+		return errors.New("context-policy may be supplied only once")
+	}
+	f.value = policy
+	f.set = true
+	return nil
+}
+
+type sharedContextFlag struct{ values []string }
+
+func (f *sharedContextFlag) String() string { return strings.Join(f.values, ",") }
+func (f *sharedContextFlag) Set(value string) error {
+	if !machinecontext.IsExplicitField(value) {
+		return fmt.Errorf("invalid shared context field %q (want working_directory, git_root, or git_branch)", value)
+	}
+	f.values = append(f.values, value)
+	return nil
 }
 
 func registerProviderFlags(fs *flag.FlagSet) providerFlags {
+	policy := &contextPolicyFlag{}
+	shared := &sharedContextFlag{}
+	fs.Var(policy, "context-policy", "context policy: local-only | remote-minimal | remote-explicit")
+	fs.Var(shared, "share-context", "share one context field (repeatable): working_directory | git_root | git_branch")
 	return providerFlags{
 		providerName:  fs.String("provider", envOr("CLAI_PROVIDER", "rules"), "provider: rules | openrouter"),
 		model:         fs.String("model", "", "model override for LLM providers"),
 		apiKey:        fs.String("api-key", "", "API key override for LLM providers"),
 		fallbackRules: fs.Bool("fallback-rules", false, "fall back to local rules when the selected provider errors"),
+		contextPolicy: policy,
+		sharedContext: shared,
 	}
+}
+
+func (f providerFlags) contextOptions() (machinecontext.Policy, []string, error) {
+	shared, err := machinecontext.NormalizeExplicitFields(f.sharedContext.values)
+	if err != nil {
+		return "", nil, err
+	}
+	policy := f.contextPolicy.value
+	if !f.contextPolicy.set {
+		if len(shared) != 0 {
+			return "", nil, errors.New("--share-context requires an explicit --context-policy remote-explicit in the same invocation")
+		}
+		if *f.providerName == "openrouter" {
+			policy = machinecontext.PolicyRemoteMinimal
+		} else {
+			policy = machinecontext.PolicyLocalOnly
+		}
+	}
+	if policy == machinecontext.PolicyRemoteExplicit {
+		if !f.contextPolicy.set || len(shared) == 0 {
+			return "", nil, errors.New("--context-policy remote-explicit requires at least one --share-context field in the same invocation")
+		}
+	} else if len(shared) != 0 {
+		return "", nil, errors.New("--share-context is valid only with --context-policy remote-explicit")
+	}
+	return policy, shared, nil
 }
 
 // interactiveFlags are the flags for the default (TUI) command.
@@ -269,19 +353,6 @@ func registerWidgetFlags(fs *flag.FlagSet) widgetFlags {
 		shell:         fs.String("shell", "", "active shell: fish | bash | zsh"),
 		resultFile:    fs.String("result-file", "", "caller-created result file"),
 		providerFlags: registerProviderFlags(fs),
-	}
-}
-
-// authFlags are the flags parsed by the auth command's FlagSet. Note that
-// --provider is handled by manual scanning in runAuth (so it may follow the
-// verb, e.g. "auth login --provider x") and is intentionally not registered here.
-type authFlags struct {
-	apiKey *string
-}
-
-func registerAuthFlags(fs *flag.FlagSet) authFlags {
-	return authFlags{
-		apiKey: fs.String("api-key", "", "API key override"),
 	}
 }
 
@@ -389,15 +460,18 @@ type fallback struct {
 	primary provider.Provider
 }
 
-func (f fallback) Compile(request provider.Request) ([]provider.Candidate, error) {
-	candidates, err := f.primary.Compile(request)
+func (f fallback) Compile(ctx context.Context, request provider.Request) ([]provider.Candidate, error) {
+	candidates, err := f.primary.Compile(ctx, request)
 	if err == nil {
 		return candidates, nil
 	}
-	return rules.Provider{}.Compile(request)
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil, err
+	}
+	return rules.Provider{}.Compile(ctx, request)
 }
 
-func selectProvider(name, model, apiKey string, fallbackRules bool) (provider.Provider, error) {
+func selectProvider(name, model, apiKey string, fallbackRules bool, policy machinecontext.Policy, sharedFields []string) (provider.Provider, error) {
 	switch name {
 	case "rules", "":
 		return rules.Provider{}, nil
@@ -406,7 +480,7 @@ func selectProvider(name, model, apiKey string, fallbackRules bool) (provider.Pr
 		if err != nil {
 			return nil, err
 		}
-		var p provider.Provider = openrouter.Provider{APIKey: key, Model: model}
+		var p provider.Provider = openrouter.Provider{APIKey: key, Model: model, Policy: policy, SharedFields: sharedFields}
 		if fallbackRules {
 			p = fallback{primary: p}
 		}

@@ -38,12 +38,10 @@ func driftCases() []driftCase {
 			help:     func() string { return commandLong("widget") },
 		},
 		{
-			name:     "auth",
-			register: func(fs *flag.FlagSet) { registerAuthFlags(fs) },
-			help:     func() string { return commandLong("auth") },
-			// --provider is parsed by manual scanning in runAuth so it may
-			// follow the verb; it is documented but not on the FlagSet.
-			allowInHelp: map[string]bool{"--provider": true},
+			name:        "auth",
+			register:    func(*flag.FlagSet) {},
+			help:        func() string { return commandLong("auth") },
+			allowInHelp: map[string]bool{"--provider": true, "--api-key": true},
 		},
 	}
 }

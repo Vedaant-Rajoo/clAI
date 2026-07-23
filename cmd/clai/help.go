@@ -20,7 +20,11 @@ var commands = []commandHelp{
 		long: `Manage provider credentials.
 
 Usage:
-  clai auth <login|status|logout> [--provider <name>]
+  clai auth login [--provider <name>]
+  clai auth status [--provider <name>] [--api-key <value>]
+  clai auth logout [--provider <name>]
+
+Options must follow the subcommand and use the documented space-separated form.
 
 Subcommands:
   login      Sign in (OpenRouter browser flow, or paste an API key)
@@ -32,9 +36,10 @@ Flags:
   --api-key key      API key override (status only)
 
 Examples:
-  clai auth login
+  clai auth login --provider openrouter
   clai auth status --provider openrouter
-  clai auth logout
+  clai auth status --provider openrouter --api-key <value>
+  clai auth logout --provider openrouter
 `,
 	},
 	{
@@ -82,6 +87,9 @@ Flags:
   --model name        model override for LLM providers
   --api-key key       API key override for LLM providers
   --fallback-rules    fall back to local rules when the provider errors
+  --context-policy p  context policy: local-only | remote-minimal | remote-explicit
+  --share-context f   share a field with remote-explicit (repeatable):
+                      working_directory | git_root | git_branch
 
 Exit codes:
   0  command accepted and written to the result file
@@ -124,6 +132,9 @@ Flags:
   --model name       model override for LLM providers
   --api-key key      API key override for LLM providers
   --fallback-rules   fall back to local rules when the provider errors
+  --context-policy p context policy: local-only | remote-minimal | remote-explicit
+  --share-context f  share a field with remote-explicit (repeatable):
+                     working_directory | git_root | git_branch
   --version          print version and exit
 
 Use "clai help <command>" or "clai <command> help" for more information.

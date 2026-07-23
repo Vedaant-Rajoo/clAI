@@ -1,18 +1,23 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	machinecontext "codeberg.org/newedia/clai/internal/context"
 	"codeberg.org/newedia/clai/internal/provider"
 	"codeberg.org/newedia/clai/internal/provider/openrouter"
 	"codeberg.org/newedia/clai/internal/provider/rules"
+	"codeberg.org/newedia/clai/internal/safety"
+	"codeberg.org/newedia/clai/internal/validate"
 )
 
 func TestSelectProviderDefaultIsRules(t *testing.T) {
-	p, err := selectProvider("rules", "", "", false)
+	p, err := selectProvider("rules", "", "", false, machinecontext.PolicyLocalOnly, nil)
 	if err != nil {
 		t.Fatalf("selectProvider: %v", err)
 	}
@@ -23,7 +28,7 @@ func TestSelectProviderDefaultIsRules(t *testing.T) {
 
 func TestSelectProviderOpenRouterUsesEnvKey(t *testing.T) {
 	t.Setenv("OPENROUTER_API_KEY", "sk-or-test")
-	p, err := selectProvider("openrouter", "some/model", "", false)
+	p, err := selectProvider("openrouter", "some/model", "", false, machinecontext.PolicyRemoteMinimal, nil)
 	if err != nil {
 		t.Fatalf("selectProvider: %v", err)
 	}
@@ -41,7 +46,7 @@ func TestSelectProviderOpenRouterUsesEnvKey(t *testing.T) {
 
 func TestSelectProviderOpenRouterExplicitKeyWins(t *testing.T) {
 	t.Setenv("OPENROUTER_API_KEY", "env-key")
-	p, err := selectProvider("openrouter", "", "flag-key", false)
+	p, err := selectProvider("openrouter", "", "flag-key", false, machinecontext.PolicyRemoteMinimal, nil)
 	if err != nil {
 		t.Fatalf("selectProvider: %v", err)
 	}
@@ -52,7 +57,7 @@ func TestSelectProviderOpenRouterExplicitKeyWins(t *testing.T) {
 
 func TestSelectProviderFallbackWraps(t *testing.T) {
 	t.Setenv("OPENROUTER_API_KEY", "sk-or-test")
-	p, err := selectProvider("openrouter", "", "", true)
+	p, err := selectProvider("openrouter", "", "", true, machinecontext.PolicyRemoteMinimal, nil)
 	if err != nil {
 		t.Fatalf("selectProvider: %v", err)
 	}
@@ -62,37 +67,86 @@ func TestSelectProviderFallbackWraps(t *testing.T) {
 }
 
 func TestSelectProviderUnknown(t *testing.T) {
-	if _, err := selectProvider("bogus", "", "", false); err == nil {
+	if _, err := selectProvider("bogus", "", "", false, machinecontext.PolicyLocalOnly, nil); err == nil {
 		t.Error("want error for unknown provider")
 	}
 }
 
 func TestSelectProviderUnimplemented(t *testing.T) {
-	if _, err := selectProvider("anthropic", "", "", false); err == nil {
+	if _, err := selectProvider("anthropic", "", "", false, machinecontext.PolicyRemoteMinimal, nil); err == nil {
 		t.Error("want error for unimplemented provider")
 	}
 }
 
-type failingProvider struct{}
+type failingProvider struct{ calls *int }
 
-func (failingProvider) Compile(provider.Request) ([]provider.Candidate, error) {
+func (p failingProvider) Compile(context.Context, provider.Request) ([]provider.Candidate, error) {
+	if p.calls != nil {
+		*p.calls++
+	}
 	return nil, errors.New("boom")
 }
 
 func TestFallbackFallsBackToRules(t *testing.T) {
-	p := fallback{primary: failingProvider{}}
-	candidates, err := p.Compile(provider.Request{Intent: "run tests"})
+	calls := 0
+	p := fallback{primary: failingProvider{calls: &calls}}
+	candidates, err := p.Compile(context.Background(), provider.Request{Intent: "run tests"})
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
 	if len(candidates) == 0 || candidates[0].Command != "go test ./..." {
 		t.Errorf("candidates = %+v, want rules result", candidates)
 	}
+	if calls != 1 {
+		t.Fatalf("remote primary calls = %d, want exactly one before local fallback", calls)
+	}
+}
+
+type contextErrorProvider struct {
+	err error
+}
+
+func (p contextErrorProvider) Compile(context.Context, provider.Request) ([]provider.Candidate, error) {
+	return nil, p.err
+}
+
+func TestFallbackDoesNotConvertContextErrorsToRules(t *testing.T) {
+	for _, wantErr := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(wantErr.Error(), func(t *testing.T) {
+			candidates, err := (fallback{primary: contextErrorProvider{err: wantErr}}).Compile(
+				context.Background(), provider.Request{Intent: "run tests"},
+			)
+			if !errors.Is(err, wantErr) {
+				t.Fatalf("err = %v, want %v", err, wantErr)
+			}
+			if len(candidates) != 0 {
+				t.Fatalf("candidates = %+v, want none", candidates)
+			}
+		})
+	}
+}
+
+type noSuggestionProvider struct{}
+
+func (noSuggestionProvider) Compile(context.Context, provider.Request) ([]provider.Candidate, error) {
+	return nil, nil
+}
+
+func TestFallbackPassesThroughNoSuggestion(t *testing.T) {
+	candidates, err := (fallback{primary: noSuggestionProvider{}}).Compile(
+		context.Background(), provider.Request{Intent: "run tests"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 0 {
+		t.Fatalf("candidates = %+v, want primary no-suggestion result", candidates)
+	}
 }
 
 func TestFallbackPassesThroughSuccess(t *testing.T) {
 	p := fallback{primary: rules.Provider{}}
-	candidates, err := p.Compile(provider.Request{Intent: "run tests"})
+	candidates, err := p.Compile(context.Background(), provider.Request{Intent: "run tests"})
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
@@ -156,20 +210,20 @@ func TestWidgetAcceptedWritesExactResult(t *testing.T) {
 
 	original := executeTUI
 	executeTUI = func(provider.Provider, string) (string, bool, error) {
-		return `printf '%s' "hello * $world 日本語"`, true, nil
+		return `printf '%s' 'hello * $world 日本語'`, true, nil
 	}
 	t.Cleanup(func() { executeTUI = original })
 
-	c, _, _ := captureCLI()
+	c, _, errBuf := captureCLI()
 	code := c.run([]string{"widget", "--shell", "fish", "--result-file", path})
 	if code != exitOK {
-		t.Fatalf("run(widget) = %d, want %d", code, exitOK)
+		t.Fatalf("run(widget) = %d, want %d; stderr: %s", code, exitOK, errBuf.String())
 	}
 	got, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `printf '%s' "hello * $world 日本語"`
+	want := `printf '%s' 'hello * $world 日本語'`
 	if string(got) != want {
 		t.Errorf("result = %q, want %q", got, want)
 	}
@@ -216,6 +270,43 @@ func TestWidgetErrorRemovesResult(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("result file was not removed: %v", err)
+	}
+}
+
+// TestWidgetBlockedCommandNotExportedAtBoundary proves the transport boundary
+// independently enforces the safety gate (REQ-INVARIANT-004): even if the TUI
+// reports a structurally valid but safety-blocked command as accepted, widget
+// export refuses it and never writes the result file.
+func TestWidgetBlockedCommandNotExportedAtBoundary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "result")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	const blocked = "rm -rf /"
+	if result := validate.Command(blocked); !result.Valid {
+		t.Fatalf("precondition: %q must be structurally valid so only the safety gate can refuse it", blocked)
+	}
+	if decision := safety.Evaluate(blocked); decision.Decision != safety.Block {
+		t.Fatalf("precondition: %q must be safety-blocked, got %v", blocked, decision.Decision)
+	}
+
+	original := executeTUI
+	executeTUI = func(provider.Provider, string) (string, bool, error) {
+		return blocked, true, nil
+	}
+	t.Cleanup(func() { executeTUI = original })
+
+	c, _, errBuf := captureCLI()
+	code := c.run([]string{"widget", "--shell", "fish", "--result-file", path})
+	if code != exitError {
+		t.Fatalf("run(widget) = %d, want %d; stderr: %s", code, exitError, errBuf.String())
+	}
+	if !strings.Contains(errBuf.String(), "blocked by safety") {
+		t.Fatalf("stderr = %q, want it to report the safety block", errBuf.String())
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("blocked command left a result file behind: %v", err)
 	}
 }
 

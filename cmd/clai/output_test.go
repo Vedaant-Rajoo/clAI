@@ -72,7 +72,7 @@ func TestOutputStreamRouting(t *testing.T) {
 			args:       []string{"auth"},
 			wantCode:   exitUsage,
 			wantStdout: "",
-			wantStderr: "usage: clai auth",
+			wantStderr: "missing command",
 		},
 		{
 			name:       "unknown init shell to stderr",

@@ -15,9 +15,10 @@ clipboard and `--print-command` prints it to stdout.
 ## Shell Integration
 
 `clai` can install an interactive widget for Fish, Bash, or Zsh. The widget
-opens the TUI from a keybinding and replaces the complete command-line buffer
-with the accepted command. It never executes the command automatically, so you
-can inspect or edit it before pressing Enter.
+opens the TUI from a keybinding and inserts the accepted command at the current
+cursor while preserving surrounding prompt text. It never executes the command
+automatically, so you can inspect or edit it before pressing Enter. Bash 3.2 uses
+a compatibility path that currently appends accepted text at the end of the buffer.
 
 - [Shell integration overview](docs/shell/README.md)
 - [Fish setup](docs/shell/fish.md)
@@ -26,6 +27,11 @@ can inspect or edit it before pressing Enter.
 
 ## Providers
 
-Local rules by default; LLM providers (OpenRouter first) are opt-in.
+Local rules by default; LLM providers (OpenRouter first) are opt-in. Remote
+OpenRouter requests default to a minimal context policy that sends the intent
+plus normalized OS family, shell family, and project kind only. Absolute paths
+and Git details require invocation-scoped `--context-policy remote-explicit`
+with repeatable `--share-context` approvals; `local-only` fails closed for remote
+endpoints.
 
-- [Provider setup and auth](docs/providers.md)
+- [Provider setup, auth, and context privacy](docs/providers.md)

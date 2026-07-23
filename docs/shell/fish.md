@@ -1,8 +1,8 @@
 # Fish Integration
 
-The Fish integration opens `clai` from a keybinding and replaces the complete
-Fish command-line buffer with an accepted command. It never executes the
-command automatically.
+The Fish integration opens `clai` from a keybinding and inserts the accepted
+command at the current cursor while preserving surrounding prompt text. It never
+executes the command automatically.
 
 See the [shell integration overview](README.md) for shared behavior and the
 internal adapter contract.

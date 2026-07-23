@@ -403,11 +403,23 @@ func validationText(result validate.Result) string {
 		return allowStyle.Render("valid")
 	}
 
-	return blockStyle.Render("invalid") + "\n" + strings.Join(result.Reasons, "\n")
+	return blockStyle.Render("invalid") + "\n" + visibleReasons(result.Reasons)
 }
 
 func safetyText(result safety.Result) string {
-	return decisionStyle(result.Decision).Render(string(result.Decision)) + "\n" + strings.Join(result.Reasons, "\n")
+	return decisionStyle(result.Decision).Render(string(result.Decision)) + "\n" + visibleReasons(result.Reasons)
+}
+
+// visibleReasons sanitizes gate reasons before rendering. Reasons embed
+// untrusted command tokens (for example the unrecognized executable name), so
+// they get the same one-way visible transformation as every other untrusted
+// field on the review screen.
+func visibleReasons(reasons []string) string {
+	visible := make([]string, len(reasons))
+	for i, reason := range reasons {
+		visible[i] = textsafe.Visible(reason)
+	}
+	return strings.Join(visible, "\n")
 }
 
 func decisionStyle(decision safety.Decision) lipgloss.Style {

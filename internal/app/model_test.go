@@ -734,3 +734,30 @@ func stripANSI(s string) string {
 	}
 	return b.String()
 }
+
+// TestUntrustedReasonTextIsSanitizedInReviewView is the regression proof for
+// review finding F-1: safety and validation reasons embed untrusted command
+// tokens (for example the unrecognized executable name), so the rendered view
+// must contain no raw terminal-control byte or prohibited format rune arriving
+// through the provider -> compileResult -> review path.
+func TestUntrustedReasonTextIsSanitizedInReviewView(t *testing.T) {
+	command := "fo\x1b]0;pwn\x07o\u202Ebar arg"
+	p := stubProvider{candidates: []provider.Candidate{{Command: command, Explanation: "x"}}}
+	m := submitIntent(t, NewWithProvider(p), "intent")
+	if m.screen != screenReview {
+		t.Fatalf("screen = %v, want review", m.screen)
+	}
+
+	view := m.View()
+	if strings.ContainsRune(view, '\u202E') {
+		t.Fatalf("review view contains a raw U+202E from a gate reason:\n%q", view)
+	}
+	for i := 0; i < len(view); i++ {
+		if view[i] == 0x1b && i+1 < len(view) && view[i+1] != '[' {
+			t.Fatalf("review view contains a raw non-CSI escape byte at %d:\n%q", i, view)
+		}
+	}
+	if !strings.Contains(view, "U+202E") && !strings.Contains(stripANSI(view), "202E") {
+		t.Fatalf("prohibited rune is not rendered visibly:\n%q", stripANSI(view))
+	}
+}

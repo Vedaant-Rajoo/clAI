@@ -1,9 +1,8 @@
 # Bash Integration
 
 The Bash integration opens `clai` from a Readline keybinding and inserts an
-accepted command into the current Bash command-line buffer without executing it.
-Bash 4+ inserts at the cursor; the Bash 3.2 compatibility path currently appends
-at the end of the buffer.
+accepted command into the current Bash command-line buffer at the cursor. It
+never executes the command automatically.
 
 See the [shell integration overview](README.md) for shared behavior and the
 internal adapter contract.
@@ -30,10 +29,11 @@ source ~/.bashrc
 ```
 
 The default binding is `ctrl-x ctrl-a`. Press it, enter an intent, review the
-suggested command, and accept it. On Bash 4+, the accepted command is inserted
-at the cursor without running it, so surrounding prompt text is preserved. On
-Bash 3.2, it is appended at the end of the existing buffer. Cancelling with `esc`
-or `ctrl-c` leaves the existing buffer unchanged.
+suggested command, and accept it. The accepted command is inserted at the
+cursor without running it, so surrounding prompt text is preserved. Cancelling
+with `esc` or `ctrl-c` leaves the existing buffer unchanged. Bash 3.2 requires
+Emacs editing mode for its Readline compatibility path; Bash 4+ has no mode
+requirement.
 
 ## Configuration
 

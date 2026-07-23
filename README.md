@@ -17,8 +17,7 @@ clipboard and `--print-command` prints it to stdout.
 `clai` can install an interactive widget for Fish, Bash, or Zsh. The widget
 opens the TUI from a keybinding and inserts the accepted command at the current
 cursor while preserving surrounding prompt text. It never executes the command
-automatically, so you can inspect or edit it before pressing Enter. Bash 3.2 uses
-a compatibility path that currently appends accepted text at the end of the buffer.
+automatically, so you can inspect or edit it before pressing Enter.
 
 - [Shell integration overview](docs/shell/README.md)
 - [Fish setup](docs/shell/fish.md)

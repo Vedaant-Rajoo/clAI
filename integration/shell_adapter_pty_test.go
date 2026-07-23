@@ -234,6 +234,7 @@ func TestGeneratedShellAdaptersMidCursorPTY(t *testing.T) {
 func testShellAdapterMidCursor(t *testing.T, shell shellCase, shellPath string) {
 	t.Helper()
 
+	bash3 := false
 	if shell.name == "bash" {
 		out, err := exec.Command(shellPath, "-c", "printf %s \"${BASH_VERSINFO[0]}\"").Output()
 		if err != nil {
@@ -243,14 +244,11 @@ func testShellAdapterMidCursor(t *testing.T, shell shellCase, shellPath string) 
 		if convErr != nil {
 			t.Fatalf("parse bash major version %q: %v", out, convErr)
 		}
-		if major < 4 {
-			// Bash 3.x drives the widget through a Readline kill-ring macro (the
-			// same compatibility technique fzf uses) because READLINE_POINT is
-			// not writable; that macro yanks accepted text at end-of-line, so
-			// middle-of-buffer cursor insertion is a documented limitation and is
-			// not exercised on this version.
-			t.Skipf("bash %s uses the Readline kill-ring macro; mid-buffer cursor insertion is a documented limitation", strings.TrimSpace(string(out)))
-		}
+		bash3 = major < 4
+	}
+	if bash3 {
+		testBash3MidCursor(t, shell, shellPath)
+		return
 	}
 
 	dir := t.TempDir()
@@ -363,6 +361,103 @@ func testShellAdapterMidCursor(t *testing.T, shell shellCase, shellPath string) 
 // buffer with the cursor positioned mid-string. The inspector records
 // "<cursor>:<buffer length>" so callers can prove both the spliced contents and
 // that the cursor landed at the splice point rather than end-of-buffer.
+// testBash3MidCursor proves the same REQ-WIDGET-002 / REQ-EDGE-WIDGET-001
+// splice on the Bash 3 kill-ring macro path. Bash 3 cannot expose the buffer
+// to a bind -x inspector (READLINE_LINE is not populated), so the buffer and
+// cursor are captured differently: a probe character self-inserts at the
+// cursor, then M-# (insert-comment) accepts the line into history without
+// executing it, and `fc -ln -1` records the exact commented buffer. Seeing
+// "#git statusZ --short" proves both the splice position and that the text
+// after the cursor was preserved.
+func testBash3MidCursor(t *testing.T, shell shellCase, shellPath string) {
+	t.Helper()
+
+	dir := t.TempDir()
+	adapterPath := filepath.Join(dir, "clai."+shell.name)
+	helperPath := filepath.Join(dir, "fake-clai")
+	argsPath := filepath.Join(dir, "helper-args")
+	statePath := filepath.Join(dir, "state")
+	executedPath := filepath.Join(dir, "executed marker")
+
+	adapter, err := shellinit.Script(shell.name)
+	if err != nil {
+		t.Fatalf("generate %s adapter: %v", shell.name, err)
+	}
+	if err := os.WriteFile(adapterPath, []byte(adapter), 0o600); err != nil {
+		t.Fatalf("write generated adapter: %v", err)
+	}
+	if err := os.WriteFile(helperPath, []byte(fakeCLAI), 0o700); err != nil {
+		t.Fatalf("write fake clai helper: %v", err)
+	}
+
+	// The exact REQ-EDGE-WIDGET-001 example: "git sta| --short" + accept "tus".
+	const seedBuffer = "git sta --short"
+	const seedBack = 8 // len(" --short"): C-b times to place the cursor after "git sta".
+	const accepted = "tus"
+	const wantHistory = "#git statusZ --short"
+
+	cmd := exec.Command(shellPath, shell.args...)
+	cmd.Dir = dir
+	cmd.Env = withEnv(os.Environ(), map[string]string{
+		"CLAI_COMMAND":    helperPath,
+		"CLAI_TEST_ARGS":  argsPath,
+		"CLAI_TEST_MODE":  "accept",
+		"CLAI_TEST_VALUE": accepted,
+		"TMPDIR":          dir,
+		"TERM":            "dumb",
+	})
+
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 24, Cols: 4096})
+	if err != nil {
+		t.Fatalf("start clean interactive %s: %v", shell.name, err)
+	}
+	var output lockedBuffer
+	drainDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(&output, ptmx)
+		close(drainDone)
+	}()
+	cleanup := func() {
+		_ = ptmx.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+		select {
+		case <-drainDone:
+		case <-time.After(time.Second):
+		}
+	}
+	defer cleanup()
+
+	readyPath := filepath.Join(dir, "ready")
+	writePTY(t, ptmx, "source "+shellQuote(adapterPath)+"\ncommand touch "+shellQuote(readyPath)+"\n")
+	waitForFile(t, readyPath, ptyTimeout, shell.name+"3 setup", &output)
+
+	writePTY(t, ptmx, seedBuffer)
+	writePTY(t, ptmx, strings.Repeat(string([]byte{0x02}), seedBack)) // C-b: backward-char.
+	writePTY(t, ptmx, string([]byte{0x18, 0x01}))                     // Ctrl-X Ctrl-A: widget macro.
+	waitForFile(t, argsPath, ptyTimeout, shell.name+"3 fake clai invocation", &output)
+	resultPath := assertHelperInvocation(t, argsPath, shell.name)
+	waitForMissingFile(t, resultPath, ptyTimeout, shell.name+"3 result-file cleanup", &output)
+
+	writePTY(t, ptmx, "Z")                       // Probe: self-inserts at the cursor.
+	writePTY(t, ptmx, string([]byte{0x1b, '#'})) // M-#: accept as a comment, never execute.
+	writePTY(t, ptmx, "fc -ln -1 > "+shellQuote(statePath)+"\r")
+	waitForFile(t, statePath, ptyTimeout, shell.name+"3 history capture", &output)
+
+	got, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read captured history: %v\nterminal output:\n%s", err, output.String())
+	}
+	if strings.TrimSpace(string(got)) != wantHistory {
+		t.Fatalf("bash 3 mid-cursor splice mismatch\n got: %q\nwant: %q\nterminal output:\n%s", strings.TrimSpace(string(got)), wantHistory, output.String())
+	}
+	if _, err := os.Stat(executedPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("adapter executed the edited buffer; marker stat error: %v", err)
+	}
+}
+
 func midCursorSetup(shell, adapterPath, statePath, cursorPath, donePath, readyPath, seedBuffer string, seedCursor int) string {
 	adapter := shellQuote(adapterPath)
 	state := shellQuote(statePath)

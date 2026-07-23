@@ -30,8 +30,7 @@ shell-specific pages for configuration examples:
 Press the binding, enter an intent, review the suggestion, and accept it. The
 integration inserts the accepted command at the cursor, preserving any text
 already on the prompt, and does not execute the command. You remain
-responsible for reviewing, editing, and pressing Enter. Bash 3.2 uses a
-compatibility path that currently appends accepted text at the end of the buffer.
+responsible for reviewing, editing, and pressing Enter.
 
 Widget mode requires a Unix-like system with a controlling terminal; it is
 not supported on Windows.
@@ -83,6 +82,7 @@ with a restrictive umask, enforce mode `0600`, and remove it after success,
 cancellation, or failure. They intentionally do not trust an inherited
 `TMPDIR`, because a writable non-sticky directory could allow result-path
 replacement. They read the result only after a successful widget exit and then
-insert the accepted command without executing it. Fish, Zsh, and Bash 4+ insert
-at the current cursor; Bash 3.2 currently appends at the end. Existing prompt text
-remains editable.
+insert the accepted command at the current cursor without executing it. Existing
+prompt text on both sides of the cursor remains editable. Bash 3.2 reaches the
+same cursor splice through a Readline kill-ring macro because its Readline does
+not expose a writable cursor to shell functions.

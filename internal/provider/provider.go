@@ -1,6 +1,10 @@
 package provider
 
-import machinecontext "codeberg.org/newedia/clai/internal/context"
+import (
+	"context"
+
+	machinecontext "codeberg.org/newedia/clai/internal/context"
+)
 
 type Request struct {
 	Intent  string
@@ -21,5 +25,5 @@ type Candidate struct {
 //     are alternates that the current UI ignores.
 //   - A non-nil error means compilation failed; no candidates are usable.
 type Provider interface {
-	Compile(Request) ([]Candidate, error)
+	Compile(context.Context, Request) ([]Candidate, error)
 }

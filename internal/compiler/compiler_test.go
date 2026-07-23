@@ -1,7 +1,6 @@
 package compiler
 
 import (
-	"strings"
 	"testing"
 
 	machinecontext "codeberg.org/newedia/clai/internal/context"
@@ -20,19 +19,19 @@ func TestCompile(t *testing.T) {
 		{"status in git repository", Request{Intent: "show status", Context: gitRepo}, "git status"},
 		{"repo status", Request{Intent: "working tree changes", Context: gitRepo}, "git status"},
 		{"the changes", Request{Intent: "what are the changes", Context: gitRepo}, "git status"},
-		{"status outside git repository", Request{Intent: "show status", Context: noRepo}, "ls -la"},
+		{"status outside git repository", Request{Intent: "show status", Context: noRepo}, ""},
 		{"git diff", Request{Intent: "what changed", Context: gitRepo}, "git diff"},
-		{"git diff outside repo", Request{Intent: "show diff", Context: noRepo}, `echo "No Git repository detected"`},
+		{"git diff outside repo", Request{Intent: "show diff", Context: noRepo}, ""},
 		{"staged diff", Request{Intent: "show staged changes", Context: gitRepo}, "git diff --cached"},
-		{"cached diff outside repo", Request{Intent: "cached diff", Context: noRepo}, `echo "No Git repository detected"`},
+		{"cached diff outside repo", Request{Intent: "cached diff", Context: noRepo}, ""},
 		{"git log", Request{Intent: "recent commits", Context: gitRepo}, "git log --oneline -10"},
-		{"git log outside repo", Request{Intent: "commit history", Context: noRepo}, `echo "No Git repository detected"`},
+		{"git log outside repo", Request{Intent: "commit history", Context: noRepo}, ""},
 		{"current branch", Request{Intent: "current branch", Context: gitRepo}, "git branch --show-current"},
-		{"branch outside repo", Request{Intent: "branch name", Context: noRepo}, `echo "No Git repository detected"`},
+		{"branch outside repo", Request{Intent: "branch name", Context: noRepo}, ""},
 		{"remotes", Request{Intent: "git remote", Context: gitRepo}, "git remote -v"},
-		{"remotes outside repo", Request{Intent: "remote url", Context: noRepo}, `echo "No Git repository detected"`},
+		{"remotes outside repo", Request{Intent: "remote url", Context: noRepo}, ""},
 		{"tags", Request{Intent: "list git tags", Context: gitRepo}, "git tag --list"},
-		{"tags outside repo", Request{Intent: "tags", Context: noRepo}, `echo "No Git repository detected"`},
+		{"tags outside repo", Request{Intent: "tags", Context: noRepo}, ""},
 
 		// Non-git rules.
 		{"pwd", Request{Intent: "where am i"}, "pwd"},
@@ -62,9 +61,6 @@ func TestCompile(t *testing.T) {
 		{"date", Request{Intent: "what time is it"}, "date"},
 		{"docker containers", Request{Intent: "docker containers"}, "docker ps"},
 		{"docker images", Request{Intent: "docker images"}, "docker images"},
-
-		// Fallback.
-		{"fallback", Request{Intent: "make me coffee"}, `echo "No suggestion available yet"`},
 	}
 
 	for _, tt := range tests {
@@ -74,10 +70,20 @@ func TestCompile(t *testing.T) {
 				t.Fatalf("Compile(%+v).Command = %q, want %q", tt.request, result.Command, tt.command)
 			}
 
-			if result.Explanation == "" {
+			if tt.command != "" && result.Explanation == "" {
 				t.Fatalf("Compile(%+v).Explanation is empty", tt.request)
 			}
+			if tt.command == "" && result.Explanation != "" {
+				t.Fatalf("Compile(%+v).Explanation = %q, want empty no-suggestion result", tt.request, result.Explanation)
+			}
 		})
+	}
+}
+
+func TestCompileNoSuggestion(t *testing.T) {
+	result := Compile(Request{Intent: "make me coffee"})
+	if result.Command != "" || result.Explanation != "" {
+		t.Fatalf("Compile(no match) = %+v, want empty result", result)
 	}
 }
 
@@ -88,9 +94,22 @@ func TestCompileIsCaseInsensitive(t *testing.T) {
 	}
 }
 
-func TestNoGitRepositoryResult(t *testing.T) {
-	result := noGitRepositoryResult()
-	if !strings.Contains(result.Command, "No Git repository detected") {
-		t.Fatalf("noGitRepositoryResult().Command = %q", result.Command)
+func TestGitDependentRulesOutsideRepositoryReturnNoSuggestion(t *testing.T) {
+	intents := []string{
+		"git status",
+		"show diff",
+		"cached diff",
+		"commit history",
+		"branch name",
+		"remote url",
+		"git tags",
+	}
+	for _, intent := range intents {
+		t.Run(intent, func(t *testing.T) {
+			result := Compile(Request{Intent: intent, Context: noRepo})
+			if result != (Result{}) {
+				t.Fatalf("Compile(%q outside Git) = %+v, want empty no-suggestion result", intent, result)
+			}
+		})
 	}
 }

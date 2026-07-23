@@ -1,8 +1,7 @@
 // Package auth resolves and stores LLM provider credentials.
 //
 // Resolution precedence: explicit value (flag) > environment variable >
-// OS keyring > config file fallback. Stored credentials are long-lived
-// API keys; on 401 the caller should prompt the user to re-authenticate.
+// OS keyring > config file fallback.
 package auth
 
 import (
@@ -11,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/zalando/go-keyring"
 )
@@ -18,6 +18,52 @@ import (
 const (
 	serviceName = "clai"
 	fileName    = "credentials.json"
+	lockName    = ".credentials.lock"
+)
+
+type keyringStore interface {
+	Get(service, user string) (string, error)
+	Set(service, user, password string) error
+	Delete(service, user string) error
+}
+
+type systemKeyring struct{}
+
+func (systemKeyring) Get(service, user string) (string, error) {
+	return keyring.Get(service, user)
+}
+func (systemKeyring) Set(service, user, password string) error {
+	return keyring.Set(service, user, password)
+}
+func (systemKeyring) Delete(service, user string) error {
+	return keyring.Delete(service, user)
+}
+
+// filesystemHooks are deterministic test checkpoints. Production leaves every
+// hook nil. Hooks run while the cross-process credential lock is held.
+type filesystemHooks struct {
+	afterBaseValidationBeforeAppOpen func(base, app string) error
+	beforeLockAcquire                func(dir, path string) error
+	afterLockAcquired                func(dir, path string) error
+	afterFileValidationBeforeRead    func(dir, path string) error
+	afterCredentialReadWhileLocked   func(dir, path string) error
+	beforeTempCreation               func(dir, path string) error
+	afterTempCreation                func(dir, path, tempName string) error
+	afterRenameBeforeVerification    func(dir, path string) error
+	unlinkTemp                       func(dirfd int, name string) error
+	unlockLock                       func(fd int) error
+	closeLock                        func(file *os.File) error
+	closeCredential                  func(file *os.File) error
+	closeTemp                        func(file *os.File) error
+	closeAppDirectory                func(file *os.File) error
+	closeBaseDirectory               func(file *os.File) error
+	syncDirectory                    func(fd int) error
+}
+
+var (
+	credentialKeyring         keyringStore = systemKeyring{}
+	userConfigDir                          = os.UserConfigDir
+	credentialFilesystemHooks filesystemHooks
 )
 
 // EnvVarFor returns the conventional environment variable for a provider.
@@ -41,75 +87,145 @@ func Resolve(provider, explicit string) (string, error) {
 	if explicit != "" {
 		return explicit, nil
 	}
-
 	if env := EnvVarFor(provider); env != "" {
 		if value := os.Getenv(env); value != "" {
 			return value, nil
 		}
 	}
 
-	key, err := keyring.Get(serviceName, provider)
-	if err == nil {
+	key, keyringErr := credentialKeyring.Get(serviceName, provider)
+	if keyringErr == nil && key != "" {
 		return key, nil
 	}
-	if !errors.Is(err, keyring.ErrNotFound) {
-		// Keyring exists but errored; fall through to file rather than fail.
-		if key, ferr := readFile(provider); ferr == nil && key != "" {
-			return key, nil
-		}
-		return "", fmt.Errorf("read credentials for %s: %w", provider, err)
+	if keyringErr == nil {
+		keyringErr = keyring.ErrNotFound
 	}
 
-	return readFile(provider)
+	key, fileErr := readFile(provider)
+	if fileErr != nil {
+		if errors.Is(keyringErr, keyring.ErrNotFound) {
+			return "", fileErr
+		}
+		return "", errors.Join(
+			fmt.Errorf("read credential from keyring: %w", keyringErr),
+			fmt.Errorf("read credential from config file: %w", fileErr),
+		)
+	}
+	if key != "" {
+		return key, nil
+	}
+	if !errors.Is(keyringErr, keyring.ErrNotFound) {
+		return "", fmt.Errorf("read credential from keyring: %w", keyringErr)
+	}
+	return "", nil
 }
 
-// Store persists an API key, preferring the OS keyring and falling back to
-// a 0600 config file when the keyring is unavailable (headless Linux, CI).
+// Store persists an API key, preferring the OS keyring and falling back to a
+// private config file when the keyring is unavailable.
 func Store(provider, key string) error {
-	if err := keyring.Set(serviceName, provider, key); err == nil {
-		// Clear any stale file copy so there is a single source of truth.
-		_ = deleteFileEntry(provider)
+	if err := credentialKeyring.Set(serviceName, provider, key); err == nil {
+		if err := deleteFileEntry(provider); err != nil {
+			return fmt.Errorf("remove stale config credential: %w", err)
+		}
 		return nil
 	}
-
-	return writeFile(provider, key)
+	if err := writeFile(provider, key); err != nil {
+		return fmt.Errorf("store credential in config file: %w", err)
+	}
+	return nil
 }
 
-// Delete removes the stored key from both keyring and file.
+// Delete removes the stored key from both keyring and file. A missing keyring
+// entry is not an error, but operational errors are returned after config-file
+// cleanup is attempted.
 func Delete(provider string) error {
-	err := keyring.Delete(serviceName, provider)
-	if err != nil && !errors.Is(err, keyring.ErrNotFound) {
-		err = nil // keyring unavailable; still try the file
+	keyringErr := credentialKeyring.Delete(serviceName, provider)
+	if errors.Is(keyringErr, keyring.ErrNotFound) {
+		keyringErr = nil
+	} else if keyringErr != nil {
+		keyringErr = fmt.Errorf("delete credential from keyring: %w", keyringErr)
 	}
-	if ferr := deleteFileEntry(provider); ferr != nil {
-		return ferr
+	fileErr := deleteFileEntry(provider)
+	if fileErr != nil {
+		fileErr = fmt.Errorf("delete credential from config file: %w", fileErr)
 	}
-	return err
+	return errors.Join(keyringErr, fileErr)
 }
 
-// Source reports where the resolved credential came from, for `auth status`.
+// Source reports where the resolved credential came from, for compatibility
+// with existing callers. It returns "none" when source inspection fails.
+// Callers that must distinguish absence from unsafe storage or backend failure
+// should use SourceWithError.
 func Source(provider, explicit string) string {
-	switch {
-	case explicit != "":
-		return "flag"
-	case EnvVarFor(provider) != "" && os.Getenv(EnvVarFor(provider)) != "":
-		return "env (" + EnvVarFor(provider) + ")"
+	source, err := SourceWithError(provider, explicit)
+	if err != nil {
+		return "none"
 	}
-	if _, err := keyring.Get(serviceName, provider); err == nil {
-		return "keyring"
+	return source
+}
+
+// SourceWithError reports where the resolved credential came from while
+// preserving storage validation and keyring errors.
+func SourceWithError(provider, explicit string) (string, error) {
+	if explicit != "" {
+		return "flag", nil
 	}
-	if key, err := readFile(provider); err == nil && key != "" {
-		return "config file"
+	if env := EnvVarFor(provider); env != "" && os.Getenv(env) != "" {
+		return "env (" + env + ")", nil
 	}
-	return "none"
+
+	key, keyringErr := credentialKeyring.Get(serviceName, provider)
+	if keyringErr == nil && key != "" {
+		return "keyring", nil
+	}
+	if keyringErr == nil {
+		keyringErr = keyring.ErrNotFound
+	}
+
+	key, fileErr := readFile(provider)
+	if fileErr != nil {
+		if errors.Is(keyringErr, keyring.ErrNotFound) {
+			return "", fileErr
+		}
+		return "", errors.Join(
+			fmt.Errorf("inspect credential keyring: %w", keyringErr),
+			fmt.Errorf("inspect credential config file: %w", fileErr),
+		)
+	}
+	if key != "" {
+		return "config file", nil
+	}
+	if !errors.Is(keyringErr, keyring.ErrNotFound) {
+		return "", fmt.Errorf("inspect credential keyring: %w", keyringErr)
+	}
+	return "none", nil
 }
 
 func configPath() (string, error) {
-	dir, err := os.UserConfigDir()
+	dir, err := userConfigDir()
 	if err != nil {
+		return "", fmt.Errorf("locate user config directory: %w", err)
+	}
+	if err := validateConfiguredBasePath(dir); err != nil {
 		return "", err
 	}
 	return filepath.Join(dir, "clai", fileName), nil
+}
+
+func validateConfiguredBasePath(path string) error {
+	if !filepath.IsAbs(path) {
+		return errors.New("user config directory must be absolute")
+	}
+	volume := filepath.VolumeName(path)
+	remainder := strings.TrimPrefix(path, volume)
+	for _, component := range strings.FieldsFunc(remainder, func(r rune) bool {
+		return r == '/' || r == '\\'
+	}) {
+		if component == "." || component == ".." {
+			return errors.New("user config directory must not contain dot path components")
+		}
+	}
+	return nil
 }
 
 func readFile(provider string) (string, error) {
@@ -117,16 +233,13 @@ func readFile(provider string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return "", nil
-	}
-	if err != nil {
+	data, exists, err := secureReadCredentialFile(path)
+	if err != nil || !exists {
 		return "", err
 	}
-	var creds map[string]string
-	if err := json.Unmarshal(data, &creds); err != nil {
-		return "", fmt.Errorf("parse %s: %w", path, err)
+	creds, err := decodeCredentials(path, data)
+	if err != nil {
+		return "", err
 	}
 	return creds[provider], nil
 }
@@ -136,19 +249,10 @@ func writeFile(provider, key string) error {
 	if err != nil {
 		return err
 	}
-	creds := map[string]string{}
-	if data, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(data, &creds)
-	}
-	creds[provider] = key
-	data, err := json.MarshalIndent(creds, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0o600)
+	return secureMutateCredentialFile(path, true, func(creds map[string]string) bool {
+		creds[provider] = key
+		return true
+	})
 }
 
 func deleteFileEntry(provider string) error {
@@ -156,24 +260,22 @@ func deleteFileEntry(provider string) error {
 	if err != nil {
 		return err
 	}
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
+	return secureMutateCredentialFile(path, false, func(creds map[string]string) bool {
+		if _, ok := creds[provider]; !ok {
+			return false
+		}
+		delete(creds, provider)
+		return true
+	})
+}
+
+func decodeCredentials(path string, data []byte) (map[string]string, error) {
 	var creds map[string]string
 	if err := json.Unmarshal(data, &creds); err != nil {
-		return err
+		return nil, fmt.Errorf("parse credential file %q: %w", path, err)
 	}
-	if _, ok := creds[provider]; !ok {
-		return nil
+	if creds == nil {
+		creds = map[string]string{}
 	}
-	delete(creds, provider)
-	out, err := json.MarshalIndent(creds, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, out, 0o600)
+	return creds, nil
 }

@@ -13,6 +13,9 @@ func TestCollectFallsBackToConfiguredShell(t *testing.T) {
 	if context.Shell != "/bin/fish" {
 		t.Fatalf("Shell = %q, want /bin/fish", context.Shell)
 	}
+	if context.ShellProvenance != "SHELL" {
+		t.Fatalf("ShellProvenance = %q, want SHELL", context.ShellProvenance)
+	}
 }
 
 func TestCollectWithShellOverridesConfiguredShell(t *testing.T) {
@@ -24,6 +27,9 @@ func TestCollectWithShellOverridesConfiguredShell(t *testing.T) {
 			if context.Shell != shell {
 				t.Fatalf("Shell = %q, want %q", context.Shell, shell)
 			}
+			if context.ShellProvenance != "widget-declared-shell" {
+				t.Fatalf("ShellProvenance = %q, want widget-declared-shell", context.ShellProvenance)
+			}
 		})
 	}
 }
@@ -34,6 +40,9 @@ func TestCollectWithShellRejectsUnsupportedOverride(t *testing.T) {
 	context := CollectWithShell("sh")
 	if context.Shell != "/bin/zsh" {
 		t.Fatalf("Shell = %q, want fallback /bin/zsh", context.Shell)
+	}
+	if context.ShellProvenance != "SHELL" {
+		t.Fatalf("ShellProvenance = %q, want SHELL", context.ShellProvenance)
 	}
 }
 

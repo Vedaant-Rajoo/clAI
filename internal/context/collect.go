@@ -10,6 +10,7 @@ import (
 type Context struct {
 	WorkingDirectory string
 	Shell            string
+	ShellProvenance  string
 	OS               string
 	GitRepository    bool
 	GitRoot          string
@@ -26,13 +27,16 @@ func CollectWithShell(shell string) Context {
 
 func collect(activeShell string) Context {
 	shell := os.Getenv("SHELL")
+	shellProvenance := "SHELL"
 	if isSupportedShell(activeShell) {
 		shell = activeShell
+		shellProvenance = "widget-declared-shell"
 	}
 
 	c := Context{
-		Shell: shell,
-		OS:    runtime.GOOS,
+		Shell:           shell,
+		ShellProvenance: shellProvenance,
+		OS:              runtime.GOOS,
 	}
 
 	if wd, err := os.Getwd(); err == nil {

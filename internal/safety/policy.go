@@ -7,6 +7,7 @@ import (
 
 	"codeberg.org/newedia/clai/internal/shellsyntax"
 	"codeberg.org/newedia/clai/internal/textsafe"
+	"codeberg.org/newedia/clai/internal/validate"
 )
 
 type Decision string
@@ -16,8 +17,6 @@ const (
 	Warn  Decision = "warn"
 	Block Decision = "block"
 )
-
-const maxCommandBytes = 8 * 1024
 
 type Result struct {
 	Decision Decision
@@ -49,7 +48,7 @@ func Evaluate(command string) Result {
 	if textsafe.ContainsProhibitedCommandFormat(command) {
 		add(Block, "Command contains a prohibited invisible or bidirectional format character.")
 	}
-	if len(command) > maxCommandBytes {
+	if len(command) > validate.MaxCommandBytes {
 		add(Block, "Command exceeds the maximum size eligible for safety analysis.")
 		return aggregate(findings)
 	}
@@ -86,7 +85,7 @@ func classifyExecutable(resolved shellsyntax.ExecutableResolution, commandIndex,
 	gitArgs, gitCommandKnown := gitCommand(args)
 
 	switch {
-	case slices.Contains([]string{"rm", "dd", "mkfs", "mkfs.ext2", "mkfs.ext3", "mkfs.ext4", "mkfs.xfs", "mkfs.btrfs", "shutdown", "reboot", "halt", "poweroff", "kill", "pkill", "killall"}, base):
+	case slices.Contains([]string{"rm", "dd", "truncate", "mkfs", "mkfs.ext2", "mkfs.ext3", "mkfs.ext4", "mkfs.xfs", "mkfs.btrfs", "fdisk", "parted", "wipefs", "shutdown", "reboot", "halt", "poweroff", "kill", "pkill", "killall"}, base):
 		add(Block, "Command invokes a blocked destructive executable: "+base+".")
 	case slices.Contains([]string{"sudo", "doas", "su"}, base):
 		add(Block, "Command invokes an elevated-privilege executable: "+base+".")
@@ -478,10 +477,44 @@ func gitDestructive(args []string) bool {
 	if len(args) == 0 {
 		return false
 	}
-	if args[0] == "clean" {
+	return gitSubcommandDestructive(args[0], args[1:])
+}
+
+// gitSubcommandDestructive reports whether a resolved git subcommand together
+// with its trailing arguments performs a destructive operation. Force flags are
+// matched precisely: --force/-f only applies to push, -D (or the equivalent
+// --delete --force pair) only to branch, and drop/clear only to stash.
+func gitSubcommandDestructive(subcommand string, rest []string) bool {
+	switch subcommand {
+	case "clean":
+		return true
+	case "reset":
+		return slices.Contains(rest, "--hard")
+	case "push":
+		return gitPushForced(rest)
+	case "branch":
+		return gitBranchForceDeleted(rest)
+	case "stash":
+		return len(rest) > 0 && (rest[0] == "drop" || rest[0] == "clear")
+	}
+	return false
+}
+
+func gitPushForced(rest []string) bool {
+	for _, value := range rest {
+		if value == "--force" || value == "-f" || value == "--force-with-lease" ||
+			strings.HasPrefix(value, "--force-with-lease=") {
+			return true
+		}
+	}
+	return false
+}
+
+func gitBranchForceDeleted(rest []string) bool {
+	if slices.Contains(rest, "-D") {
 		return true
 	}
-	return args[0] == "reset" && slices.Contains(args[1:], "--hard")
+	return slices.Contains(rest, "--delete") && slices.Contains(rest, "--force")
 }
 
 // gitDestructiveUnderUncertainty prevents a newly introduced or otherwise
@@ -489,10 +522,7 @@ func gitDestructive(args []string) bool {
 // a warning. It is used only after exact global-option resolution failed.
 func gitDestructiveUnderUncertainty(args []string) bool {
 	for index, value := range args {
-		if value == "clean" {
-			return true
-		}
-		if value == "reset" && slices.Contains(args[index+1:], "--hard") {
+		if gitSubcommandDestructive(value, args[index+1:]) {
 			return true
 		}
 	}

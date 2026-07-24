@@ -141,8 +141,15 @@ func TestCompileDoesNotReflectCustomHTTPReasonOrBody(t *testing.T) {
 	_, err := (Provider{APIKey: "test", endpoint: "http://localhost/v1", client: client}).Compile(
 		context.Background(), provider.Request{Intent: "list files"},
 	)
-	if err == nil || err.Error() != "openrouter: HTTP status 599" {
-		t.Fatalf("err = %v, want stable status-code-only error", err)
+	// 599 is a 5xx, so it now classifies as a transient upstream error. The
+	// message must remain a stable, deterministic function of the status code
+	// only: no upstream reason phrase or body may leak into it.
+	const wantErr = "openrouter: upstream server error (HTTP 599): transient upstream failure, retry later"
+	if err == nil || err.Error() != wantErr {
+		t.Fatalf("err = %v, want %q", err, wantErr)
+	}
+	if !errors.Is(err, ErrServer) {
+		t.Fatalf("err = %v, want errors.Is ErrServer", err)
 	}
 	if strings.Contains(err.Error(), sentinel) {
 		t.Fatalf("untrusted response text reflected in error: %v", err)
@@ -468,6 +475,135 @@ func TestReceiptFieldOrdering(t *testing.T) {
 	}
 	if want := []string{machinecontext.FieldOSFamily, machinecontext.FieldShellFamily, machinecontext.FieldProjectKind}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("selected order = %v, want %v", got, want)
+	}
+}
+
+func TestCompileClassifiesHTTPErrors(t *testing.T) {
+	const apiKey = "super-secret-key"
+	tests := []struct {
+		name        string
+		status      int
+		retryAfter  string
+		sentinel    error
+		wantSubstrs []string
+		notSubstrs  []string
+	}{
+		{"unauthorized", http.StatusUnauthorized, "", ErrAuth,
+			[]string{"openrouter:", "authentication error", "HTTP 401", "re-authenticate"}, nil},
+		{"forbidden", http.StatusForbidden, "", ErrAuth,
+			[]string{"authentication error", "HTTP 403"}, nil},
+		{"rate-limited-with-retry-after", http.StatusTooManyRequests, "42", ErrRateLimited,
+			[]string{"rate limited", "HTTP 429", "retry after 42", "back off"}, nil},
+		{"rate-limited-no-retry-after", http.StatusTooManyRequests, "", ErrRateLimited,
+			[]string{"rate limited", "HTTP 429", "back off"}, []string{"retry after"}},
+		{"internal-server-error", http.StatusInternalServerError, "", ErrServer,
+			[]string{"upstream server error", "HTTP 500", "retry later"}, nil},
+		{"service-unavailable", http.StatusServiceUnavailable, "", ErrServer,
+			[]string{"upstream server error", "HTTP 503", "retry later"}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tt.retryAfter != "" {
+					w.Header().Set("Retry-After", tt.retryAfter)
+				}
+				w.WriteHeader(tt.status)
+				io.WriteString(w, "SENTINEL upstream body must not leak")
+			}))
+			defer server.Close()
+
+			_, err := (Provider{APIKey: apiKey, endpoint: server.URL}).Compile(
+				context.Background(), provider.Request{Intent: "list files"},
+			)
+			if err == nil {
+				t.Fatalf("status %d: err = nil, want classified error", tt.status)
+			}
+			if !errors.Is(err, tt.sentinel) {
+				t.Fatalf("status %d: err = %v, want errors.Is %v", tt.status, err, tt.sentinel)
+			}
+			for _, sub := range tt.wantSubstrs {
+				if !strings.Contains(err.Error(), sub) {
+					t.Errorf("status %d: err = %q, want substring %q", tt.status, err.Error(), sub)
+				}
+			}
+			for _, sub := range tt.notSubstrs {
+				if strings.Contains(err.Error(), sub) {
+					t.Errorf("status %d: err = %q, must not contain %q", tt.status, err.Error(), sub)
+				}
+			}
+			if strings.Contains(err.Error(), apiKey) {
+				t.Fatalf("status %d: API key leaked into error: %v", tt.status, err)
+			}
+			if strings.Contains(err.Error(), "SENTINEL") {
+				t.Fatalf("status %d: upstream body leaked into error: %v", tt.status, err)
+			}
+		})
+	}
+}
+
+func TestCompileGenericStatusFallback(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusNotFound, http.StatusTeapot} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+
+			_, err := (Provider{APIKey: "test", endpoint: server.URL}).Compile(
+				context.Background(), provider.Request{Intent: "list files"},
+			)
+			want := fmt.Sprintf("openrouter: HTTP status %d", status)
+			if err == nil || err.Error() != want {
+				t.Fatalf("err = %v, want %q", err, want)
+			}
+			if errors.Is(err, ErrAuth) || errors.Is(err, ErrRateLimited) || errors.Is(err, ErrServer) {
+				t.Fatalf("generic status %d matched a specific sentinel: %v", status, err)
+			}
+		})
+	}
+}
+
+func TestCompileSucceedsOn200(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"choices":[{"message":{"content":"{\"command\":\"ls -la\",\"explanation\":\"lists files\"}"}}]}`)
+	}))
+	defer server.Close()
+
+	candidates, err := (Provider{APIKey: "test", endpoint: server.URL}).Compile(
+		context.Background(), provider.Request{Intent: "list files"},
+	)
+	if err != nil {
+		t.Fatalf("200 response failed: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].Command != "ls -la" {
+		t.Fatalf("candidates = %+v, want single ls -la candidate", candidates)
+	}
+}
+
+func TestSanitizeRetryAfter(t *testing.T) {
+	if got := sanitizeRetryAfter("120"); got != "120" {
+		t.Errorf("seconds: got %q, want %q", got, "120")
+	}
+	if got := sanitizeRetryAfter("  30  "); got != "30" {
+		t.Errorf("trimmed: got %q, want %q", got, "30")
+	}
+	if got := sanitizeRetryAfter("Wed, 21 Oct 2015 07:28:00 GMT"); got != "Wed, 21 Oct 2015 07:28:00 GMT" {
+		t.Errorf("http-date: got %q", got)
+	}
+	if got := sanitizeRetryAfter(""); got != "" {
+		t.Errorf("empty: got %q, want empty", got)
+	}
+	// Control/escape sequences from a hostile upstream must not survive verbatim
+	// into a terminal-rendered error.
+	for _, raw := range []string{"30\x1b[31mred", "30\ninjected", "30\r\n"} {
+		if got := sanitizeRetryAfter(raw); strings.ContainsAny(got, "\x1b\n\r") {
+			t.Errorf("sanitizeRetryAfter(%q) = %q still contains a raw control character", raw, got)
+		}
+	}
+	// The rendered value is hard-bounded regardless of input length.
+	if got := sanitizeRetryAfter(strings.Repeat("9", 500)); len([]rune(got)) > maxRetryAfterRunes {
+		t.Errorf("length not bounded: %d runes", len([]rune(got)))
 	}
 }
 

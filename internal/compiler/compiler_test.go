@@ -1,9 +1,11 @@
 package compiler
 
 import (
+	"strings"
 	"testing"
 
 	machinecontext "codeberg.org/newedia/clai/internal/context"
+	"codeberg.org/newedia/clai/internal/validate"
 )
 
 var gitRepo = machinecontext.Context{GitRepository: true}
@@ -44,8 +46,8 @@ func TestCompile(t *testing.T) {
 		{"large files", Request{Intent: "largest files"}, "du -ah . | sort -hr | head -20"},
 		{"directory size", Request{Intent: "folder size"}, "du -sh ."},
 		{"disk space", Request{Intent: "free space"}, "df -h"},
-		{"todo", Request{Intent: "show todo"}, "rg TODO"},
-		{"fixme", Request{Intent: "show fixme"}, "rg TODO"},
+		{"todo", Request{Intent: "show todo"}, "rg 'TODO|FIXME'"},
+		{"fixme", Request{Intent: "show fixme"}, "rg 'TODO|FIXME'"},
 		{"search", Request{Intent: "find text"}, "rg <pattern>"},
 		{"grep", Request{Intent: "grep"}, "rg <pattern>"},
 		{"go test", Request{Intent: "run tests"}, "go test ./..."},
@@ -54,8 +56,8 @@ func TestCompile(t *testing.T) {
 		{"processes", Request{Intent: "running processes"}, "ps aux"},
 		{"ports", Request{Intent: "open ports"}, "lsof -iTCP -sTCP:LISTEN -n -P"},
 		{"environment", Request{Intent: "env vars"}, "printenv"},
-		{"path variable", Request{Intent: "show path"}, "printf '%s\n' \"$PATH\""},
-		{"which shell", Request{Intent: "which shell"}, "printf '%s\n' \"$SHELL\""},
+		{"path variable", Request{Intent: "show path"}, "printenv PATH"},
+		{"which shell", Request{Intent: "which shell"}, "printenv SHELL"},
 		{"hostname", Request{Intent: "machine name"}, "hostname"},
 		{"network", Request{Intent: "ip address"}, "ifconfig"},
 		{"date", Request{Intent: "what time is it"}, "date"},
@@ -91,6 +93,40 @@ func TestCompileIsCaseInsensitive(t *testing.T) {
 	result := Compile(Request{Intent: "GIT STATUS", Context: gitRepo})
 	if result.Command != "git status" {
 		t.Fatalf("Compile(uppercase).Command = %q, want %q", result.Command, "git status")
+	}
+}
+
+func TestCompiledCommandsPassValidation(t *testing.T) {
+	intents := []string{
+		"show path",
+		"path variable",
+		"which shell",
+		"current shell",
+		"show todo",
+		"show fixme",
+	}
+	for _, intent := range intents {
+		t.Run(intent, func(t *testing.T) {
+			result := Compile(Request{Intent: intent})
+			if result.Command == "" {
+				t.Fatalf("Compile(%q).Command is empty, want a suggestion", intent)
+			}
+
+			if got := validate.Command(result.Command); !got.Valid {
+				t.Fatalf("validate.Command(%q).Valid = false, want true; reasons: %v", result.Command, got.Reasons)
+			}
+		})
+	}
+}
+
+func TestFixmeIntentSearchesForFixme(t *testing.T) {
+	result := Compile(Request{Intent: "show fixme"})
+	if !strings.Contains(result.Command, "FIXME") {
+		t.Fatalf("Compile(fixme).Command = %q, want it to contain %q", result.Command, "FIXME")
+	}
+
+	if got := validate.Command(result.Command); !got.Valid {
+		t.Fatalf("validate.Command(%q).Valid = false, want true; reasons: %v", result.Command, got.Reasons)
 	}
 }
 

@@ -125,8 +125,8 @@ func Compile(request Request) Result {
 		}
 	case containsAny(normalized, "todo", "fixme"):
 		return Result{
-			Command:     "rg TODO",
-			Explanation: "Searches the current directory for TODO comments.",
+			Command:     "rg 'TODO|FIXME'",
+			Explanation: "Searches the current directory for TODO and FIXME comments.",
 		}
 	case containsAny(normalized, "search", "find text", "grep"):
 		return Result{
@@ -165,12 +165,12 @@ func Compile(request Request) Result {
 		}
 	case containsAny(normalized, "path variable", "show path"):
 		return Result{
-			Command:     "printf '%s\n' \"$PATH\"",
+			Command:     "printenv PATH",
 			Explanation: "Prints the shell PATH value.",
 		}
 	case containsAny(normalized, "which shell", "current shell", "shell"):
 		return Result{
-			Command:     "printf '%s\n' \"$SHELL\"",
+			Command:     "printenv SHELL",
 			Explanation: "Prints the configured login shell path.",
 		}
 	case containsAny(normalized, "hostname", "machine name"):

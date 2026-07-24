@@ -17,14 +17,36 @@ import (
 
 	machinecontext "codeberg.org/newedia/clai/internal/context"
 	"codeberg.org/newedia/clai/internal/provider"
+	"codeberg.org/newedia/clai/internal/textsafe"
 )
 
 // DefaultModel is used when the caller does not specify one.
-const DefaultModel = "anthropic/claude-sonnet-4"
+//
+// Verified against OpenRouter's live catalog on 2026-07-23: "anthropic/claude-sonnet-5"
+// resolves (canonical "anthropic/claude-sonnet-5-20260630", the current
+// Sonnet-class model). The prior default "anthropic/claude-sonnet-4" has been
+// retired from the catalog, so this migration is required, not cosmetic.
+const DefaultModel = "anthropic/claude-sonnet-5"
 
 const (
 	defaultEndpoint  = "https://openrouter.ai/api/v1/chat/completions"
 	maxResponseBytes = 4 << 20
+	// maxRetryAfterRunes hard-bounds how much of an upstream Retry-After header
+	// value is ever echoed back in an error message.
+	maxRetryAfterRunes = 64
+)
+
+// Sentinel errors classify non-2xx OpenRouter responses so callers can react
+// with errors.Is without matching on message text. They carry no
+// upstream-controlled data and every returned error stays prefixed "openrouter:".
+var (
+	// ErrAuth reports a rejected credential (HTTP 401/403). The API key is
+	// never included in the error.
+	ErrAuth = errors.New("openrouter: authentication error")
+	// ErrRateLimited reports throttling (HTTP 429).
+	ErrRateLimited = errors.New("openrouter: rate limited")
+	// ErrServer reports a transient upstream failure (HTTP 5xx).
+	ErrServer = errors.New("openrouter: upstream server error")
 )
 
 const systemPrompt = `You convert a natural-language intent into a single shell command.
@@ -158,7 +180,7 @@ func (p Provider) Compile(ctx context.Context, request provider.Request) ([]prov
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return nil, fmt.Errorf("openrouter: HTTP status %d", response.StatusCode)
+		return nil, classifyHTTPError(response)
 	}
 	responseBytes, err := readResponseBody(response.Body)
 	if err != nil {
@@ -255,6 +277,44 @@ func readResponseBody(reader io.Reader) ([]byte, error) {
 		return nil, errors.New("openrouter: response exceeds size limit")
 	}
 	return body, nil
+}
+
+// classifyHTTPError maps a non-2xx response to a differentiated, wrappable
+// error. Only the numeric status and (for 429) a sanitized Retry-After value
+// are ever reflected: the response body and upstream reason phrase are never
+// read or echoed, so a hostile upstream cannot inject text into the error.
+func classifyHTTPError(response *http.Response) error {
+	status := response.StatusCode
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return fmt.Errorf("%w (HTTP %d): re-authenticate or check the API key (run `clai auth login --provider openrouter` or set OPENROUTER_API_KEY)", ErrAuth, status)
+	case status == http.StatusTooManyRequests:
+		if retry := sanitizeRetryAfter(response.Header.Get("Retry-After")); retry != "" {
+			return fmt.Errorf("%w (HTTP %d): retry after %s, then back off before retrying", ErrRateLimited, status, retry)
+		}
+		return fmt.Errorf("%w (HTTP %d): back off before retrying", ErrRateLimited, status)
+	case status >= 500 && status <= 599:
+		return fmt.Errorf("%w (HTTP %d): transient upstream failure, retry later", ErrServer, status)
+	default:
+		return fmt.Errorf("openrouter: HTTP status %d", status)
+	}
+}
+
+// sanitizeRetryAfter returns a terminal-safe, length-bounded rendering of an
+// upstream Retry-After header value, or "" when it is absent/blank. The value
+// is upstream-controlled, so it is hard-capped and passed through
+// textsafe.Visible to neutralize control and format characters before it can
+// reach a terminal-rendered error.
+func sanitizeRetryAfter(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) > maxRetryAfterRunes {
+		runes = runes[:maxRetryAfterRunes]
+	}
+	return textsafe.Visible(string(runes))
 }
 
 func classifyProxyMode(client *http.Client, request *http.Request) string {

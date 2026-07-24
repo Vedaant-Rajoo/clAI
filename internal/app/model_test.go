@@ -271,12 +271,18 @@ func renderUntrustedField(t *testing.T, field, payload string) string {
 	case "explanation":
 		m.screen = screenReview
 		m.explanation = payload
+		// The Why section is collapsed by default; expand it so the untrusted
+		// explanation is actually rendered for the sanitization assertion.
+		m.whyExpanded = true
 	case "intent":
 		m.screen = screenReview
 		m.intent = payload
 	case "context":
 		m.screen = screenReview
 		m.context = machinecontext.Context{WorkingDirectory: payload}
+		// The Context used section is collapsed by default; expand it so the
+		// untrusted working directory is actually rendered.
+		m.contextExpanded = true
 	case "error":
 		m.screen = screenInput
 		m.err = errors.New(payload)
@@ -759,5 +765,128 @@ func TestUntrustedReasonTextIsSanitizedInReviewView(t *testing.T) {
 	}
 	if !strings.Contains(view, "U+202E") && !strings.Contains(stripANSI(view), "202E") {
 		t.Fatalf("prohibited rune is not rendered visibly:\n%q", stripANSI(view))
+	}
+}
+
+// TestReviewCollapsesOptionalRowsUnderHeightBudget proves the review screen
+// keeps the hero command, its validation/safety status, and the action hints on
+// a terminal too short to hold everything, dropping the optional echoed intent
+// first rather than clipping an essential row.
+func TestReviewCollapsesOptionalRowsUnderHeightBudget(t *testing.T) {
+	p := stubProvider{candidates: []provider.Candidate{
+		{Command: "git status", Explanation: "reports the tree state"},
+	}}
+	m := submitIntent(t, NewWithProvider(p), "SENTINEL_INTENT")
+	if m.screen != screenReview {
+		t.Fatalf("screen = %v, want review", m.screen)
+	}
+
+	short, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 3})
+	shortView := stripANSI(short.(Model).View())
+	for _, needle := range []string{"git", "valid", "allow", "enter accept"} {
+		if !strings.Contains(shortView, needle) {
+			t.Fatalf("short review drops essential %q:\n%s", needle, shortView)
+		}
+	}
+	if strings.Contains(shortView, "SENTINEL_INTENT") {
+		t.Fatalf("short review kept the optional intent row instead of dropping it:\n%s", shortView)
+	}
+
+	tall, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 40})
+	tallView := stripANSI(tall.(Model).View())
+	if !strings.Contains(tallView, "SENTINEL_INTENT") {
+		t.Fatalf("tall review hides the intent row that fits its budget:\n%s", tallView)
+	}
+}
+
+// TestReviewTogglesWhyAndContext proves the Why and Context used sections are
+// collapsed by default and are revealed — then hidden again — by the "?" and
+// "c" toggles, keeping the default review minimal while the detail stays one
+// keystroke away.
+func TestReviewTogglesWhyAndContext(t *testing.T) {
+	p := stubProvider{candidates: []provider.Candidate{
+		{Command: "git status", Explanation: "BECAUSE_EXPLANATION"},
+	}}
+	m := submitIntent(t, NewWithProvider(p), "intent")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 40})
+	m = updated.(Model)
+
+	if v := stripANSI(m.View()); strings.Contains(v, "BECAUSE_EXPLANATION") || strings.Contains(v, "cwd:") {
+		t.Fatalf("default review is not minimal:\n%s", v)
+	}
+
+	press := func(m Model, r rune) Model {
+		t.Helper()
+		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		return next.(Model)
+	}
+
+	m = press(m, '?')
+	if v := stripANSI(m.View()); !strings.Contains(v, "BECAUSE_EXPLANATION") {
+		t.Fatalf("? did not reveal the explanation:\n%s", v)
+	}
+	m = press(m, '?')
+	if v := stripANSI(m.View()); strings.Contains(v, "BECAUSE_EXPLANATION") {
+		t.Fatalf("? did not collapse the explanation again:\n%s", v)
+	}
+
+	m = press(m, 'c')
+	if v := stripANSI(m.View()); !strings.Contains(v, "cwd:") {
+		t.Fatalf("c did not reveal the context:\n%s", v)
+	}
+	m = press(m, 'c')
+	if v := stripANSI(m.View()); strings.Contains(v, "cwd:") {
+		t.Fatalf("c did not collapse the context again:\n%s", v)
+	}
+}
+
+// TestExpandedSectionCollapsesToHintWhenItCannotFit proves a section the user
+// opened but the height budget cannot hold collapses to a one-line hint rather
+// than clipping an essential row, so the user learns the detail is hidden and
+// how to see it.
+func TestExpandedSectionCollapsesToHintWhenItCannotFit(t *testing.T) {
+	p := stubProvider{candidates: []provider.Candidate{
+		{Command: "git status", Explanation: "BECAUSE_EXPLANATION"},
+	}}
+	m := submitIntent(t, NewWithProvider(p), "intent")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 6})
+	m = updated.(Model)
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+	m = next.(Model)
+
+	view := stripANSI(m.View())
+	if strings.Contains(view, "BECAUSE_EXPLANATION") {
+		t.Fatalf("explanation body was rendered despite the height budget:\n%s", view)
+	}
+	if !strings.Contains(view, "why hidden") {
+		t.Fatalf("collapsed Why section did not fall back to a hint:\n%s", view)
+	}
+	for _, needle := range []string{"git", "enter accept"} {
+		if !strings.Contains(view, needle) {
+			t.Fatalf("budget fallback dropped essential %q:\n%s", needle, view)
+		}
+	}
+}
+
+// TestFrameBudgetPaddingMatchesBaseStyle guards the height/width budget math
+// against a silent drift in baseStyle's Padding(1, 2). Every view subtracts
+// frameVerticalPadding from the terminal height and wraps the row measurer at the
+// width less frameHorizontalPadding; both constants mirror baseStyle's padding.
+// If someone changes the frame padding without updating the budget, the views
+// would over- or under-estimate their rendered height and could clip an
+// essential row. Deriving the expected totals from baseStyle.GetPadding* keeps
+// the constants and the frame in lockstep.
+func TestFrameBudgetPaddingMatchesBaseStyle(t *testing.T) {
+	top := baseStyle.GetPaddingTop()
+	right := baseStyle.GetPaddingRight()
+	bottom := baseStyle.GetPaddingBottom()
+	left := baseStyle.GetPaddingLeft()
+
+	if got, want := frameVerticalPadding, top+bottom; got != want {
+		t.Fatalf("frameVerticalPadding = %d, but baseStyle top+bottom padding = %d; update the height budget to match baseStyle's Padding", got, want)
+	}
+	if got, want := frameHorizontalPadding, left+right; got != want {
+		t.Fatalf("frameHorizontalPadding = %d, but baseStyle left+right padding = %d; update the row measurer to match baseStyle's Padding", got, want)
 	}
 }

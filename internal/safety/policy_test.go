@@ -5,6 +5,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"codeberg.org/newedia/clai/internal/validate"
 )
 
 func TestEvaluateStructuralPolicyMatrix(t *testing.T) {
@@ -50,6 +52,19 @@ func TestEvaluateStructuralPolicyMatrix(t *testing.T) {
 		{name: "git attached attr source reset blocks", command: "git --attr-source=HEAD reset --hard HEAD", decision: Block, reason: "destructive operation"},
 		{name: "future git option cannot hide clean", command: "git --future-option clean -fd", decision: Block, reason: "destructive operation"},
 		{name: "future git option cannot hide hard reset", command: "git --future-option reset --hard HEAD", decision: Block, reason: "destructive operation"},
+		{name: "blocks truncate", command: "truncate -s 0 f", decision: Block, reason: "destructive executable: truncate"},
+		{name: "blocks fdisk", command: "fdisk /dev/sda", decision: Block, reason: "destructive executable: fdisk"},
+		{name: "blocks parted", command: "parted /dev/sda", decision: Block, reason: "destructive executable: parted"},
+		{name: "blocks wipefs", command: "wipefs -a /dev/sda", decision: Block, reason: "destructive executable: wipefs"},
+		{name: "git push force blocks", command: "git push --force", decision: Block, reason: "destructive operation"},
+		{name: "git push short force blocks", command: "git push -f origin main", decision: Block, reason: "destructive operation"},
+		{name: "git push force with lease blocks", command: "git push --force-with-lease", decision: Block, reason: "destructive operation"},
+		{name: "git branch force delete blocks", command: "git branch -D feature", decision: Block, reason: "destructive operation"},
+		{name: "git branch long force delete blocks", command: "git branch --delete --force feature", decision: Block, reason: "destructive operation"},
+		{name: "git stash drop blocks", command: "git stash drop", decision: Block, reason: "destructive operation"},
+		{name: "git stash clear blocks", command: "git stash clear", decision: Block, reason: "destructive operation"},
+		{name: "git push without force warns", command: "git push origin main", decision: Warn, reason: "not recognized"},
+		{name: "git branch delete merged unchanged allows", command: "git branch -d merged", decision: Allow, reason: "read-only"},
 		{name: "git attached directory status allows", command: "git -C/tmp/repo status", decision: Allow, reason: "read-only"},
 		{name: "git add warns", command: "git add .", decision: Warn, reason: "repository state"},
 		{name: "docker pull warns", command: "docker pull image", decision: Warn, reason: "Docker command"},
@@ -199,11 +214,11 @@ func TestEvaluateOrdinaryUnicodeAndOtherFormatUnaffected(t *testing.T) {
 }
 
 func TestEvaluateSizeBoundaryAndDeterministicReasons(t *testing.T) {
-	atLimit := "printf " + strings.Repeat("x", maxCommandBytes-len("printf "))
+	atLimit := "printf " + strings.Repeat("x", validate.MaxCommandBytes-len("printf "))
 	if result := Evaluate(atLimit); result.Decision != Allow {
 		t.Fatalf("8192-byte command = %#v, want allow", result)
 	}
-	overLimit := strings.Repeat("x", maxCommandBytes+1)
+	overLimit := strings.Repeat("x", validate.MaxCommandBytes+1)
 	if result := Evaluate(overLimit); result.Decision != Block || !containsReason(result.Reasons, "maximum size") {
 		t.Fatalf("8193-byte command = %#v, want bounded block", result)
 	}

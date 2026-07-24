@@ -6,7 +6,7 @@ on:
 
 jobs:
   check:
-    runs-on: trixie 
+    runs-on: codeberg-small 
     steps:
       - name: Checkout
         uses: https://code.forgejo.org/actions/checkout@v4

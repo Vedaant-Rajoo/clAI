@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	machinecontext "codeberg.org/newedia/clai/internal/context"
-	"codeberg.org/newedia/clai/internal/provider"
+	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
+	"github.com/Vedaant-Rajoo/clai/internal/provider"
 	tea "github.com/charmbracelet/bubbletea"
 )
 

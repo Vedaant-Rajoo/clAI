@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	machinecontext "codeberg.org/newedia/clai/internal/context"
-	"codeberg.org/newedia/clai/internal/validate"
+	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
+	"github.com/Vedaant-Rajoo/clai/internal/validate"
 )
 
 var gitRepo = machinecontext.Context{GitRepository: true}

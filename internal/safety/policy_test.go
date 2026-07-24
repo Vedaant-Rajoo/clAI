@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"codeberg.org/newedia/clai/internal/validate"
+	"github.com/Vedaant-Rajoo/clai/internal/validate"
 )
 
 func TestEvaluateStructuralPolicyMatrix(t *testing.T) {

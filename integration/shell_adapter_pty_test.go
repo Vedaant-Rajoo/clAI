@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"codeberg.org/newedia/clai/internal/shellinit"
+	"github.com/Vedaant-Rajoo/clai/internal/shellinit"
 	"github.com/creack/pty"
 )
 

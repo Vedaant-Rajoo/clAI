@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	machinecontext "codeberg.org/newedia/clai/internal/context"
+	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
 )
 
 func parseProviderFlagsForTest(t *testing.T, widget bool, args ...string) (providerFlags, error) {

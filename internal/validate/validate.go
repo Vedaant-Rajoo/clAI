@@ -5,8 +5,8 @@ import (
 	"strings"
 	"unicode"
 
-	"codeberg.org/newedia/clai/internal/shellsyntax"
-	"codeberg.org/newedia/clai/internal/textsafe"
+	"github.com/Vedaant-Rajoo/clai/internal/shellsyntax"
+	"github.com/Vedaant-Rajoo/clai/internal/textsafe"
 )
 
 var placeholderPattern = regexp.MustCompile(`<[^<>[:space:]][^<>]*>`)

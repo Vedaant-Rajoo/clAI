@@ -15,9 +15,9 @@ import (
 	"strings"
 	"time"
 
-	machinecontext "codeberg.org/newedia/clai/internal/context"
-	"codeberg.org/newedia/clai/internal/provider"
-	"codeberg.org/newedia/clai/internal/textsafe"
+	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
+	"github.com/Vedaant-Rajoo/clai/internal/provider"
+	"github.com/Vedaant-Rajoo/clai/internal/textsafe"
 )
 
 // DefaultModel is used when the caller does not specify one.

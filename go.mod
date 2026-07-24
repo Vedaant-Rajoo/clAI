@@ -1,4 +1,4 @@
-module codeberg.org/newedia/clai
+module github.com/Vedaant-Rajoo/clai
 
 go 1.26.2
 

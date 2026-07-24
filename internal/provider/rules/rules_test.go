@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	machinecontext "codeberg.org/newedia/clai/internal/context"
-	"codeberg.org/newedia/clai/internal/provider"
+	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
+	"github.com/Vedaant-Rajoo/clai/internal/provider"
 )
 
 func TestProviderCompile(t *testing.T) {

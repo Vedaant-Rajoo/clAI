@@ -3,7 +3,7 @@ package provider
 import (
 	"context"
 
-	machinecontext "codeberg.org/newedia/clai/internal/context"
+	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
 )
 
 type Request struct {

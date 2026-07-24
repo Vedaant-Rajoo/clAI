@@ -8,12 +8,12 @@ import (
 	"strings"
 	"testing"
 
-	machinecontext "codeberg.org/newedia/clai/internal/context"
-	"codeberg.org/newedia/clai/internal/provider"
-	"codeberg.org/newedia/clai/internal/provider/openrouter"
-	"codeberg.org/newedia/clai/internal/provider/rules"
-	"codeberg.org/newedia/clai/internal/safety"
-	"codeberg.org/newedia/clai/internal/validate"
+	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
+	"github.com/Vedaant-Rajoo/clai/internal/provider"
+	"github.com/Vedaant-Rajoo/clai/internal/provider/openrouter"
+	"github.com/Vedaant-Rajoo/clai/internal/provider/rules"
+	"github.com/Vedaant-Rajoo/clai/internal/safety"
+	"github.com/Vedaant-Rajoo/clai/internal/validate"
 )
 
 func TestSelectProviderDefaultIsRules(t *testing.T) {

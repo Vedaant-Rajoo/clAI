@@ -8,7 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"codeberg.org/newedia/clai/internal/acceptance"
+	"github.com/Vedaant-Rajoo/clai/internal/acceptance"
 )
 
 func main() {

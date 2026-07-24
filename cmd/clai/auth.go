@@ -22,7 +22,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"codeberg.org/newedia/clai/internal/auth"
+	"github.com/Vedaant-Rajoo/clai/internal/auth"
 )
 
 const (

@@ -5,9 +5,9 @@ import (
 	"slices"
 	"strings"
 
-	"codeberg.org/newedia/clai/internal/shellsyntax"
-	"codeberg.org/newedia/clai/internal/textsafe"
-	"codeberg.org/newedia/clai/internal/validate"
+	"github.com/Vedaant-Rajoo/clai/internal/shellsyntax"
+	"github.com/Vedaant-Rajoo/clai/internal/textsafe"
+	"github.com/Vedaant-Rajoo/clai/internal/validate"
 )
 
 type Decision string

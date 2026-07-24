@@ -3,8 +3,8 @@ package rules
 import (
 	"context"
 
-	"codeberg.org/newedia/clai/internal/compiler"
-	"codeberg.org/newedia/clai/internal/provider"
+	"github.com/Vedaant-Rajoo/clai/internal/compiler"
+	"github.com/Vedaant-Rajoo/clai/internal/provider"
 )
 
 type Provider struct{}

@@ -394,7 +394,7 @@ func TestFindCaseRejectsUnknownCaseID(t *testing.T) {
 
 func TestCheckedInRevisionEvidence(t *testing.T) {
 	t.Parallel()
-	root := repositoryRoot(t)
+	root := requireLocalScaffolding(t)
 	read := func(parts ...string) []byte {
 		t.Helper()
 		data, err := os.ReadFile(filepath.Join(append([]string{root}, parts...)...))
@@ -411,7 +411,7 @@ func TestCheckedInRevisionEvidence(t *testing.T) {
 	checks := map[string]string{
 		sha256Hex(initial):         "28ac242a7c7f4f15bdcc8ad052f504251380580f0749e9f4d257209eb9c61add",
 		sha256Hex(registered):      "5dc63862dfe786a6e45cf9155dc56a8ed3cae3769ff80dd135487e35958d5f5d",
-		sha256Hex(current):         "ce4f640fdd30f85b2c5616391ce80c3862ec95dc2218c550ab14e4014929356e",
+		sha256Hex(current):         "ddff3b871cef51d2b137dd3d32e1ae8d57d98813cf2901d901066fa8e435ab3f",
 		sha256Hex(migrationDiff):   "27a46e185cc9cf12b10b48c72c7a5e59ba30790527091809b811580f0416a47a",
 		sha256Hex(remediationDiff): "f31e3de8e608e4261d6fb10251b67fb56595e9cd6541946196caef730954c82f",
 	}
@@ -431,12 +431,16 @@ func TestCheckedInRevisionEvidence(t *testing.T) {
 func normalizeSpecificationRevision(data []byte, remediation bool) string {
 	marker := regexp.MustCompile(`\s+<!-- requirement: REQ-[A-Z0-9-]+ -->$`)
 	remediationRequirement := regexp.MustCompile(`<!-- requirement: REQ-ACCEPT-WORKFLOW-(?:00[6-9]|01[0-3]) -->`)
+	// REQ-PERFORMANCE-011 (minimal, height-aware review) is an additive post-baseline
+	// requirement; like the workflow-hardening additions it is stripped so the current
+	// revision still reduces byte-for-byte to the immutable 28ac baseline.
+	minimalReviewRequirement := regexp.MustCompile(`<!-- requirement: REQ-PERFORMANCE-011 -->`)
 	var normalized []string
 	for _, line := range strings.Split(string(data), "\n") {
 		if strings.HasPrefix(line, "<!-- requirement: REQ-") {
 			continue
 		}
-		if remediation && (remediationRequirement.MatchString(line) || strings.HasPrefix(line, "The completion proof ")) {
+		if remediation && (remediationRequirement.MatchString(line) || minimalReviewRequirement.MatchString(line) || strings.HasPrefix(line, "The completion proof ")) {
 			continue
 		}
 		line = marker.ReplaceAllString(line, "")
@@ -456,9 +460,37 @@ func normalizeSpecificationRevision(data []byte, remediation bool) string {
 	return strings.Join(normalized, "\n")
 }
 
+// TestRevisionLabelBinding binds the manifest's revision label to the exact
+// specification hash it denotes. TestCheckedInRevisionEvidence pins the spec
+// bytes but asserts nothing about revision_label; Validate only checks that the
+// hash matches the spec, not that the label was advanced. Without this, the
+// specification can change (a new hash, updated everywhere Validate looks) while
+// revision_label silently lags. Pinning the (label, hash) pair here makes the
+// label a first-class part of the evidence: any spec-byte change or relabel must
+// update BOTH constants together, forcing a deliberate revision decision instead
+// of silent drift.
+func TestRevisionLabelBinding(t *testing.T) {
+	t.Parallel()
+	root := requireLocalScaffolding(t)
+	_, manifest, err := Load(
+		filepath.Join(root, ".local", "SPECIFICATION.md"),
+		filepath.Join(root, ".local", "acceptance-manifest.yaml"),
+		filepath.Join(root, ".local", "artifacts.yaml"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const boundLabel = "phase-0-remediation-r2"
+	const boundSpecHash = "ddff3b871cef51d2b137dd3d32e1ae8d57d98813cf2901d901066fa8e435ab3f"
+	if manifest.RevisionLabel != boundLabel || manifest.SpecificationSHA256 != boundSpecHash {
+		t.Fatalf("revision binding = (%q, %q), want (%q, %q): a specification change or relabel must update both constants together and consciously choose the revision label",
+			manifest.RevisionLabel, manifest.SpecificationSHA256, boundLabel, boundSpecHash)
+	}
+}
+
 func TestCheckedInManifestValidates(t *testing.T) {
 	t.Parallel()
-	root := repositoryRoot(t)
+	root := requireLocalScaffolding(t)
 	ids, manifest, err := Load(filepath.Join(root, ".local", "SPECIFICATION.md"), filepath.Join(root, ".local", "acceptance-manifest.yaml"), filepath.Join(root, ".local", "artifacts.yaml"))
 	if err != nil {
 		t.Fatal(err)
@@ -470,7 +502,7 @@ func TestCheckedInManifestValidates(t *testing.T) {
 
 func TestCheckedInProofCasesAreBehaviorSpecific(t *testing.T) {
 	t.Parallel()
-	root := repositoryRoot(t)
+	root := requireLocalScaffolding(t)
 	_, manifest, err := Load(filepath.Join(root, ".local", "SPECIFICATION.md"), filepath.Join(root, ".local", "acceptance-manifest.yaml"), filepath.Join(root, ".local", "artifacts.yaml"))
 	if err != nil {
 		t.Fatal(err)
@@ -518,6 +550,26 @@ func repositoryRoot(t *testing.T) string {
 		t.Fatal("runtime.Caller failed")
 	}
 	return filepath.Clean(filepath.Join(filepath.Dir(filename), "..", ".."))
+}
+
+// requireLocalScaffolding returns the repository root but skips the calling test
+// when the private .local/ governance inputs (the normative spec, manifest,
+// artifacts, and frozen revisions) are absent. Those inputs are intentionally
+// kept out of the public repository, so they exist only in a full local
+// checkout. CI and git worktrees without them skip these checked-in consistency
+// gates rather than hard-failing; the gate is still enforced wherever .local/ is
+// present (make check). A stat error other than not-exist is a real fault and
+// fails the test.
+func requireLocalScaffolding(t *testing.T) string {
+	t.Helper()
+	root := repositoryRoot(t)
+	if _, err := os.Stat(filepath.Join(root, ".local", "SPECIFICATION.md")); err != nil {
+		if os.IsNotExist(err) {
+			t.Skip("acceptance scaffolding (.local/) not present; the checked-in governance gate is enforced where .local/ exists (e.g. make check)")
+		}
+		t.Fatalf("stat .local/SPECIFICATION.md: %v", err)
+	}
+	return root
 }
 
 func validManifest(spec, predecessor []byte, ids []string) Manifest {

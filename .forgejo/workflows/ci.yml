@@ -6,7 +6,7 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: trixie 
     steps:
       - name: Checkout
         uses: https://code.forgejo.org/actions/checkout@v4

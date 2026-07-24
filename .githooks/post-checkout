@@ -1,0 +1,6 @@
+#!/bin/sh
+# Runs on `git worktree add` (and branch/HEAD checkouts). Delegates to the shared
+# provisioning script so every new worktree receives its untracked files and build,
+# regardless of which tool created it.
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 0
+exec "$dir/worktree-provision.sh" "$@"

@@ -26,11 +26,14 @@ automatically, so you can inspect or edit it before pressing Enter.
 
 ## Providers
 
-Local rules by default; LLM providers (OpenRouter first) are opt-in. Remote
-OpenRouter requests default to a minimal context policy that sends the intent
-plus normalized OS family, shell family, and project kind only. Absolute paths
-and Git details require invocation-scoped `--context-policy remote-explicit`
-with repeatable `--share-context` approvals; `local-only` fails closed for remote
+Local `rules` by default; the LLM providers `openrouter` and direct `anthropic`
+are opt-in. Direct Anthropic uses the official Anthropic SDK and defaults to
+`claude-sonnet-5`; its streaming is internal only, so partial model output never
+enters review — the TUI stays on loading until one complete candidate is ready.
+Remote providers default to a minimal context policy that sends the intent plus
+normalized OS family, shell family, and project kind only. Absolute paths and Git
+details require invocation-scoped `--context-policy remote-explicit` with
+repeatable `--share-context` approvals; `local-only` fails closed for remote
 endpoints.
 
 - [Provider setup, auth, and context privacy](docs/providers.md)

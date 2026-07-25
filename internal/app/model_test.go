@@ -890,3 +890,62 @@ func TestFrameBudgetPaddingMatchesBaseStyle(t *testing.T) {
 		t.Fatalf("frameHorizontalPadding = %d, but baseStyle left+right padding = %d; update the row measurer to match baseStyle's Padding", got, want)
 	}
 }
+
+// TestAnthropicTransportOnlyNoPartialCandidate is the app-layer anchor for
+// AC-ANTHROPIC-TRANSPORT-ONLY (REQ-PERFORMANCE-012, REQ-NON-GOAL-009). Streaming
+// is a transport detail: the model has no partial-delta message type, so while a
+// request is in flight the UI stays on loading with no candidate, command,
+// explanation, or review text, and only one complete candidate — delivered by a
+// single compileResult — ever enters review. The anthropic-package test of the
+// same name proves the transport half; these subtests prove the app half by
+// composing the model's existing loading / interrupted / cancelled / superseded
+// invariants.
+func TestAnthropicTransportOnlyNoPartialCandidate(t *testing.T) {
+	t.Run("LoadingWhileInFlightThenOneCompleteCandidate", func(t *testing.T) {
+		started := make(chan struct{})
+		release := make(chan struct{})
+		m := NewWithProvider(ignoresCancellationProvider{started: started, release: release})
+		m.input.SetValue("show directory")
+		updated, compileCmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		m = updated.(Model)
+
+		result := make(chan tea.Msg, 1)
+		go func() { result <- compileCmd() }()
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("provider did not start")
+		}
+
+		// Stream in flight: nothing partial has reached the UI or model state.
+		if m.screen != screenLoading {
+			t.Fatalf("screen = %v, want loading while the stream is consumed", m.screen)
+		}
+		if m.command != "" || m.explanation != "" || m.Accepted() {
+			t.Fatalf("partial state mid-stream: command=%q explanation=%q accepted=%v", m.command, m.explanation, m.Accepted())
+		}
+		if strings.Contains(m.View(), "pwd") {
+			t.Fatalf("loading view leaked candidate text: %q", m.View())
+		}
+
+		close(release)
+		var complete tea.Msg
+		select {
+		case complete = <-result:
+		case <-time.After(time.Second):
+			t.Fatal("provider did not return a complete result")
+		}
+		updated, _ = m.Update(complete)
+		m = updated.(Model)
+		if m.screen != screenReview || m.command != "pwd" {
+			t.Fatalf("one complete candidate did not enter review: screen=%v command=%q", m.screen, m.command)
+		}
+	})
+	t.Run("CompleteCandidateEntersReview", TestSubmitUsesFirstCandidate)
+	t.Run("InterruptedStreamErrorYieldsNoCandidate", TestProviderErrorDiscardsReturnedCandidates)
+	t.Run("TruncatedDeadlineYieldsNoCandidate", TestDeadlineExceededIsVisibleFailureWithNoExport)
+	t.Run("CancelledStreamExposesNoCandidate", TestCancelledResultIsNotProviderFailure)
+	t.Run("LateResultAfterEscapeNotReviewedOrExported", TestEscapeBeforeResultPreventsLateCandidateReviewOrExport)
+	t.Run("SupersededResultIgnored", TestStaleResultFromSupersededRequestIsIgnored)
+	t.Run("ResizeDuringLoadingKeepsRequestAlive", TestResizeDuringLoadingKeepsRequestAlive)
+}

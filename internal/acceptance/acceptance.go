@@ -152,6 +152,39 @@ type independentReviewRecord struct {
 	RecordedAt          string `json:"recorded_at"`
 }
 
+type manualEvidenceCommand struct {
+	Command           string  `json:"command"`
+	ExitStatus        int     `json:"exit_status"`
+	RawOutputSHA256   string  `json:"raw_output_sha256"`
+	RawOutputLocation string  `json:"raw_output_location"`
+	DurationSeconds   float64 `json:"duration_seconds"`
+	Note              string  `json:"note,omitempty"`
+}
+
+type manualObservationOutcome struct {
+	Observation string `json:"observation"`
+	Outcome     string `json:"outcome"`
+	Evidence    string `json:"evidence"`
+}
+
+type manualEvidenceRecord struct {
+	Schema                      string                     `json:"schema"`
+	CaseID                      string                     `json:"case_id"`
+	BehaviorArea                string                     `json:"behavior_area"`
+	RequirementIDs              []string                   `json:"requirement_ids"`
+	RevisionLabel               string                     `json:"revision_label"`
+	SpecificationSHA256         string                     `json:"specification_sha256"`
+	ReviewedGitRevision         string                     `json:"reviewed_git_revision"`
+	WorkingTreeState            string                     `json:"working_tree_state,omitempty"`
+	RecordedAt                  string                     `json:"recorded_at"`
+	Reviewer                    string                     `json:"reviewer"`
+	Commands                    []manualEvidenceCommand    `json:"commands"`
+	RequiredObservationOutcomes []manualObservationOutcome `json:"required_observation_outcomes"`
+	UnexplainedSkips            string                     `json:"unexplained_skips"`
+	Deviations                  string                     `json:"deviations"`
+	Marker                      string                     `json:"marker"`
+}
+
 func Load(specPath, manifestPath, artifactsPath string) ([]string, Manifest, error) {
 	spec, err := os.ReadFile(specPath)
 	if err != nil {
@@ -190,6 +223,9 @@ func Load(specPath, manifestPath, artifactsPath string) ([]string, Manifest, err
 		return nil, Manifest{}, fmt.Errorf("read artifact registry: %w", err)
 	}
 	if err := ValidateArtifactRegistry(artifactData, manifestData, spec, manifest); err != nil {
+		return nil, Manifest{}, err
+	}
+	if err := ValidateManualEvidence(root, manifest); err != nil {
 		return nil, Manifest{}, err
 	}
 	if err := ValidateIndependentReviewEvidence(root, manifest); err != nil {
@@ -617,6 +653,112 @@ func validateFindings(manifest Manifest, requirements map[string]bool, cases map
 			*problems = append(*problems, fmt.Sprintf("%s has invalid closure status %q", where, finding.Status))
 		}
 	}
+}
+
+func ValidateManualEvidence(root string, manifest Manifest) error {
+	absoluteRoot, err := filepath.Abs(root)
+	if err != nil {
+		return fmt.Errorf("resolve repository root for manual evidence: %w", err)
+	}
+	privateRoot := filepath.Join(absoluteRoot, ".local", "evidence")
+	manualRoot := filepath.Join(privateRoot, "manual")
+	rawRoot := filepath.Join(manualRoot, "raw")
+	for _, acceptanceCase := range manifest.Cases {
+		if acceptanceCase.ProofType != "manual" {
+			continue
+		}
+		location := acceptanceCase.Evidence.Location
+		if filepath.IsAbs(location) || filepath.ToSlash(filepath.Clean(filepath.FromSlash(location))) != location {
+			return fmt.Errorf("case %q manual evidence path is not a clean repository-relative path", acceptanceCase.ID)
+		}
+		path := filepath.Join(absoluteRoot, filepath.FromSlash(location))
+		if !pathWithin(manualRoot, path) {
+			return fmt.Errorf("case %q manual evidence is outside approved private root .local/evidence/manual", acceptanceCase.ID)
+		}
+		if err := validatePrivateEvidencePath(privateRoot, path); err != nil {
+			return fmt.Errorf("case %q manual evidence: %w", acceptanceCase.ID, err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("case %q read manual evidence: %w", acceptanceCase.ID, err)
+		}
+		var record manualEvidenceRecord
+		if err := decodeStrictRecord(string(data), &record); err != nil {
+			return fmt.Errorf("case %q malformed manual evidence: %w", acceptanceCase.ID, err)
+		}
+		if record.Schema != "manual-acceptance-evidence/v1" || record.CaseID != acceptanceCase.ID || record.BehaviorArea != acceptanceCase.BehaviorArea || !equalStrings(record.RequirementIDs, acceptanceCase.RequirementIDs) || record.RevisionLabel != manifest.RevisionLabel || record.SpecificationSHA256 != manifest.SpecificationSHA256 || record.Marker != acceptanceCase.Evidence.Marker {
+			return fmt.Errorf("case %q manual evidence record does not match current manifest metadata", acceptanceCase.ID)
+		}
+		if strings.TrimSpace(record.Reviewer) == "" || strings.TrimSpace(record.ReviewedGitRevision) == "" || strings.TrimSpace(record.Deviations) == "" {
+			return fmt.Errorf("case %q manual evidence requires reviewer, reviewed_git_revision, and deviations", acceptanceCase.ID)
+		}
+		if _, err := time.Parse(time.RFC3339, record.RecordedAt); err != nil {
+			return fmt.Errorf("case %q manual evidence recorded_at must be RFC3339", acceptanceCase.ID)
+		}
+		if record.UnexplainedSkips != "none" {
+			return fmt.Errorf("case %q manual evidence has unexplained skips", acceptanceCase.ID)
+		}
+		if len(record.Commands) != 2 {
+			return fmt.Errorf("case %q manual evidence must contain exactly the first two prescribed commands", acceptanceCase.ID)
+		}
+		for i := range record.Commands {
+			command := commandFromManualStep(acceptanceCase.Steps[i])
+			got := record.Commands[i]
+			zeroMatchProof := got.ExitStatus == 1 && strings.HasPrefix(got.Command, "rg ") && strings.TrimSpace(got.Note) != ""
+			if command == "" || got.Command != command || (got.ExitStatus != 0 && !zeroMatchProof) || got.DurationSeconds < 0 {
+				return fmt.Errorf("case %q manual evidence command %d does not match an accepted prescribed outcome", acceptanceCase.ID, i)
+			}
+			decodedHash, err := hex.DecodeString(got.RawOutputSHA256)
+			if err != nil || len(decodedHash) != sha256.Size || got.RawOutputSHA256 != strings.ToLower(got.RawOutputSHA256) {
+				return fmt.Errorf("case %q manual evidence command %d has an invalid SHA-256", acceptanceCase.ID, i)
+			}
+			rawLocation := got.RawOutputLocation
+			if filepath.IsAbs(rawLocation) || filepath.ToSlash(filepath.Clean(filepath.FromSlash(rawLocation))) != rawLocation {
+				return fmt.Errorf("case %q raw evidence path %d is not clean and repository-relative", acceptanceCase.ID, i)
+			}
+			rawPath := filepath.Join(absoluteRoot, filepath.FromSlash(rawLocation))
+			if !pathWithin(rawRoot, rawPath) {
+				return fmt.Errorf("case %q raw evidence path %d is outside .local/evidence/manual/raw", acceptanceCase.ID, i)
+			}
+			if err := validatePrivateEvidencePath(privateRoot, rawPath); err != nil {
+				return fmt.Errorf("case %q raw evidence %d: %w", acceptanceCase.ID, i, err)
+			}
+			raw, err := os.ReadFile(rawPath)
+			if err != nil {
+				return fmt.Errorf("case %q read raw evidence %d: %w", acceptanceCase.ID, i, err)
+			}
+			if sha256Hex(raw) != got.RawOutputSHA256 {
+				return fmt.Errorf("case %q raw evidence %d SHA-256 mismatch", acceptanceCase.ID, i)
+			}
+		}
+		if len(record.RequiredObservationOutcomes) != len(acceptanceCase.RequiredObservations) {
+			return fmt.Errorf("case %q manual evidence observation count mismatch", acceptanceCase.ID)
+		}
+		for i, observation := range acceptanceCase.RequiredObservations {
+			outcome := record.RequiredObservationOutcomes[i]
+			if outcome.Observation != observation || outcome.Outcome != "pass" || strings.TrimSpace(outcome.Evidence) == "" {
+				return fmt.Errorf("case %q manual evidence observation %d is not a directly supported pass", acceptanceCase.ID, i)
+			}
+		}
+	}
+	return nil
+}
+
+func commandFromManualStep(step string) string {
+	start := strings.IndexByte(step, '`')
+	if start < 0 {
+		return ""
+	}
+	end := strings.IndexByte(step[start+1:], '`')
+	if end < 0 {
+		return ""
+	}
+	return step[start+1 : start+1+end]
+}
+
+func pathWithin(root, path string) bool {
+	relative, err := filepath.Rel(root, path)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
 func ValidateIndependentReviewEvidence(root string, manifest Manifest) error {

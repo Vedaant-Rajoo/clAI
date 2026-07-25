@@ -125,6 +125,50 @@ func TestResolvePrecedence(t *testing.T) {
 	}
 }
 
+func TestAnthropicAuthResolutionAndAmbientDisabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		explicit string
+		env      string
+		keyring  string
+		file     string
+		want     string
+	}{
+		{name: "explicit beats environment keyring and file", explicit: "flag-key", env: "env-key", keyring: "keyring-key", file: "file-key", want: "flag-key"},
+		{name: "environment beats keyring and file", env: "env-key", keyring: "keyring-key", file: "file-key", want: "env-key"},
+		{name: "keyring beats file", keyring: "keyring-key", file: "file-key", want: "keyring-key"},
+		{name: "private config fallback", file: "file-key", want: "file-key"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values := map[string]string{}
+			if tt.keyring != "" {
+				values["anthropic"] = tt.keyring
+			}
+			base := useTestBackends(t, &fakeKeyring{values: values})
+			t.Setenv("ANTHROPIC_API_KEY", tt.env)
+			// These ambient SDK credentials are intentionally irrelevant to clai's
+			// resolver; the provider separately proves WithoutEnvironmentDefaults.
+			t.Setenv("ANTHROPIC_AUTH_TOKEN", "ambient-token")
+			t.Setenv("ANTHROPIC_PROFILE", "ambient-profile")
+			t.Setenv("ANTHROPIC_FEDERATION_RULE_ID", "ambient-rule")
+			t.Setenv("ANTHROPIC_ORGANIZATION_ID", "ambient-org")
+			t.Setenv("ANTHROPIC_SERVICE_ACCOUNT_ID", "ambient-account")
+			t.Setenv("ANTHROPIC_IDENTITY_TOKEN", "ambient-identity")
+			if tt.file != "" {
+				writeCredentialFixture(t, base, `{"anthropic":"`+tt.file+`"}`)
+			}
+			got, err := Resolve("anthropic", tt.explicit)
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("Resolve = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestEmptySuccessfulKeyringValueFallsBackConsistently(t *testing.T) {
 	kr := &fakeKeyring{values: map[string]string{"openrouter": ""}}
 	base := useTestBackends(t, kr)

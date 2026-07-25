@@ -586,7 +586,16 @@ func decodeExchangeKey(responseBody []byte) (string, error) {
 			return "", errors.New("decode key response")
 		}
 		if name != "key" {
-			return "", errors.New("decode key response: unknown member")
+			// Tolerate unknown members (for example OpenRouter's user_id) so a
+			// provider that adds fields to an otherwise well-formed response does
+			// not break login. Fully consume and discard the member's value to
+			// keep the decoder aligned; the "key" member is still validated
+			// strictly below, and duplicate/missing/trailing checks are intact.
+			var discard json.RawMessage
+			if err := decoder.Decode(&discard); err != nil {
+				return "", errors.New("decode key response")
+			}
+			continue
 		}
 		if seenKey {
 			return "", errors.New("decode key response: duplicate key member")

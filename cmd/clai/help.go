@@ -83,7 +83,7 @@ Usage:
 Flags:
   --shell name        active shell: fish | bash | zsh
   --result-file path  caller-created file the accepted command is written to
-  --provider name     provider: rules | openrouter (default: rules, or $CLAI_PROVIDER)
+  --provider name     provider: rules | openrouter | anthropic (default: rules, or $CLAI_PROVIDER)
   --model name        model override for LLM providers
   --api-key key       API key override for LLM providers
   --fallback-rules    fall back to local rules when the provider errors
@@ -128,7 +128,7 @@ Commands:
 Flags:
   --copy             copy the accepted command to the clipboard
   --print-command    print the accepted command to stdout
-  --provider name    provider: rules | openrouter (default: rules, or $CLAI_PROVIDER)
+  --provider name    provider: rules | openrouter | anthropic (default: rules, or $CLAI_PROVIDER)
   --model name       model override for LLM providers
   --api-key key      API key override for LLM providers
   --fallback-rules   fall back to local rules when the provider errors

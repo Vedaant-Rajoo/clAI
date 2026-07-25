@@ -346,6 +346,109 @@ func TestValidateIndependentReviewEvidenceFile(t *testing.T) {
 	})
 }
 
+func TestValidateManualEvidenceFiles(t *testing.T) {
+	setup := func(t *testing.T) (string, Manifest, string, string, manualEvidenceRecord) {
+		t.Helper()
+		root := t.TempDir()
+		rawDir := filepath.Join(root, ".local", "evidence", "manual", "raw")
+		if err := os.MkdirAll(rawDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for _, dir := range []string{
+			filepath.Join(root, ".local", "evidence"),
+			filepath.Join(root, ".local", "evidence", "manual"),
+			rawDir,
+		} {
+			if err := os.Chmod(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		rawLocation := ".local/evidence/manual/raw/AC-MANUAL-TEST-0.log"
+		rawPath := filepath.Join(root, filepath.FromSlash(rawLocation))
+		raw := []byte("proof output\n")
+		if err := os.WriteFile(rawPath, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		secondLocation := ".local/evidence/manual/raw/AC-MANUAL-TEST-1.log"
+		secondPath := filepath.Join(root, filepath.FromSlash(secondLocation))
+		if err := os.WriteFile(secondPath, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		acceptanceCase := Case{
+			ID: "AC-MANUAL-TEST", RequirementIDs: []string{"REQ-TEST-001"}, ProofType: "manual",
+			BehaviorArea: "test behavior", Steps: []string{"Run `go test ./...`.", "Run `rg proof internal`."},
+			RequiredObservations: []string{"First observation", "Second observation"},
+			Evidence:             Evidence{Marker: "MANUAL-TEST-PASS", Location: ".local/evidence/manual/AC-MANUAL-TEST.json"},
+		}
+		manifest := Manifest{RevisionLabel: "test-r1", SpecificationSHA256: strings.Repeat("a", 64), Cases: []Case{acceptanceCase}}
+		record := manualEvidenceRecord{
+			Schema: "manual-acceptance-evidence/v1", CaseID: acceptanceCase.ID, BehaviorArea: acceptanceCase.BehaviorArea,
+			RequirementIDs: acceptanceCase.RequirementIDs, RevisionLabel: manifest.RevisionLabel,
+			SpecificationSHA256: manifest.SpecificationSHA256, ReviewedGitRevision: "deadbeef", RecordedAt: "2026-07-24T12:00:00Z",
+			Reviewer: "fresh-reviewer", UnexplainedSkips: "none", Deviations: "none", Marker: acceptanceCase.Evidence.Marker,
+			Commands: []manualEvidenceCommand{
+				{Command: "go test ./...", ExitStatus: 0, RawOutputSHA256: sha256Hex(raw), RawOutputLocation: rawLocation, DurationSeconds: 1},
+				{Command: "rg proof internal", ExitStatus: 0, RawOutputSHA256: sha256Hex(raw), RawOutputLocation: secondLocation, DurationSeconds: 1},
+			},
+			RequiredObservationOutcomes: []manualObservationOutcome{
+				{Observation: "First observation", Outcome: "pass", Evidence: "TestOne proves it."},
+				{Observation: "Second observation", Outcome: "pass", Evidence: "TestTwo proves it."},
+			},
+		}
+		return root, manifest, filepath.Join(root, filepath.FromSlash(acceptanceCase.Evidence.Location)), rawPath, record
+	}
+	write := func(t *testing.T, path string, record manualEvidenceRecord, mode os.FileMode) {
+		t.Helper()
+		data, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("valid current record", func(t *testing.T) {
+		root, manifest, path, _, record := setup(t)
+		write(t, path, record, 0o600)
+		if err := ValidateManualEvidence(root, manifest); err != nil {
+			t.Fatal(err)
+		}
+	})
+	for _, test := range []struct {
+		name string
+		edit func(*manualEvidenceRecord)
+	}{
+		{"stale revision", func(r *manualEvidenceRecord) { r.RevisionLabel = "old" }},
+		{"stale specification hash", func(r *manualEvidenceRecord) { r.SpecificationSHA256 = strings.Repeat("b", 64) }},
+		{"wrong marker", func(r *manualEvidenceRecord) { r.Marker = "wrong" }},
+		{"wrong command", func(r *manualEvidenceRecord) { r.Commands[0].Command = "true" }},
+		{"failed command", func(r *manualEvidenceRecord) { r.Commands[0].ExitStatus = 1 }},
+		{"wrong raw hash", func(r *manualEvidenceRecord) { r.Commands[0].RawOutputSHA256 = strings.Repeat("0", 64) }},
+		{"unmapped observation", func(r *manualEvidenceRecord) { r.RequiredObservationOutcomes[0].Observation = "other" }},
+		{"failed observation", func(r *manualEvidenceRecord) { r.RequiredObservationOutcomes[0].Outcome = "fail" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root, manifest, path, _, record := setup(t)
+			test.edit(&record)
+			write(t, path, record, 0o600)
+			if err := ValidateManualEvidence(root, manifest); err == nil {
+				t.Fatal("invalid manual evidence accepted")
+			}
+		})
+	}
+	t.Run("non-private record", func(t *testing.T) {
+		root, manifest, path, _, record := setup(t)
+		write(t, path, record, 0o644)
+		if err := os.Chmod(path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := ValidateManualEvidence(root, manifest); err == nil {
+			t.Fatal("non-private manual evidence accepted")
+		}
+	})
+}
+
 func TestValidateArtifactMetadata(t *testing.T) {
 	t.Parallel()
 	spec := []byte("one <!-- requirement: REQ-ONE-001 -->\ntwo <!-- requirement: REQ-TWO-001 -->\n")
@@ -392,6 +495,33 @@ func TestFindCaseRejectsUnknownCaseID(t *testing.T) {
 	}
 }
 
+func TestProviderBoundaryArtifactsRegistered(t *testing.T) {
+	t.Parallel()
+	root := requireLocalScaffolding(t)
+	data, err := os.ReadFile(filepath.Join(root, ".local", "artifacts.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := string(data)
+	for _, required := range []string{
+		"name: candidate-json-contract",
+		"path: internal/provider/candidatejson/candidatejson.go",
+		"schema: candidate/v1",
+		"sha256: d4ebadb8f0d525bcaef836114f5c2ebf7906be59c8268a2a05747205e5903ecb",
+		"name: request-receipt-contract",
+		"path: internal/provider/receipt.go",
+		"schema: request-receipt/v1",
+		"sha256: 16024cc7e6f6234c4ccfab0813a5dec768351a799f0c61e71823dc4c2bcfeaa0",
+		"REQ-ANTHROPIC-005",
+		"REQ-ANTHROPIC-010",
+		"REQ-CONTEXT-018",
+	} {
+		if !strings.Contains(registry, required) {
+			t.Errorf("artifact registry missing %q", required)
+		}
+	}
+}
+
 func TestCheckedInRevisionEvidence(t *testing.T) {
 	t.Parallel()
 	root := requireLocalScaffolding(t)
@@ -405,15 +535,19 @@ func TestCheckedInRevisionEvidence(t *testing.T) {
 	}
 	initial := read(".local", "revisions", "SPECIFICATION-28ac242a7c7f4f15.md")
 	registered := read(".local", "revisions", "SPECIFICATION-5dc63862dfe786a6.md")
+	predecessor := read(".local", "revisions", "SPECIFICATION-ddff3b871cef51d2.md")
 	current := read(".local", "SPECIFICATION.md")
 	migrationDiff := read(".local", "revisions", "SPECIFICATION-28ac-to-5dc.diff")
 	remediationDiff := read(".local", "revisions", "SPECIFICATION-28ac-to-phase-0-remediation-r1.diff")
+	anthropicDiff := read(".local", "revisions", "SPECIFICATION-ddff-to-phase-a-anthropic-r1.diff")
 	checks := map[string]string{
 		sha256Hex(initial):         "28ac242a7c7f4f15bdcc8ad052f504251380580f0749e9f4d257209eb9c61add",
 		sha256Hex(registered):      "5dc63862dfe786a6e45cf9155dc56a8ed3cae3769ff80dd135487e35958d5f5d",
-		sha256Hex(current):         "ddff3b871cef51d2b137dd3d32e1ae8d57d98813cf2901d901066fa8e435ab3f",
+		sha256Hex(predecessor):     "ddff3b871cef51d2b137dd3d32e1ae8d57d98813cf2901d901066fa8e435ab3f",
+		sha256Hex(current):         "f6a55193c3b420ec28a68c050fb7be8a541753ee8a33b6c5900c9cef6ab5a676",
 		sha256Hex(migrationDiff):   "27a46e185cc9cf12b10b48c72c7a5e59ba30790527091809b811580f0416a47a",
 		sha256Hex(remediationDiff): "f31e3de8e608e4261d6fb10251b67fb56595e9cd6541946196caef730954c82f",
+		sha256Hex(anthropicDiff):   "dae1358bbac67a249050a46767dea16a4406a262889a6d83a454c68a3d2d6601",
 	}
 	for got, want := range checks {
 		if got != want {
@@ -423,8 +557,19 @@ func TestCheckedInRevisionEvidence(t *testing.T) {
 	if normalizeSpecificationRevision(registered, false) != string(initial) {
 		t.Fatal("registered predecessor contains semantic changes outside stable IDs and worker-workflow identity fields")
 	}
-	if normalizeSpecificationRevision(current, true) != string(initial) {
-		t.Fatal("remediation revision contains semantic changes outside stable IDs and specification-workflow hardening")
+	// The phase-0-remediation-r2 predecessor (ddff) is the last revision whose
+	// normative bytes still reduce to the immutable 28ac assignment-start baseline
+	// after stripping requirement-ID markers and controlled workflow-hardening
+	// additions. The current revision (phase-a-anthropic-r1) deliberately diverges
+	// from that baseline: it supersedes REQ-PURPOSE-001, REQ-NON-GOAL-001,
+	// REQ-CONTEXT-015, and REQ-PERFORMANCE-010 and adds the section 6.8 direct
+	// Anthropic provider tranche (REQ-ANTHROPIC-001..010), putting behavior that
+	// REQ-NON-GOAL-001 previously excluded in scope. It therefore no longer reduces
+	// to the 28ac baseline and is instead bound to its predecessor by the registered
+	// semantic diff pinned above and by the (label, hash) pair asserted in
+	// TestRevisionLabelBinding.
+	if normalizeSpecificationRevision(predecessor, true) != string(initial) {
+		t.Fatal("registered phase-0-remediation-r2 predecessor contains semantic changes outside stable IDs and specification-workflow hardening")
 	}
 }
 
@@ -432,8 +577,9 @@ func normalizeSpecificationRevision(data []byte, remediation bool) string {
 	marker := regexp.MustCompile(`\s+<!-- requirement: REQ-[A-Z0-9-]+ -->$`)
 	remediationRequirement := regexp.MustCompile(`<!-- requirement: REQ-ACCEPT-WORKFLOW-(?:00[6-9]|01[0-3]) -->`)
 	// REQ-PERFORMANCE-011 (minimal, height-aware review) is an additive post-baseline
-	// requirement; like the workflow-hardening additions it is stripped so the current
-	// revision still reduces byte-for-byte to the immutable 28ac baseline.
+	// requirement; like the workflow-hardening additions it is stripped so the predecessor
+	// revision (the sole remediation=true caller below) still reduces byte-for-byte to the
+	// immutable 28ac baseline.
 	minimalReviewRequirement := regexp.MustCompile(`<!-- requirement: REQ-PERFORMANCE-011 -->`)
 	var normalized []string
 	for _, line := range strings.Split(string(data), "\n") {
@@ -480,8 +626,8 @@ func TestRevisionLabelBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const boundLabel = "phase-0-remediation-r2"
-	const boundSpecHash = "ddff3b871cef51d2b137dd3d32e1ae8d57d98813cf2901d901066fa8e435ab3f"
+	const boundLabel = "phase-a-anthropic-r1"
+	const boundSpecHash = "f6a55193c3b420ec28a68c050fb7be8a541753ee8a33b6c5900c9cef6ab5a676"
 	if manifest.RevisionLabel != boundLabel || manifest.SpecificationSHA256 != boundSpecHash {
 		t.Fatalf("revision binding = (%q, %q), want (%q, %q): a specification change or relabel must update both constants together and consciously choose the revision label",
 			manifest.RevisionLabel, manifest.SpecificationSHA256, boundLabel, boundSpecHash)

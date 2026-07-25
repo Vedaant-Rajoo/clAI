@@ -31,6 +31,7 @@ func TestContextPolicyDefaults(t *testing.T) {
 	}{
 		{"rules", "rules", machinecontext.PolicyLocalOnly},
 		{"openrouter", "openrouter", machinecontext.PolicyRemoteMinimal},
+		{"anthropic", "anthropic", machinecontext.PolicyRemoteMinimal},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			flags, err := parseProviderFlagsForTest(t, false, "--provider", tt.provider)

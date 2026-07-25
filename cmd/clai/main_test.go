@@ -10,6 +10,7 @@ import (
 
 	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
 	"github.com/Vedaant-Rajoo/clai/internal/provider"
+	"github.com/Vedaant-Rajoo/clai/internal/provider/anthropic"
 	"github.com/Vedaant-Rajoo/clai/internal/provider/openrouter"
 	"github.com/Vedaant-Rajoo/clai/internal/provider/rules"
 	"github.com/Vedaant-Rajoo/clai/internal/safety"
@@ -73,8 +74,86 @@ func TestSelectProviderUnknown(t *testing.T) {
 }
 
 func TestSelectProviderUnimplemented(t *testing.T) {
-	if _, err := selectProvider("anthropic", "", "", false, machinecontext.PolicyRemoteMinimal, nil); err == nil {
+	if _, err := selectProvider("openai", "", "", false, machinecontext.PolicyRemoteMinimal, nil); err == nil {
 		t.Error("want error for unimplemented provider")
+	}
+}
+
+func TestSelectProviderAnthropicUsesEnvKey(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+	p, err := selectProvider("anthropic", "claude-opus-4-8", "", false, machinecontext.PolicyRemoteMinimal, nil)
+	if err != nil {
+		t.Fatalf("selectProvider: %v", err)
+	}
+	ap, ok := p.(anthropic.Provider)
+	if !ok {
+		t.Fatalf("got %T, want anthropic.Provider", p)
+	}
+	if ap.APIKey != "sk-ant-test" {
+		t.Errorf("APIKey = %q, want env key", ap.APIKey)
+	}
+	if ap.Model != "claude-opus-4-8" {
+		t.Errorf("Model = %q, want claude-opus-4-8", ap.Model)
+	}
+	if ap.Policy != machinecontext.PolicyRemoteMinimal {
+		t.Errorf("Policy = %q, want remote-minimal", ap.Policy)
+	}
+}
+
+func TestAnthropicModelDefaultAndOverride(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+	t.Run("default left empty for provider default", func(t *testing.T) {
+		p, err := selectProvider("anthropic", "", "", false, machinecontext.PolicyRemoteMinimal, nil)
+		if err != nil {
+			t.Fatalf("selectProvider: %v", err)
+		}
+		if got := p.(anthropic.Provider).Model; got != "" {
+			t.Fatalf("Model = %q, want empty so provider applies %q", got, anthropic.DefaultModel)
+		}
+	})
+	t.Run("CLI override forwarded verbatim", func(t *testing.T) {
+		p, err := selectProvider("anthropic", "claude-opus-4-8", "", false, machinecontext.PolicyRemoteMinimal, nil)
+		if err != nil {
+			t.Fatalf("selectProvider: %v", err)
+		}
+		if got := p.(anthropic.Provider).Model; got != "claude-opus-4-8" {
+			t.Fatalf("Model = %q, want claude-opus-4-8", got)
+		}
+	})
+}
+
+func TestSelectProviderAnthropicExplicitKeyWins(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "env-key")
+	p, err := selectProvider("anthropic", "", "flag-key", false, machinecontext.PolicyRemoteMinimal, nil)
+	if err != nil {
+		t.Fatalf("selectProvider: %v", err)
+	}
+	if p.(anthropic.Provider).APIKey != "flag-key" {
+		t.Errorf("APIKey = %q, want flag-key", p.(anthropic.Provider).APIKey)
+	}
+}
+
+func TestSelectProviderAnthropicFallbackWraps(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+	p, err := selectProvider("anthropic", "", "", true, machinecontext.PolicyRemoteMinimal, nil)
+	if err != nil {
+		t.Fatalf("selectProvider: %v", err)
+	}
+	if _, ok := p.(fallback); !ok {
+		t.Errorf("got %T, want fallback wrapper", p)
+	}
+}
+
+func TestSelectProviderAnthropicSharedFieldsForwarded(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+	shared := []string{machinecontext.FieldWorkingDirectory}
+	p, err := selectProvider("anthropic", "", "", false, machinecontext.PolicyRemoteExplicit, shared)
+	if err != nil {
+		t.Fatalf("selectProvider: %v", err)
+	}
+	ap := p.(anthropic.Provider)
+	if len(ap.SharedFields) != 1 || ap.SharedFields[0] != machinecontext.FieldWorkingDirectory {
+		t.Errorf("SharedFields = %v, want [working_directory]", ap.SharedFields)
 	}
 }
 
@@ -310,14 +389,54 @@ func TestWidgetBlockedCommandNotExportedAtBoundary(t *testing.T) {
 	}
 }
 
+func TestWidgetRejectsResultFileReplacementDuringTUI(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "result")
+	originalPath := filepath.Join(dir, "original")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	original := executeTUI
+	executeTUI = func(provider.Provider, string) (string, bool, error) {
+		if err := os.Rename(path, originalPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return "pwd", true, nil
+	}
+	t.Cleanup(func() { executeTUI = original })
+
+	c, _, errBuf := captureCLI()
+	code := c.run([]string{"widget", "--shell", "fish", "--result-file", path})
+	if code != exitError {
+		t.Fatalf("run(widget) = %d, want %d; stderr: %s", code, exitError, errBuf.String())
+	}
+	if !strings.Contains(errBuf.String(), "changed while the TUI was open") {
+		t.Fatalf("stderr = %q, want identity-change error", errBuf.String())
+	}
+	if data, err := os.ReadFile(path); err != nil || len(data) != 0 {
+		t.Fatalf("replacement file changed or removed: data=%q err=%v", data, err)
+	}
+	if _, err := os.Stat(originalPath); err != nil {
+		t.Fatalf("original inspected file missing: %v", err)
+	}
+}
+
 func TestWriteWidgetResult(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "result")
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
+	expected, err := inspectWidgetResult(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	const command = `printf '%s' "hello * world"`
-	if err := writeWidgetResult(path, command); err != nil {
+	if err := writeWidgetResult(path, command, expected); err != nil {
 		t.Fatalf("writeWidgetResult: %v", err)
 	}
 	got, err := os.ReadFile(path)
@@ -331,7 +450,7 @@ func TestWriteWidgetResult(t *testing.T) {
 
 func TestWriteWidgetResultRejectsUnsafeTargets(t *testing.T) {
 	t.Run("relative", func(t *testing.T) {
-		if err := writeWidgetResult("result", "pwd"); err == nil {
+		if err := writeWidgetResult("result", "pwd", nil); err == nil {
 			t.Fatal("expected relative path error")
 		}
 	})
@@ -341,7 +460,7 @@ func TestWriteWidgetResultRejectsUnsafeTargets(t *testing.T) {
 		if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := writeWidgetResult(path, "pwd"); err == nil {
+		if err := writeWidgetResult(path, "pwd", nil); err == nil {
 			t.Fatal("expected nonempty file error")
 		}
 	})
@@ -354,7 +473,7 @@ func TestWriteWidgetResultRejectsUnsafeTargets(t *testing.T) {
 		if err := os.Chmod(path, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if err := writeWidgetResult(path, "pwd"); err == nil {
+		if err := writeWidgetResult(path, "pwd", nil); err == nil {
 			t.Fatal("expected permissions error")
 		}
 	})
@@ -369,7 +488,7 @@ func TestWriteWidgetResultRejectsUnsafeTargets(t *testing.T) {
 		if err := os.Symlink(target, link); err != nil {
 			t.Skipf("symlink unavailable: %v", err)
 		}
-		if err := writeWidgetResult(link, "pwd"); err == nil {
+		if err := writeWidgetResult(link, "pwd", nil); err == nil {
 			t.Fatal("expected symlink error")
 		}
 	})

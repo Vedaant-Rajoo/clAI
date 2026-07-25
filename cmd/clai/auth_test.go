@@ -275,6 +275,10 @@ func TestExchangeCode(t *testing.T) {
 		{"escaped replacement character", "{\"key\":\"\\uFFFD\"}", "�"},
 		{"ordinary non ascii", `{"key":"日本語-api-key"}`, "日本語-api-key"},
 		{"decoded length boundary", `{"key":"` + strings.Repeat("k", maxAPIKeyLength) + `"}`, strings.Repeat("k", maxAPIKeyLength)},
+		{"unknown member before key tolerated", `{"user_id":"u-123","key":"ok"}`, "ok"},
+		{"unknown member after key tolerated", `{"key":"ok","user_id":"u-123"}`, "ok"},
+		{"unknown object member tolerated", `{"limits":{"remaining":5},"key":"ok"}`, "ok"},
+		{"unknown array member tolerated", `{"scopes":["a","b"],"key":"ok"}`, "ok"},
 	}
 	for _, tc := range validUnicode {
 		t.Run(tc.name, func(t *testing.T) {
@@ -298,8 +302,8 @@ func TestExchangeCode(t *testing.T) {
 		{"malformed", http.StatusOK, `{`, nil, "decode key response"},
 		{"top level array", http.StatusOK, `[{"key":"ok"}]`, nil, "expected object"},
 		{"duplicate key", http.StatusOK, `{"key":"first","key":"second"}`, nil, "duplicate key member"},
-		{"unknown member before key", http.StatusOK, `{"other":1,"key":"ok"}`, nil, "unknown member"},
-		{"unknown member after key", http.StatusOK, `{"key":"ok","other":1}`, nil, "unknown member"},
+		{"duplicate key with unknown member between", http.StatusOK, `{"key":"first","user_id":"u","key":"second"}`, nil, "duplicate key member"},
+		{"malformed unknown member value", http.StatusOK, `{"user_id":,"key":"ok"}`, nil, "decode key response"},
 		{"key number", http.StatusOK, `{"key":123}`, nil, "key must be a string"},
 		{"key object", http.StatusOK, `{"key":{}}`, nil, "key must be a string"},
 		{"key null", http.StatusOK, `{"key":null}`, nil, "key must be a string"},

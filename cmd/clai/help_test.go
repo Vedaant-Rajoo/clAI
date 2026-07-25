@@ -61,6 +61,7 @@ func TestMainHelpContent(t *testing.T) {
 		"auth", "init", "version",
 		"--copy", "--print-command", "--provider", "--model",
 		"--api-key", "--fallback-rules", "--context-policy", "--share-context", "--version",
+		"rules", "openrouter", "anthropic",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("main help missing %q", want)

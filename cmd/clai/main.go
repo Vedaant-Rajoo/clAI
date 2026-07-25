@@ -14,6 +14,7 @@ import (
 	"github.com/Vedaant-Rajoo/clai/internal/auth"
 	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
 	"github.com/Vedaant-Rajoo/clai/internal/provider"
+	"github.com/Vedaant-Rajoo/clai/internal/provider/anthropic"
 	"github.com/Vedaant-Rajoo/clai/internal/provider/openrouter"
 	"github.com/Vedaant-Rajoo/clai/internal/provider/rules"
 	"github.com/Vedaant-Rajoo/clai/internal/safety"
@@ -197,14 +198,15 @@ func (c cli) runWidget(args []string) int {
 		fmt.Fprintf(c.stderr, "clai widget: %v\nRun 'clai widget help' for usage.\n", err)
 		return exitUsage
 	}
-	if _, err := inspectWidgetResult(*f.resultFile); err != nil {
+	resultIdentity, err := inspectWidgetResult(*f.resultFile)
+	if err != nil {
 		fmt.Fprintf(c.stderr, "clai widget: invalid result file: %v\n", err)
 		return exitError
 	}
 	keepResult := false
 	defer func() {
 		if !keepResult {
-			_ = os.Remove(*f.resultFile)
+			removeWidgetResultIfSame(*f.resultFile, resultIdentity)
 		}
 	}()
 
@@ -235,7 +237,7 @@ func (c cli) runWidget(args []string) int {
 		fmt.Fprintf(c.stderr, "clai widget: accepted command is blocked by safety and not exportable: %s\n", strings.Join(decision.Reasons, " "))
 		return exitError
 	}
-	if err := writeWidgetResult(*f.resultFile, command); err != nil {
+	if err := writeWidgetResult(*f.resultFile, command, resultIdentity); err != nil {
 		fmt.Fprintf(c.stderr, "clai widget: write result: %v\n", err)
 		return exitError
 	}
@@ -289,7 +291,7 @@ func registerProviderFlags(fs *flag.FlagSet) providerFlags {
 	fs.Var(policy, "context-policy", "context policy: local-only | remote-minimal | remote-explicit")
 	fs.Var(shared, "share-context", "share one context field (repeatable): working_directory | git_root | git_branch")
 	return providerFlags{
-		providerName:  fs.String("provider", envOr("CLAI_PROVIDER", "rules"), "provider: rules | openrouter"),
+		providerName:  fs.String("provider", envOr("CLAI_PROVIDER", "rules"), "provider: rules | openrouter | anthropic"),
 		model:         fs.String("model", "", "model override for LLM providers"),
 		apiKey:        fs.String("api-key", "", "API key override for LLM providers"),
 		fallbackRules: fs.Bool("fallback-rules", false, "fall back to local rules when the selected provider errors"),
@@ -308,9 +310,10 @@ func (f providerFlags) contextOptions() (machinecontext.Policy, []string, error)
 		if len(shared) != 0 {
 			return "", nil, errors.New("--share-context requires an explicit --context-policy remote-explicit in the same invocation")
 		}
-		if *f.providerName == "openrouter" {
+		switch *f.providerName {
+		case "openrouter", "anthropic":
 			policy = machinecontext.PolicyRemoteMinimal
-		} else {
+		default:
 			policy = machinecontext.PolicyLocalOnly
 		}
 	}
@@ -416,10 +419,21 @@ func inspectWidgetResult(path string) (os.FileInfo, error) {
 	return info, nil
 }
 
-func writeWidgetResult(path, command string) error {
+func removeWidgetResultIfSame(path string, expected os.FileInfo) {
+	current, err := os.Lstat(path)
+	if err != nil || expected == nil || !os.SameFile(expected, current) {
+		return
+	}
+	_ = os.Remove(path)
+}
+
+func writeWidgetResult(path, command string, expected os.FileInfo) error {
 	before, err := inspectWidgetResult(path)
 	if err != nil {
 		return err
+	}
+	if expected == nil || !os.SameFile(expected, before) {
+		return errors.New("result file changed while the TUI was open")
 	}
 
 	file, err := os.OpenFile(path, os.O_WRONLY, 0)
@@ -432,7 +446,7 @@ func writeWidgetResult(path, command string) error {
 	if err != nil {
 		return err
 	}
-	if !after.Mode().IsRegular() || !os.SameFile(before, after) {
+	if !after.Mode().IsRegular() || !os.SameFile(expected, after) || !os.SameFile(before, after) {
 		return errors.New("result file changed while opening")
 	}
 	if after.Mode().Perm()&0o077 != 0 {
@@ -485,9 +499,19 @@ func selectProvider(name, model, apiKey string, fallbackRules bool, policy machi
 			p = fallback{primary: p}
 		}
 		return p, nil
-	case "anthropic", "openai":
-		return nil, fmt.Errorf("provider %q is not implemented yet; use openrouter or rules", name)
+	case "anthropic":
+		key, err := auth.Resolve("anthropic", apiKey)
+		if err != nil {
+			return nil, err
+		}
+		var p provider.Provider = anthropic.Provider{APIKey: key, Model: model, Policy: policy, SharedFields: sharedFields}
+		if fallbackRules {
+			p = fallback{primary: p}
+		}
+		return p, nil
+	case "openai":
+		return nil, fmt.Errorf("provider %q is not implemented yet; use anthropic, openrouter, or rules", name)
 	default:
-		return nil, fmt.Errorf("unknown provider %q (known: rules, openrouter)", name)
+		return nil, fmt.Errorf("unknown provider %q (known: rules, openrouter, anthropic)", name)
 	}
 }

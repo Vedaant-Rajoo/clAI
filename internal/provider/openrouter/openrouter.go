@@ -70,26 +70,13 @@ type Provider struct {
 	receiptSink func(RequestReceipt)
 }
 
-type RequestReceipt struct {
-	Version                string
-	Provider               string
-	Model                  string
-	EffectiveEndpoint      string
-	EndpointClassification machinecontext.EndpointClass
-	ProxyMode              string
-	ContextPolicy          machinecontext.Policy
-	SelectorVersion        string
-	SelectedFields         []machinecontext.Field
-	RedactedFields         []machinecontext.Field
-	OmittedFields          []machinecontext.Field
-	RequestBody            []byte
-	RequestBodyHash        BodyHash
-}
+// RequestReceipt and BodyHash moved to the provider-neutral internal/provider
+// package so the direct Anthropic provider emits the same receipt shape. They are
+// kept here as type aliases (not new named types) so every existing package-local
+// reference — including the golden receipt tests — stays byte-identical.
+type RequestReceipt = provider.RequestReceipt
 
-type BodyHash struct {
-	Algorithm string
-	Value     string
-}
+type BodyHash = provider.BodyHash
 
 type requestBody struct {
 	Model    string    `json:"model"`

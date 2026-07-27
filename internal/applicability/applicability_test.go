@@ -153,6 +153,40 @@ func TestEditReviewDerivesExecutablesFromBytes(t *testing.T) {
 	}
 }
 
+// TestEditedBraceCommandsDeriveExecutables covers the consequence of literal
+// {} joining the supported subset: a braced command now parses, so edit
+// evaluation derives its executables instead of skipping on parse uncertainty.
+// The marks stay soft, so such a command remains exportable after acceptance.
+func TestEditedBraceCommandsDeriveExecutables(t *testing.T) {
+	inventory := fixtureInventory{tools: map[string]capability.ToolFact{
+		"du": {Name: "du", Present: true},
+	}}
+
+	result := EvaluateEdited("xargs -I{} du -h {}", inventory)
+	if result.Decision != Marked {
+		t.Fatalf("decision = %q, want a soft mark for the absent xargs", result.Decision)
+	}
+	want := []string{"tool xargs: may not work (not present in capability inventory)"}
+	if !reflect.DeepEqual(result.Reasons, want) {
+		t.Fatalf("reasons = %v, want %v", result.Reasons, want)
+	}
+
+	// Every derived executable present: applicable with no reasons.
+	present := fixtureInventory{tools: map[string]capability.ToolFact{
+		"find": {Name: "find", Present: true},
+		"du":   {Name: "du", Present: true},
+	}}
+	if got := EvaluateEdited(`find . -exec du -h {} \;`, present); got.Decision != Applicable || len(got.Reasons) != 0 {
+		t.Fatalf("EvaluateEdited(find -exec) = %+v, want applicable with no reasons", got)
+	}
+
+	// A brace pair in command position is still parse uncertainty, so no
+	// applicability assertion is made and structural validation decides.
+	if got := EvaluateEdited("{}/echo", inventory); got.Decision != Applicable || len(got.Reasons) != 0 {
+		t.Fatalf("EvaluateEdited({}/echo) = %+v, want no applicability assertion", got)
+	}
+}
+
 func TestEditedParseUncertaintyDefersToValidation(t *testing.T) {
 	inventory := fixtureInventory{tools: map[string]capability.ToolFact{}}
 	for _, command := range []string{"echo $(missing)", "echo 'unterminated"} {

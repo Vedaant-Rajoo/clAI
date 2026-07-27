@@ -6,6 +6,11 @@ import (
 	"unicode/utf8"
 )
 
+// emptyBracePair is the only brace construct inside the supported subset. Fish,
+// Bash, and Zsh all render it literally in every word position, so it carries no
+// grouping or expansion meaning and is treated as ordinary word data.
+const emptyBracePair = "{}"
+
 type tokenKind uint8
 
 const (
@@ -262,6 +267,18 @@ func (l *lexer) lexWord() Word {
 			parts = append(parts, WordPart{Kind: UnquotedPart, Value: text, Span: Span{partStart, l.pos}})
 			l.issue("unsupported-grouping", Unsupported, Span{partStart, l.pos}, "shell grouping is outside the supported shell subset")
 		case '{', '}':
+			// An empty brace pair is literal text in Fish, Bash, and Zsh alike:
+			// it is neither brace expansion nor grouping, and no shell in the
+			// subset expands it in any word position. It is kept as data here so
+			// idioms such as `xargs -I{}` and `find -exec {} \;` parse; a pair
+			// occupying a command-dispatch position is re-flagged by
+			// appendBraceDispatchIssues, where command structure is known.
+			if strings.HasPrefix(l.source[l.pos:], emptyBracePair) {
+				l.pos += len(emptyBracePair)
+				value.WriteString(emptyBracePair)
+				parts = append(parts, WordPart{Kind: UnquotedPart, Value: emptyBracePair, Span: Span{partStart, l.pos}})
+				continue
+			}
 			l.pos++
 			text := l.source[partStart:l.pos]
 			value.WriteString(text)
@@ -505,7 +522,44 @@ func appendStructuralIssues(result *Result) {
 			}
 			resolution := ResolveExecutable(*command)
 			result.Issues = append(result.Issues, resolution.Issues...)
+			appendBraceDispatchIssues(resolution, &result.Issues)
 		}
+	}
+}
+
+// braceDataWord reports whether word carries a literal empty brace pair outside
+// quotes. The lexer emits each pair as its own unquoted part, so the match is
+// exact: it cannot collide with a lone brace, with quoted text, or with a brace
+// that happens to sit inside a longer unquoted run.
+func braceDataWord(word Word) bool {
+	for _, part := range word.Parts {
+		if part.Kind == UnquotedPart && part.Value == emptyBracePair {
+			return true
+		}
+	}
+	return false
+}
+
+// appendBraceDispatchIssues flags a literal brace pair that occupies a command-
+// or wrapper-dispatch position. The pair is inert data in every argument
+// position, but a dispatch word such as `{}/echo` reduces to the base name
+// `echo`, and `{}/env` would be consumed as a wrapper, so both dispatch surfaces
+// are checked rather than only the first word of the command.
+func appendBraceDispatchIssues(resolution ExecutableResolution, issues *[]Issue) {
+	for _, wrapper := range resolution.Wrappers {
+		if braceDataWord(wrapper.Word) {
+			*issues = append(*issues, braceDispatchIssue(wrapper.Word.Span))
+		}
+	}
+	if resolution.Found && braceDataWord(resolution.Word) {
+		*issues = append(*issues, braceDispatchIssue(resolution.Word.Span))
+	}
+}
+
+func braceDispatchIssue(span Span) Issue {
+	return Issue{
+		Code: "unsupported-brace-dispatch", Kind: Unsupported, Span: span,
+		Message: "brace syntax in a command position is outside the supported shell subset",
 	}
 }
 

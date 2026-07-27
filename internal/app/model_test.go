@@ -1292,4 +1292,19 @@ func TestReviewDisplaysRelevantCapabilityFacts(t *testing.T) {
 	if strings.Contains(strings.Join(facts, "\n"), "/usr/bin/rg") {
 		t.Fatalf("edited capability facts exposed executable path: %v", facts)
 	}
+
+	// A literal brace pair is word data, so an edited command using the xargs
+	// replacement idiom parses and its executable positions are derived rather
+	// than skipped for parse uncertainty. Only genuine executable positions are
+	// derived: rg is an argument to xargs here, not a command of its own.
+	braced := relevantCapabilityLines(model.inventory, nil, true, "rg --files | xargs -I{} du -h {}")
+	joined := strings.Join(braced, "\n")
+	for _, want := range []string{"tool rg: present 14.1.0", "tool xargs: absent"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("edited brace command missing derived fact %q: %v", want, braced)
+		}
+	}
+	if strings.Contains(joined, "{}") || strings.Contains(joined, "-I") {
+		t.Fatalf("capability facts leaked brace or flag syntax: %v", braced)
+	}
 }

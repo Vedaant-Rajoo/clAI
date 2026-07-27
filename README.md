@@ -39,4 +39,9 @@ invocation-scoped `--context-policy remote-explicit` with repeatable
 `--share-context` approvals; `local-only` omits context and fails closed for
 remote endpoints.
 
+To exercise a remote provider without spending API calls, run
+`go run ./cmd/clai-stubprovider` and pass `--dev-endpoint http://127.0.0.1:8747`.
+The override accepts loopback hosts only and labels every screen, so it cannot
+send traffic off-host or be mistaken for a real session.
+
 - [Provider setup, auth, and context privacy](docs/providers.md)

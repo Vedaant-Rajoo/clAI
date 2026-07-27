@@ -64,6 +64,31 @@ executable paths, raw probe output, and parse errors are never transmitted.
 remotes, host or user identity, shell history, prior command output, environment
 dumps, repository contents, or credentials.
 
+## Testing against a local endpoint
+
+`--dev-endpoint <url>` redirects a remote provider's requests to a loopback
+server so you can exercise the complete request path — credential header,
+context selection, request serialization, streaming, strict candidate decoding,
+applicability, review, and shell export — without contacting the real provider
+or spending money on API calls:
+
+```sh
+go run ./cmd/clai-stubprovider              # serves scripted scenarios on 127.0.0.1:8747
+clai --provider anthropic --dev-endpoint http://127.0.0.1:8747
+```
+
+The URL must address a loopback host. Ordinary hostnames are rejected before any
+network activity, including ones that happen to resolve to loopback, so this can
+never redirect traffic off-host. It is not accepted for the local `rules`
+provider, and it does not bypass credentials — a key is still resolved and sent
+in the request header exactly as it would be in production. Because the endpoint
+is loopback, the context policy defaults to `local-only` and the request carries
+the intent alone; pass `--context-policy remote-minimal` (or `remote-explicit`
+with `--share-context`) explicitly when you want to exercise context sharing. Every screen that can
+show a candidate is labelled with the effective endpoint, so a stubbed session
+cannot be mistaken for a real one. Run `go run ./cmd/clai-stubprovider --list` to
+see the scenarios; the intent text selects one.
+
 The API key is attached as an authorization header, not included in the JSON
 request body. clai also creates an ephemeral, non-secret internal request receipt
 covering the configured endpoint and its lexical classification, proxy mode,

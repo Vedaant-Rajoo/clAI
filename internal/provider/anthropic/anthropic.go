@@ -88,6 +88,8 @@ Rules:
 - requirements contains zero to eight actual dependencies using kind tool, shell, or os and lowercase ASCII names.
 - min_version is optional and valid only for tool requirements as a numeric dotted version.
 - The command must be a single line, safe to paste into the user's shell.
+- The command must stay inside the shell syntax subset shared by Fish, Bash, and Zsh. Allowed: plain words, single and double quotes, backslash escapes, leading NAME=value assignments, the env and command wrappers, ; && || and | to combine commands, input/output/append redirects, and the literal brace pair {} as used by xargs -I{} and find -exec {} \;.
+- Never use command substitution $(...) or backticks, parameter expansion such as $VAR or ${VAR}, brace expansion such as {a,b} or {1..3}, brace groups { ...; }, subshells ( ... ), comments, here-documents, background &, or passing a command string to a shell with -c. A command using any of these is rejected before the user can accept it, so choose a formulation that avoids them.
 - The explanation is one short sentence saying why this command fits the supplied capability facts.
 - Use only the normalized capability and environment facts included in the user message; never infer executable paths or raw probe output.
 - Declare requirements that the command actually depends on.`

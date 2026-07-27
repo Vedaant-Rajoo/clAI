@@ -142,6 +142,19 @@ func (c cli) runInteractive(args []string) int {
 		return exitUsage
 	}
 
+	// Go's flag package stops at the first non-flag argument, so a trailing
+	// positional would otherwise be silently ignored and start the TUI. A
+	// trailing help request is honored; anything else is a usage error, matching
+	// the widget command's stricter handling.
+	if fs.NArg() != 0 {
+		if fs.NArg() == 1 && isHelpArg(fs.Arg(0)) {
+			printMainHelp(c.stdout)
+			return exitOK
+		}
+		fmt.Fprintf(c.stderr, "clai: unexpected argument %q\nRun 'clai help' for usage.\n", fs.Arg(0))
+		return exitUsage
+	}
+
 	// The endpoint is validated first because the context policy defaults on
 	// endpoint classification (REQ-CONTEXT-003, REQ-DEVENDPOINT-004).
 	devEndpoint, err := f.devEndpointOption()

@@ -40,6 +40,14 @@ func TestHelpRouting(t *testing.T) {
 		{"version extra arg", []string{"version", "bogus"}, exitUsage},
 		{"auth no verb", []string{"auth"}, exitUsage},
 		{"auth unknown verb", []string{"auth", "bogus"}, exitUsage},
+		// Go's flag package stops at the first non-flag argument, so a trailing
+		// positional after interactive flags used to be silently ignored and
+		// start the TUI. Help is honored; anything else is a usage error.
+		{"flags then help", []string{"--provider", "rules", "help"}, exitOK},
+		{"flags then -h", []string{"--provider", "rules", "-h"}, exitOK},
+		{"flags then --help", []string{"--provider", "rules", "--help"}, exitOK},
+		{"flags then stray positional", []string{"--provider", "rules", "bogus"}, exitUsage},
+		{"flags then extra positionals", []string{"--provider", "rules", "help", "extra"}, exitUsage},
 	}
 
 	for _, tc := range cases {

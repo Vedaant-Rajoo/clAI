@@ -105,6 +105,8 @@ func classifyExecutable(resolved shellsyntax.ExecutableResolution, commandIndex,
 		add(Warn, "Git command may modify repository state.")
 	case base == "docker" && startsWithAnyArgument(args, "run", "build", "pull"):
 		add(Warn, "Docker command may create containers, build images, or download remote content.")
+	case base == "find" && dispatchesExternalCommand(args):
+		add(Warn, "Command dispatches an external command through find -exec.")
 	case slices.Contains([]string{"pwd", "ls", "find", "rg", "du", "df", "date", "hostname", "go", "ps", "lsof", "printenv", "printf", "ifconfig", "echo"}, base):
 		add(Allow, "Command appears to be read-only.")
 	case base == "git" && gitCommandKnown && startsWithAnyArgument(gitArgs, "status", "diff", "log", "branch", "remote", "tag"):
@@ -435,6 +437,22 @@ func wordValues(words []shellsyntax.Word) []string {
 
 func startsWithAnyArgument(args []string, values ...string) bool {
 	return len(args) > 0 && slices.Contains(values, args[0])
+}
+
+// dispatchesExternalCommand reports whether find arguments hand a command to
+// find for execution. The dispatched command is find's own argument syntax, so
+// the executable it names is invisible to this policy: `find . -exec rm -rf . \;`
+// resolves to base `find` and would otherwise read as read-only. Such a command
+// warns rather than allows; it is not blocked, because the dispatched name is
+// not analyzed and a block would have to be speculative.
+func dispatchesExternalCommand(args []string) bool {
+	for _, value := range args {
+		switch value {
+		case "-exec", "-execdir", "-ok", "-okdir":
+			return true
+		}
+	}
+	return false
 }
 
 func gitCommand(args []string) ([]string, bool) {

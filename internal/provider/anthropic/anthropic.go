@@ -81,12 +81,16 @@ var (
 	defaultReceiptSink = func(provider.RequestReceipt) {}
 )
 
-const systemPrompt = `You convert a natural-language intent into a single shell command.
+const systemPrompt = `You convert a natural-language intent into a single shell command candidate.
 
 Rules:
+- Return one candidate/v2 object with command, explanation, and optional requirements.
+- requirements contains zero to eight actual dependencies using kind tool, shell, or os and lowercase ASCII names.
+- min_version is optional and valid only for tool requirements as a numeric dotted version.
 - The command must be a single line, safe to paste into the user's shell.
-- The explanation is one short sentence saying why this command fits.
-- Use only the environment context included in the user message.`
+- The explanation is one short sentence saying why this command fits the supplied capability facts.
+- Use only the normalized capability and environment facts included in the user message; never infer executable paths or raw probe output.
+- Declare requirements that the command actually depends on.`
 
 // Provider compiles an intent into one candidate via Anthropic's Messages API.
 //
@@ -103,23 +107,6 @@ type Provider struct {
 	timeout     time.Duration
 	transport   http.RoundTripper
 	receiptSink func(provider.RequestReceipt)
-}
-
-// promptContext mirrors the OpenRouter prompt semantics: only the context
-// fields the policy selected are ever populated. It is intentionally not the
-// OpenRouter wire envelope — the SDK owns the Messages request shape.
-type promptContext struct {
-	OSFamily         string `json:"os_family,omitempty"`
-	ShellFamily      string `json:"shell_family,omitempty"`
-	ProjectKind      string `json:"project_kind,omitempty"`
-	WorkingDirectory string `json:"working_directory,omitempty"`
-	GitRoot          string `json:"git_root,omitempty"`
-	GitBranch        string `json:"git_branch,omitempty"`
-}
-
-type promptPayload struct {
-	Intent  string        `json:"intent"`
-	Context promptContext `json:"context"`
 }
 
 // streamLifecycle validates the Anthropic SSE message/block lifecycle separately
@@ -203,7 +190,7 @@ func (p Provider) Compile(ctx context.Context, request provider.Request) ([]prov
 	if policy == machinecontext.PolicyLocalOnly && class == machinecontext.EndpointRemote {
 		return nil, errors.New("anthropic: local-only context policy prohibits a remote endpoint")
 	}
-	selection, err := machinecontext.Select(request.Context, policy, p.SharedFields)
+	selection, err := machinecontext.Select(request.Context, request.Capabilities, policy, p.SharedFields)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: context policy: %w", err)
 	}
@@ -338,27 +325,7 @@ func (p Provider) Compile(ctx context.Context, request provider.Request) ([]prov
 // buildUserContent marshals the intent plus only the policy-selected context
 // fields into the user message text.
 func buildUserContent(intent string, selection machinecontext.Selection) ([]byte, error) {
-	values := promptContext{}
-	for _, field := range selection.Capsule.Fields {
-		if field.Sharing != machinecontext.SharingSelected {
-			continue
-		}
-		switch field.Name {
-		case machinecontext.FieldOSFamily:
-			values.OSFamily = field.Value
-		case machinecontext.FieldShellFamily:
-			values.ShellFamily = field.Value
-		case machinecontext.FieldProjectKind:
-			values.ProjectKind = field.Value
-		case machinecontext.FieldWorkingDirectory:
-			values.WorkingDirectory = field.Value
-		case machinecontext.FieldGitRoot:
-			values.GitRoot = field.Value
-		case machinecontext.FieldGitBranch:
-			values.GitBranch = field.Value
-		}
-	}
-	return json.Marshal(promptPayload{Intent: intent, Context: values})
+	return json.Marshal(machinecontext.ProviderPayloadFor(intent, selection))
 }
 
 // classifyStopReason maps the final stop reason to success or a fail-closed

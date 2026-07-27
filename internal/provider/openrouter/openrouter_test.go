@@ -11,12 +11,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Vedaant-Rajoo/clai/internal/capability"
 	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
 	"github.com/Vedaant-Rajoo/clai/internal/provider"
 )
@@ -247,7 +250,7 @@ func TestRemoteMinimalGoldenBodyHashAndForbiddenAbsence(t *testing.T) {
 	selection, err := machinecontext.Select(machinecontext.Context{
 		OS: "darwin", Shell: "/bin/fish", WorkingDirectory: "/SENTINEL/absolute/path",
 		GitRepository: true, GitRoot: "/SENTINEL/git/root", GitBranch: "SENTINEL-private-branch",
-	}, machinecontext.PolicyRemoteMinimal, nil)
+	}, capability.Inventory{}, machinecontext.PolicyRemoteMinimal, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +258,7 @@ func TestRemoteMinimalGoldenBodyHashAndForbiddenAbsence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"model":"example/model","messages":[{"role":"system","content":"You convert a natural-language intent into a single shell command.\n\nRules:\n- Reply with ONLY a JSON object: {\"command\": \"...\", \"explanation\": \"...\"}.\n- The command must be a single line, safe to paste into the user's shell.\n- The explanation is one short sentence saying why this command fits.\n- Never include markdown fences or extra prose.\n- Use only the environment context included in the user message."},{"role":"user","content":"{\"intent\":\"list files\",\"context\":{\"os_family\":\"darwin\",\"shell_family\":\"fish\",\"project_kind\":\"git\"}}"}]}`
+	want := `{"model":"example/model","messages":[{"role":"system","content":"You convert a natural-language intent into a single shell command candidate.\n\nRules:\n- Reply with ONLY one candidate/v2 JSON object containing command, explanation, and optional requirements.\n- requirements is an array of zero to eight objects with kind tool, shell, or os; name must be lowercase ASCII using only a-z, 0-9, dot, underscore, or hyphen.\n- min_version is optional and may be used only for a tool requirement as a numeric dotted version.\n- The command must be a single line, safe to paste into the user's shell.\n- The explanation is one short sentence saying why this command fits the supplied capability facts.\n- Use only the normalized capability and environment facts included in the user message; never infer executable paths or raw probe output.\n- Declare requirements that the command actually depends on.\n- Never include markdown fences or extra prose."},{"role":"user","content":"{\"intent\":\"list files\",\"context\":{\"os_family\":\"unknown\",\"shell_family\":\"unknown\",\"project_kind\":\"git\",\"platform_arch\":\"unknown\",\"tools\":[{\"name\":\"git\",\"status\":\"absent\"},{\"name\":\"rg\",\"status\":\"absent\"},{\"name\":\"fd\",\"status\":\"absent\"},{\"name\":\"jq\",\"status\":\"absent\"},{\"name\":\"curl\",\"status\":\"absent\"},{\"name\":\"wget\",\"status\":\"absent\"},{\"name\":\"tar\",\"status\":\"absent\"},{\"name\":\"sed\",\"status\":\"absent\"},{\"name\":\"awk\",\"status\":\"absent\"},{\"name\":\"grep\",\"status\":\"absent\"},{\"name\":\"lsof\",\"status\":\"absent\"},{\"name\":\"ifconfig\",\"status\":\"absent\"},{\"name\":\"ip\",\"status\":\"absent\"},{\"name\":\"bash\",\"status\":\"absent\"}]}}"}]}`
 	if string(body) != want {
 		t.Fatalf("body mismatch\n got: %s\nwant: %s", body, want)
 	}
@@ -279,7 +282,7 @@ func TestRemoteMinimalGoldenBodyHashAndForbiddenAbsence(t *testing.T) {
 func TestRemoteExplicitIncludesOnlyApprovedAvailableFields(t *testing.T) {
 	selection, err := machinecontext.Select(machinecontext.Context{
 		OS: "linux", Shell: "zsh", WorkingDirectory: "/work", GitRepository: true, GitRoot: "/work",
-	}, machinecontext.PolicyRemoteExplicit, []string{machinecontext.FieldWorkingDirectory, machinecontext.FieldGitBranch})
+	}, capability.Inventory{}, machinecontext.PolicyRemoteExplicit, []string{machinecontext.FieldWorkingDirectory, machinecontext.FieldGitBranch})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +297,7 @@ func TestRemoteExplicitIncludesOnlyApprovedAvailableFields(t *testing.T) {
 		t.Fatalf("body included unapproved git root: %s", body)
 	}
 	receipt := makeReceipt("model", defaultEndpoint, machinecontext.EndpointRemote, "direct", selection, body)
-	if len(receipt.OmittedFields) != 1 || receipt.OmittedFields[0].Name != machinecontext.FieldGitBranch {
+	if len(receipt.OmittedFields) != 2 || receipt.OmittedFields[0].Name != machinecontext.FieldGitRoot || receipt.OmittedFields[1].Name != machinecontext.FieldGitBranch {
 		t.Fatalf("omitted fields = %+v", receipt.OmittedFields)
 	}
 }
@@ -353,8 +356,8 @@ func TestActualTransportBytesEqualReceipt(t *testing.T) {
 	if receipt.Version != "request-receipt/v1" || receipt.Provider != "openrouter" || receipt.Model != DefaultModel || receipt.EndpointClassification != machinecontext.EndpointLoopback || receipt.SelectorVersion != machinecontext.SelectorVersion {
 		t.Fatalf("receipt metadata = %+v", receipt)
 	}
-	if len(receipt.SelectedFields) < 2 || receipt.SelectedFields[1].Name != machinecontext.FieldShellFamily || receipt.SelectedFields[1].Provenance != "provider-request" {
-		t.Fatalf("manual provider request shell provenance = %+v, want provider-request", receipt.SelectedFields)
+	if len(receipt.SelectedFields) < 2 || receipt.SelectedFields[1].Name != machinecontext.FieldShellFamily || !reflect.DeepEqual(receipt.SelectedFields[1].Provenance, []string{"SHELL"}) {
+		t.Fatalf("provider shell provenance = %+v, want [SHELL]", receipt.SelectedFields)
 	}
 }
 
@@ -371,7 +374,7 @@ func TestProxyModeExcludesProxySecret(t *testing.T) {
 	if got := classifyProxyMode(&http.Client{Transport: transport}, request); got != "configured-proxy" {
 		t.Fatalf("proxy mode = %q", got)
 	}
-	selection, _ := machinecontext.Select(machinecontext.Context{}, machinecontext.PolicyRemoteMinimal, nil)
+	selection, _ := machinecontext.Select(machinecontext.Context{}, capability.Inventory{}, machinecontext.PolicyRemoteMinimal, nil)
 	receipt := makeReceipt("model", defaultEndpoint, machinecontext.EndpointRemote, "configured-proxy", selection, []byte(`{"safe":true}`))
 	if strings.Contains(string(receipt.RequestBody), proxySecret) || strings.Contains(receipt.EffectiveEndpoint, proxySecret) || strings.Contains(receipt.RequestBodyHash.Value, proxySecret) {
 		t.Fatal("proxy secret leaked into receipt")
@@ -430,6 +433,50 @@ func TestCompileRejectsOversizeValidPrefix(t *testing.T) {
 	}
 }
 
+func TestOpenRouterCandidateV2SharedStrictDecoder(t *testing.T) {
+	valid := `{"command":"rg TODO","explanation":"uses rg","requirements":[{"kind":"tool","name":"rg"}]}`
+	candidate, err := parseCandidate(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidate.Requirements) != 1 || candidate.Requirements[0].Name != "rg" {
+		t.Fatalf("candidate = %+v", candidate)
+	}
+
+	tooMany := strings.Repeat(`{"kind":"tool","name":"rg"},`, 8) + `{"kind":"tool","name":"grep"}`
+	for _, input := range []string{
+		`{"command":"x"}`,
+		`{"command":"x","explanation":"x","unknown":true}`,
+		`{"command":"x","explanation":"x","requirements":[{"kind":"package","name":"git"}]}`,
+		`{"command":"x","explanation":"x","requirements":[{"kind":"tool","name":"Git"}]}`,
+		`{"command":"x","explanation":"x","requirements":[` + tooMany + `]}`,
+	} {
+		if _, err := parseCandidate(input); err == nil {
+			t.Fatalf("parseCandidate(%s) accepted", input)
+		}
+	}
+}
+
+func TestOpenRouterFenceNormalizationThenStrictDecode(t *testing.T) {
+	for _, input := range []string{
+		"```json\n{\"command\":\"pwd\",\"explanation\":\"prints cwd\"}\n```",
+		"```\n{\"command\":\"pwd\",\"explanation\":\"prints cwd\"}\n```",
+	} {
+		if _, err := parseCandidate(input); err != nil {
+			t.Fatalf("valid fence rejected: %v", err)
+		}
+	}
+	for _, input := range []string{
+		"```json\n{\"command\":\"pwd\",\"explanation\":\"prints cwd\",\"extra\":true}\n```",
+		"```json {\"command\":\"pwd\",\"explanation\":\"prints cwd\"}```",
+		"```json\n{\"command\":\"pwd\",\"explanation\":\"prints cwd\"}",
+	} {
+		if _, err := parseCandidate(input); err == nil {
+			t.Fatalf("invalid fenced payload accepted: %q", input)
+		}
+	}
+}
+
 func TestParseCandidate(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -467,15 +514,131 @@ func TestParseCandidate(t *testing.T) {
 }
 
 func TestReceiptFieldOrdering(t *testing.T) {
-	selection, _ := machinecontext.Select(machinecontext.Context{OS: "linux", Shell: "bash", WorkingDirectory: "/x"}, machinecontext.PolicyRemoteMinimal, nil)
+	selection, _ := machinecontext.Select(machinecontext.Context{OS: "linux", Shell: "bash", WorkingDirectory: "/x"}, capability.Inventory{}, machinecontext.PolicyRemoteMinimal, nil)
 	receipt := makeReceipt("m", defaultEndpoint, machinecontext.EndpointRemote, "direct", selection, []byte("{}"))
 	got := []string{}
 	for _, field := range receipt.SelectedFields {
 		got = append(got, field.Name)
 	}
-	if want := []string{machinecontext.FieldOSFamily, machinecontext.FieldShellFamily, machinecontext.FieldProjectKind}; !reflect.DeepEqual(got, want) {
+	want := []string{machinecontext.FieldOSFamily, machinecontext.FieldShellFamily, machinecontext.FieldProjectKind, machinecontext.FieldPlatformArch}
+	for _, name := range capability.ToolNames() {
+		want = append(want, "tool_"+name)
+	}
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("selected order = %v, want %v", got, want)
 	}
+}
+
+func TestContextV2ReceiptMembershipAllPolicies(t *testing.T) {
+	context := machinecontext.Context{
+		WorkingDirectory: "/work",
+		GitRepository:    true,
+		GitRoot:          "/work",
+		GitBranch:        "dev",
+	}
+	inventory := capability.Inventory{}
+	universe := []string{machinecontext.FieldOSFamily, machinecontext.FieldShellFamily, machinecontext.FieldProjectKind, machinecontext.FieldPlatformArch}
+	for _, name := range capability.ToolNames() {
+		universe = append(universe, "tool_"+name)
+	}
+	universe = append(universe, machinecontext.FieldWorkingDirectory, machinecontext.FieldGitRoot, machinecontext.FieldGitBranch)
+
+	tests := []struct {
+		name         string
+		policy       machinecontext.Policy
+		shared       []string
+		wantSelected []string
+		wantOmitted  []string
+	}{
+		{"local-only", machinecontext.PolicyLocalOnly, nil, []string{}, universe},
+		{"remote-minimal", machinecontext.PolicyRemoteMinimal, nil, universe[:len(universe)-3], universe[len(universe)-3:]},
+		{"remote-explicit", machinecontext.PolicyRemoteExplicit, []string{machinecontext.FieldWorkingDirectory, machinecontext.FieldGitBranch}, append(append([]string(nil), universe[:len(universe)-3]...), machinecontext.FieldWorkingDirectory, machinecontext.FieldGitBranch), []string{machinecontext.FieldGitRoot}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			selection, err := machinecontext.Select(context, inventory, tt.policy, tt.shared)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := buildRequestBody("model", "intent", selection)
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt := makeReceipt("model", defaultEndpoint, machinecontext.EndpointRemote, "direct", selection, body)
+			wantHash := sha256.Sum256(body)
+			if receipt.RequestBodyHash.Algorithm != "sha256" || receipt.RequestBodyHash.Value != hex.EncodeToString(wantHash[:]) || !bytes.Equal(receipt.RequestBody, body) {
+				t.Fatalf("receipt body/hash mismatch: %+v", receipt.RequestBodyHash)
+			}
+			secondBody, err := buildRequestBody("model", "intent", selection)
+			if err != nil || !bytes.Equal(secondBody, body) {
+				t.Fatalf("request bytes are not deterministic: %v", err)
+			}
+			if got := receiptNames(receipt.SelectedFields); !reflect.DeepEqual(got, tt.wantSelected) {
+				t.Fatalf("selected = %v, want %v", got, tt.wantSelected)
+			}
+			if len(receipt.RedactedFields) != 0 {
+				t.Fatalf("redacted = %+v, want empty", receipt.RedactedFields)
+			}
+			if got := receiptNames(receipt.OmittedFields); !reflect.DeepEqual(got, tt.wantOmitted) {
+				t.Fatalf("omitted = %v, want %v", got, tt.wantOmitted)
+			}
+		})
+	}
+}
+
+func TestContextV2ProhibitedDataExcluded(t *testing.T) {
+	inventory, executablePath := providerPrivacyInventory(t)
+	selection, err := machinecontext.Select(machinecontext.Context{
+		WorkingDirectory: "/SENTINEL/private",
+		GitRepository:    true,
+		GitRoot:          "/SENTINEL/private",
+		GitBranch:        "SENTINEL-branch",
+	}, inventory, machinecontext.PolicyRemoteMinimal, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := buildRequestBody("model", "intent", selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"/SENTINEL", "SENTINEL-branch", "SENTINEL-RAW-PROBE-OUTPUT", executablePath, "hostname", "username", "credential", "git_remote"} {
+		if bytes.Contains(body, []byte(forbidden)) {
+			t.Fatalf("minimal body contains prohibited %q: %s", forbidden, body)
+		}
+	}
+}
+
+func TestRequestReceiptV1OuterShapeUnchanged(t *testing.T) {
+	typeOf := reflect.TypeOf(provider.RequestReceipt{})
+	want := []string{"Version", "Provider", "Model", "EffectiveEndpoint", "EndpointClassification", "ProxyMode", "ContextPolicy", "SelectorVersion", "SelectedFields", "RedactedFields", "OmittedFields", "RequestBody", "RequestBodyHash"}
+	got := make([]string, typeOf.NumField())
+	for index := range typeOf.NumField() {
+		got[index] = typeOf.Field(index).Name
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("request-receipt/v1 fields = %v, want %v", got, want)
+	}
+}
+
+func providerPrivacyInventory(t *testing.T) (capability.Inventory, string) {
+	t.Helper()
+	directory := t.TempDir()
+	path := filepath.Join(directory, "rg")
+	body := "#!/bin/sh\nprintf 'ripgrep 14.1.0 SENTINEL-RAW-PROBE-OUTPUT\\n'\n"
+	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", directory)
+	t.Setenv("SHELL", "/bin/bash")
+	return capability.Collect(t.Context(), ""), path
+}
+
+func receiptNames(fields []machinecontext.Field) []string {
+	result := make([]string, len(fields))
+	for index, field := range fields {
+		result[index] = field.Name
+	}
+	return result
 }
 
 func TestCompileClassifiesHTTPErrors(t *testing.T) {

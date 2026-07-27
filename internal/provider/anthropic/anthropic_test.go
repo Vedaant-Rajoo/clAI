@@ -12,12 +12,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	sdk "github.com/anthropics/anthropic-sdk-go"
 
+	"github.com/Vedaant-Rajoo/clai/internal/capability"
 	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
 	"github.com/Vedaant-Rajoo/clai/internal/provider"
 )
@@ -426,7 +428,7 @@ func TestRemoteMinimalBodyContainsOnlyPermittedContext(t *testing.T) {
 	if _, err := p.Compile(context.Background(), req); err != nil {
 		t.Fatalf("compile: %v", err)
 	}
-	for _, want := range []string{"os_family", "shell_family", "project_kind", "darwin", "fish"} {
+	for _, want := range []string{"os_family", "shell_family", "project_kind", "platform_arch", "tools", "unknown"} {
 		if !bytes.Contains(ft.lastBody, []byte(want)) {
 			t.Errorf("remote-minimal body missing permitted %q: %s", want, ft.lastBody)
 		}
@@ -464,8 +466,8 @@ func TestRemoteExplicitIncludesOnlyApprovedFields(t *testing.T) {
 	if bytes.Contains(ft.lastBody, []byte("git_root")) {
 		t.Fatalf("explicit body included unapproved git root: %s", ft.lastBody)
 	}
-	if len(receipt.OmittedFields) != 1 || receipt.OmittedFields[0].Name != machinecontext.FieldGitBranch {
-		t.Fatalf("omitted fields = %+v, want only git_branch", receipt.OmittedFields)
+	if len(receipt.OmittedFields) != 2 || receipt.OmittedFields[0].Name != machinecontext.FieldGitRoot || receipt.OmittedFields[1].Name != machinecontext.FieldGitBranch {
+		t.Fatalf("omitted fields = %+v", receipt.OmittedFields)
 	}
 }
 
@@ -905,6 +907,156 @@ func TestReceiptBytesEqualHTTPServerObservedBytes(t *testing.T) {
 	}
 }
 
+// goldenInventory is a deterministic capability fixture so context bytes and
+// receipt membership are exact regardless of the host machine.
+func goldenInventory() capability.Inventory {
+	tools := make([]capability.ToolFact, 0, len(capability.ToolNames()))
+	for _, name := range capability.ToolNames() {
+		fact := capability.ToolFact{Name: name}
+		if name == "rg" {
+			fact = capability.ToolFact{Name: "rg", Present: true, Path: "/fixture/bin/rg", Version: "14.1.0"}
+		}
+		tools = append(tools, fact)
+	}
+	shell := capability.ShellIdentity{Family: capability.ShellBash, Path: "/bin/bash", Provenance: capability.ShellFromEnv}
+	return capability.NewFixtureInventory("linux", "arm64", shell, tools)
+}
+
+func goldenToolsJSON() string {
+	var b strings.Builder
+	b.WriteByte('[')
+	for index, name := range capability.ToolNames() {
+		if index > 0 {
+			b.WriteByte(',')
+		}
+		status := "absent"
+		if name == "rg" {
+			status = "present:14.1.0"
+		}
+		b.WriteString(`{"name":"` + name + `","status":"` + status + `"}`)
+	}
+	b.WriteByte(']')
+	return b.String()
+}
+
+func receiptFieldNames(fields []machinecontext.Field) []string {
+	names := make([]string, 0, len(fields))
+	for _, field := range fields {
+		names = append(names, field.Name)
+	}
+	return names
+}
+
+func TestAnthropicContextV2ReceiptMembershipAllPolicies(t *testing.T) {
+	requestContext := machinecontext.Context{
+		WorkingDirectory: "/work",
+		GitRepository:    true,
+		GitRoot:          "/work",
+		GitBranch:        "dev",
+	}
+	inventory := goldenInventory()
+	universe := []string{machinecontext.FieldOSFamily, machinecontext.FieldShellFamily, machinecontext.FieldProjectKind, machinecontext.FieldPlatformArch}
+	for _, name := range capability.ToolNames() {
+		universe = append(universe, "tool_"+name)
+	}
+	universe = append(universe, machinecontext.FieldWorkingDirectory, machinecontext.FieldGitRoot, machinecontext.FieldGitBranch)
+
+	tests := []struct {
+		name         string
+		policy       machinecontext.Policy
+		shared       []string
+		wantSelected []string
+		wantOmitted  []string
+	}{
+		{"local-only", machinecontext.PolicyLocalOnly, nil, []string{}, universe},
+		{"remote-minimal", machinecontext.PolicyRemoteMinimal, nil, universe[:len(universe)-3], universe[len(universe)-3:]},
+		{"remote-explicit", machinecontext.PolicyRemoteExplicit, []string{machinecontext.FieldWorkingDirectory, machinecontext.FieldGitBranch}, append(append([]string(nil), universe[:len(universe)-3]...), machinecontext.FieldWorkingDirectory, machinecontext.FieldGitBranch), []string{machinecontext.FieldGitRoot}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			selection, err := machinecontext.Select(requestContext, inventory, tt.policy, tt.shared)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := buildUserContent("intent", selection)
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt := makeReceipt(DefaultModel, defaultEndpoint, machinecontext.EndpointRemote, "direct", selection, body)
+			wantHash := sha256.Sum256(body)
+			if receipt.RequestBodyHash.Algorithm != "sha256" || receipt.RequestBodyHash.Value != hex.EncodeToString(wantHash[:]) || !bytes.Equal(receipt.RequestBody, body) {
+				t.Fatalf("receipt body/hash mismatch: %+v", receipt.RequestBodyHash)
+			}
+			secondBody, err := buildUserContent("intent", selection)
+			if err != nil || !bytes.Equal(secondBody, body) {
+				t.Fatalf("request bytes are not deterministic: %v", err)
+			}
+			if got := receiptFieldNames(receipt.SelectedFields); !reflect.DeepEqual(got, tt.wantSelected) {
+				t.Fatalf("selected = %v, want %v", got, tt.wantSelected)
+			}
+			if len(receipt.RedactedFields) != 0 {
+				t.Fatalf("redacted = %+v, want empty", receipt.RedactedFields)
+			}
+			if got := receiptFieldNames(receipt.OmittedFields); !reflect.DeepEqual(got, tt.wantOmitted) {
+				t.Fatalf("omitted = %v, want %v", got, tt.wantOmitted)
+			}
+		})
+	}
+}
+
+func TestAnthropicContextWireGoldenAllPolicies(t *testing.T) {
+	requestContext := machinecontext.Context{
+		WorkingDirectory: "/work",
+		GitRepository:    true,
+		GitRoot:          "/work",
+		GitBranch:        "dev",
+	}
+	contextJSON := `{"os_family":"linux","shell_family":"bash","project_kind":"git","platform_arch":"arm64","tools":` + goldenToolsJSON()
+	tests := []struct {
+		name    string
+		baseURL string
+		policy  machinecontext.Policy
+		shared  []string
+		want    string
+	}{
+		{"local-only", "http://localhost:9999", machinecontext.PolicyLocalOnly, nil, `{"intent":"golden intent"}`},
+		{"remote-minimal", "", machinecontext.PolicyRemoteMinimal, nil, `{"intent":"golden intent","context":` + contextJSON + `}}`},
+		{"remote-explicit", "", machinecontext.PolicyRemoteExplicit, []string{machinecontext.FieldWorkingDirectory, machinecontext.FieldGitBranch}, `{"intent":"golden intent","context":` + contextJSON + `,"working_directory":"/work","git_branch":"dev"}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ft := stringTransport(textStream("end_turn", validCandidate))
+			p := Provider{
+				APIKey:       "test",
+				Policy:       tt.policy,
+				SharedFields: tt.shared,
+				baseURL:      tt.baseURL,
+				transport:    ft,
+			}
+			req := provider.Request{Intent: "golden intent", Context: requestContext, Capabilities: goldenInventory()}
+			if _, err := p.Compile(context.Background(), req); err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			var envelope struct {
+				Messages []struct {
+					Content []struct {
+						Text string `json:"text"`
+					} `json:"content"`
+				} `json:"messages"`
+			}
+			if err := json.Unmarshal(ft.lastBody, &envelope); err != nil {
+				t.Fatalf("decode request envelope: %v", err)
+			}
+			if len(envelope.Messages) != 1 || len(envelope.Messages[0].Content) != 1 {
+				t.Fatalf("envelope shape = %s", ft.lastBody)
+			}
+			if got := envelope.Messages[0].Content[0].Text; got != tt.want {
+				t.Fatalf("context payload = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestReceiptCaptureFailuresAreBoundedAndFailClosed(t *testing.T) {
 	readErr := errors.New("read failed")
 	closeErr := errors.New("close failed")
@@ -1052,7 +1204,7 @@ func TestProxyModeClassificationExcludesSecret(t *testing.T) {
 	if got := classifyProxyMode(transport, defaultEndpoint); got != "configured-proxy" {
 		t.Fatalf("proxy mode = %q, want configured-proxy", got)
 	}
-	selection, _ := machinecontext.Select(machinecontext.Context{}, machinecontext.PolicyRemoteMinimal, nil)
+	selection, _ := machinecontext.Select(machinecontext.Context{}, capability.Inventory{}, machinecontext.PolicyRemoteMinimal, nil)
 	receipt := makeReceipt("m", defaultEndpoint, machinecontext.EndpointRemote, "configured-proxy", selection, []byte(`{"safe":true}`))
 	if strings.Contains(string(receipt.RequestBody), proxySecret) || strings.Contains(receipt.EffectiveEndpoint, proxySecret) {
 		t.Fatal("proxy secret leaked into receipt")
@@ -1334,6 +1486,32 @@ func TestAnthropicStructuredOutputStrictDecode(t *testing.T) {
 	t.Run("MalformedOrTrailingRejected", TestStreamMalformedAndTrailingCandidateJSON)
 	t.Run("EmptyCommandRejected", TestStreamEmptyCommand)
 	t.Run("ThinkingNeverEntersCandidate", TestStreamThinkingInterleavedBeforeText)
+}
+
+func TestAnthropicCandidateV2Schema(t *testing.T) {
+	ft := stringTransport(textStream("end_turn", `{"command":"rg TODO","explanation":"uses rg","requirements":[{"kind":"tool","name":"rg"}]}`))
+	candidates, err := remoteProvider(ft, nil).Compile(context.Background(), remoteRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || len(candidates[0].Requirements) != 1 || candidates[0].Requirements[0].Name != "rg" {
+		t.Fatalf("candidates = %+v", candidates)
+	}
+	body := decodeBody(t, ft.lastBody)
+	encoded, err := json.Marshal(body["output_config"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, unsupported := range []string{"minLength", "maxLength", "pattern", "maxItems"} {
+		if bytes.Contains(encoded, []byte(unsupported)) {
+			t.Fatalf("Anthropic schema contains unsupported %q: %s", unsupported, encoded)
+		}
+	}
+	for _, required := range []string{"requirements", "min_version", "additionalProperties"} {
+		if !bytes.Contains(encoded, []byte(required)) {
+			t.Fatalf("candidate/v2 schema missing %q: %s", required, encoded)
+		}
+	}
 }
 
 // TestAnthropicStreamAccumulationAndStopReasons anchors AC-ANTHROPIC-STREAM

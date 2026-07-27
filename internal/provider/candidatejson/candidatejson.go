@@ -1,15 +1,5 @@
-// Package candidatejson owns the canonical candidate/v1 structured-output
-// contract that direct providers use to turn a model's JSON response into a
-// provider.Candidate.
-//
-// The contract is deliberately strict: exactly one JSON object, both the command
-// and explanation present and non-empty, and no unknown fields or trailing
-// content. Strictness is a safety property, not a convenience one — clai never
-// auto-executes a candidate, so a partial, ambiguous, or unexpectedly-shaped
-// model response must fail closed rather than yield a half-formed command. This
-// package performs no markdown-fence tolerance; a provider that must accept
-// fenced output normalizes it before calling Decode, keeping fence tolerance out
-// of the strict contract.
+// Package candidatejson owns the canonical candidate/v2 structured-output
+// contract shared by all JSON-producing providers.
 package candidatejson
 
 import (
@@ -18,62 +8,164 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 
+	"github.com/Vedaant-Rajoo/clai/internal/capability"
 	"github.com/Vedaant-Rajoo/clai/internal/provider"
 )
 
-// SchemaVersion identifies the canonical structured-output contract this package
-// enforces.
-const SchemaVersion = "candidate/v1"
+const SchemaVersion = "candidate/v2"
 
-// wire is the exact candidate/v1 shape: a JSON object carrying only a command
-// and an explanation.
+const maxRequirements = 8
+
+var requirementNamePattern = regexp.MustCompile(`^[a-z0-9._-]{1,64}$`)
+
 type wire struct {
-	Command     string `json:"command"`
-	Explanation string `json:"explanation"`
+	Command      string          `json:"command"`
+	Explanation  string          `json:"explanation"`
+	Requirements requirementList `json:"requirements,omitempty"`
 }
 
-// Decode strictly decodes exactly one candidate/v1 JSON object from data.
-//
-// It requires both fields, rejects unknown fields and any trailing JSON, and
-// rejects an empty command or explanation. The returned command and explanation
-// are untrusted model output: callers remain responsible for local validation
-// and display sanitization before use. Decode performs no markdown-fence
-// tolerance; callers normalize fenced output before calling.
-func Decode(data []byte) (provider.Candidate, error) {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
+type requirementList []requirementWire
 
-	var w wire
-	if err := dec.Decode(&w); err != nil {
+func (requirements *requirementList) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return errors.New("requirements must be an array, not null")
+	}
+	var raw []json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	decoded := make([]requirementWire, 0, len(raw))
+	for _, item := range raw {
+		decoder := json.NewDecoder(bytes.NewReader(item))
+		decoder.DisallowUnknownFields()
+		var requirement requirementWire
+		if err := decoder.Decode(&requirement); err != nil {
+			return err
+		}
+		decoded = append(decoded, requirement)
+	}
+	*requirements = decoded
+	return nil
+}
+
+type optionalVersion struct {
+	present bool
+	value   string
+}
+
+func (version *optionalVersion) UnmarshalJSON(data []byte) error {
+	version.present = true
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return errors.New("min_version must be a string, not null")
+	}
+	return json.Unmarshal(data, &version.value)
+}
+
+type requirementWire struct {
+	Kind       string          `json:"kind"`
+	Name       string          `json:"name"`
+	MinVersion optionalVersion `json:"min_version,omitempty"`
+}
+
+// Decode strictly decodes exactly one candidate/v2 object. Bounds and grammar
+// are enforced locally because the provider-facing structured-output schema
+// intentionally uses only JSON Schema features supported by Anthropic.
+func Decode(data []byte) (provider.Candidate, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+
+	var candidate wire
+	if err := decoder.Decode(&candidate); err != nil {
 		return provider.Candidate{}, fmt.Errorf("candidatejson: decode %s: %w", SchemaVersion, err)
 	}
-	// Reject anything after the first JSON value. Once one value is consumed,
-	// dec.Token returns io.EOF only when nothing but whitespace remains; any
-	// further token (e.g. a second object) is trailing content and fails closed.
-	if _, err := dec.Token(); err != io.EOF {
-		return provider.Candidate{}, fmt.Errorf("candidatejson: unexpected trailing content after %s object", SchemaVersion)
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return provider.Candidate{}, fmt.Errorf("candidatejson: unexpected trailing content after %s object", SchemaVersion)
+		}
+		return provider.Candidate{}, fmt.Errorf("candidatejson: unexpected trailing content after %s object: %w", SchemaVersion, err)
 	}
-	if w.Command == "" {
-		return provider.Candidate{}, errors.New("candidatejson: candidate object has an empty command")
+	if candidate.Command == "" {
+		return provider.Candidate{}, errors.New("candidatejson: candidate object has an empty or missing command")
 	}
-	if w.Explanation == "" {
-		return provider.Candidate{}, errors.New("candidatejson: candidate object has an empty explanation")
+	if candidate.Explanation == "" {
+		return provider.Candidate{}, errors.New("candidatejson: candidate object has an empty or missing explanation")
 	}
-	return provider.Candidate{Command: w.Command, Explanation: w.Explanation}, nil
+	if len(candidate.Requirements) > maxRequirements {
+		return provider.Candidate{}, fmt.Errorf("candidatejson: candidate has %d requirements, maximum is %d", len(candidate.Requirements), maxRequirements)
+	}
+
+	requirements := make([]capability.Requirement, 0, len(candidate.Requirements))
+	for index, declared := range candidate.Requirements {
+		kind := capability.RequirementKind(declared.Kind)
+		if !kind.Valid() {
+			return provider.Candidate{}, fmt.Errorf("candidatejson: requirement %d has invalid kind", index)
+		}
+		if !requirementNamePattern.MatchString(declared.Name) {
+			return provider.Candidate{}, fmt.Errorf("candidatejson: requirement %d has invalid name", index)
+		}
+
+		requirement := capability.Requirement{Kind: kind, Name: declared.Name}
+		if declared.MinVersion.present {
+			if kind != capability.RequirementTool {
+				return provider.Candidate{}, fmt.Errorf("candidatejson: requirement %d uses min_version for non-tool kind", index)
+			}
+			version, ok := capability.ParseVersion(declared.MinVersion.value)
+			if !ok {
+				return provider.Candidate{}, fmt.Errorf("candidatejson: requirement %d has invalid min_version", index)
+			}
+			requirement.MinVersion = version
+		}
+		requirements = append(requirements, requirement)
+	}
+
+	return provider.Candidate{
+		Command:      candidate.Command,
+		Explanation:  candidate.Explanation,
+		Requirements: requirements,
+	}, nil
 }
 
-// Schema returns the JSON Schema for candidate/v1, suitable for a provider's
-// native structured-output request. It mirrors what Decode enforces so the model
-// is steered toward a response Decode will accept, but Decode — not the schema —
-// remains the authoritative gate. A fresh map is returned on each call so callers
-// may mutate it freely.
+// Schema returns a fresh Anthropic-compatible JSON Schema for candidate/v2.
+// Unsupported constraints such as minLength, maxLength, pattern, and maxItems
+// are deliberately absent; Decode is the authoritative local gate.
 func Schema() map[string]any {
+	stringProperty := func(description string) map[string]any {
+		return map[string]any{"type": "string", "description": description}
+	}
+	requirementObject := func(kinds []any, includeVersion bool) map[string]any {
+		properties := map[string]any{
+			"kind": map[string]any{"type": "string", "enum": kinds},
+			"name": stringProperty("1-64 ASCII bytes matching ^[a-z0-9._-]{1,64}$"),
+		}
+		if includeVersion {
+			properties["min_version"] = stringProperty("Optional 1-32 byte numeric dotted version matching ^[0-9]+(?:\\.[0-9]+)*$")
+		}
+		return map[string]any{
+			"type":                 "object",
+			"properties":           properties,
+			"required":             []any{"kind", "name"},
+			"additionalProperties": false,
+		}
+	}
+
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"command":     map[string]any{"type": "string"},
-			"explanation": map[string]any{"type": "string"},
+			"command":     stringProperty("Required non-empty shell command"),
+			"explanation": stringProperty("Required non-empty one-sentence explanation"),
+			"requirements": map[string]any{
+				"type":        "array",
+				"description": "Optional array containing at most eight actual command dependencies",
+				"items": map[string]any{
+					"anyOf": []any{
+						requirementObject([]any{"tool"}, true),
+						requirementObject([]any{"shell", "os"}, false),
+					},
+				},
+			},
 		},
 		"required":             []any{"command", "explanation"},
 		"additionalProperties": false,

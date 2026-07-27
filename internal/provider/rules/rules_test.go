@@ -3,8 +3,12 @@ package rules
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 
+	"github.com/Vedaant-Rajoo/clai/internal/capability"
 	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
 	"github.com/Vedaant-Rajoo/clai/internal/provider"
 )
@@ -71,4 +75,61 @@ func TestProviderCompileCancellation(t *testing.T) {
 	if len(candidates) != 0 {
 		t.Fatalf("candidates = %+v, want none", candidates)
 	}
+}
+
+func TestControlledCapabilityFixtureSearchTODO(t *testing.T) {
+	tests := []struct {
+		name  string
+		tools []string
+		want  provider.Candidate
+	}{
+		{
+			name:  "rg present",
+			tools: []string{"rg", "grep"},
+			want: provider.Candidate{
+				Command:      "rg TODO",
+				Explanation:  "Selected rg because it is installed.",
+				Requirements: []capability.Requirement{{Kind: capability.RequirementTool, Name: "rg"}},
+			},
+		},
+		{
+			name:  "rg absent and grep present",
+			tools: []string{"grep"},
+			want: provider.Candidate{
+				Command:      "grep -r TODO .",
+				Explanation:  "Selected grep fallback because rg is absent.",
+				Requirements: []capability.Requirement{{Kind: capability.RequirementTool, Name: "grep"}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inventory := controlledInventory(t, tt.tools)
+			candidates, err := (Provider{}).Compile(t.Context(), provider.Request{
+				Intent:       "search for TODO",
+				Capabilities: inventory,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(candidates) != 1 || !reflect.DeepEqual(candidates[0], tt.want) {
+				t.Fatalf("candidates = %#v, want %#v", candidates, tt.want)
+			}
+		})
+	}
+}
+
+func controlledInventory(t *testing.T, tools []string) capability.Inventory {
+	t.Helper()
+	directory := t.TempDir()
+	for _, name := range tools {
+		path := filepath.Join(directory, name)
+		if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", directory)
+	t.Setenv("SHELL", "/bin/bash")
+	return capability.Collect(t.Context(), "")
 }

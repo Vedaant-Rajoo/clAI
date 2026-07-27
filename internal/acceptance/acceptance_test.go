@@ -504,20 +504,126 @@ func TestProviderBoundaryArtifactsRegistered(t *testing.T) {
 	}
 	registry := string(data)
 	for _, required := range []string{
-		"name: candidate-json-contract",
-		"path: internal/provider/candidatejson/candidatejson.go",
+		"name: candidate-json-contract-v1",
+		"path: .local/revisions/CANDIDATEJSON-d4ebadb8f0d525bc.go",
+		"status: superseded-by-candidate-v2",
 		"schema: candidate/v1",
 		"sha256: d4ebadb8f0d525bcaef836114f5c2ebf7906be59c8268a2a05747205e5903ecb",
+		"name: candidate-json-contract-v2",
+		"schema: candidate/v2",
 		"name: request-receipt-contract",
-		"path: internal/provider/receipt.go",
 		"schema: request-receipt/v1",
-		"sha256: 16024cc7e6f6234c4ccfab0813a5dec768351a799f0c61e71823dc4c2bcfeaa0",
-		"REQ-ANTHROPIC-005",
+		"name: capability-inventory-contract",
+		"schema: capability-inventory/v1",
+		"name: context-capsule-contract-v2",
+		"schema: context-capsule/v2",
+		"name: context-selector-contract-v2",
+		"schema: context-selector/v2",
+		"name: candidate-applicability-contract",
+		"schema: candidate-applicability/v1",
+		"name: capability-conditioned-fixtures",
+		"schema: capability-fixtures/v1",
+		"REQ-ANTHROPIC-011",
 		"REQ-ANTHROPIC-010",
-		"REQ-CONTEXT-018",
+		"REQ-CONTEXT-031",
+		"REQ-OPENROUTER-001",
 	} {
 		if !strings.Contains(registry, required) {
 			t.Errorf("artifact registry missing %q", required)
+		}
+	}
+
+	type registeredFileArtifact struct {
+		name   string
+		path   string
+		sha256 string
+	}
+	var registered []registeredFileArtifact
+	var current registeredFileArtifact
+	flush := func() {
+		if current.name != "" {
+			registered = append(registered, current)
+		}
+		current = registeredFileArtifact{}
+	}
+	for _, line := range strings.Split(registry, "\n") {
+		switch {
+		case strings.HasPrefix(line, "  - name: "):
+			flush()
+			current.name = strings.TrimPrefix(line, "  - name: ")
+		case strings.HasPrefix(line, "    path: "):
+			current.path = strings.TrimPrefix(line, "    path: ")
+		case strings.HasPrefix(line, "    sha256: "):
+			current.sha256 = strings.TrimPrefix(line, "    sha256: ")
+		}
+	}
+	flush()
+	for _, artifact := range registered {
+		if artifact.path == "" || artifact.sha256 == "" {
+			continue
+		}
+		content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(artifact.path)))
+		if err != nil {
+			t.Errorf("registered artifact %s path %s: %v", artifact.name, artifact.path, err)
+			continue
+		}
+		if got := sha256Hex(content); got != artifact.sha256 {
+			t.Errorf("registered artifact %s hash = %s, want %s for %s", artifact.name, got, artifact.sha256, artifact.path)
+		}
+	}
+
+	contentHashes := map[string]string{
+		".local/revisions/CANDIDATEJSON-d4ebadb8f0d525bc.go": "d4ebadb8f0d525bcaef836114f5c2ebf7906be59c8268a2a05747205e5903ecb",
+		"internal/provider/candidatejson/candidatejson.go":   "7ff6307b4c4a3319fb7019b0e04cd15399c9cfa2499358f5d9fa701b00cfea9b",
+		"internal/provider/receipt.go":                       "16024cc7e6f6234c4ccfab0813a5dec768351a799f0c61e71823dc4c2bcfeaa0",
+		"internal/capability/capability.go":                  "0151856bf5a6611a40fb74e6b580d0603587af5ef1a81fad711c384ad51a2930",
+		"internal/capability/allowlist.go":                   "278085169c7b742713b6c5b0b7067ecc4635d1c06747de01038fafb2e9ace18a",
+		"internal/capability/collect.go":                     "5c14ac99a0be51895075ec867ed692292224aa98763b2d855aa1c6fcf50c92a1",
+		"internal/context/privacy.go":                        "ace41ad7edd1f18e5866053f97cd85e7f367811bd500f305e43fbf27cb4eb8d9",
+		"internal/applicability/applicability.go":            "6d004826ee2d9b20a06ba328994d648358a4fe7c9e4b46884e7ce1c49c2d1318",
+		"internal/applicability/edit.go":                     "563651d2da8c3e416a09867d1aacb61a7f3d72994a763dd8cf41e9023717e0a4",
+		"integration/testdata/capability-fixtures.json":      "8435bb0ff4ca545e700fffe476adfdc6833ad5fa0258471ecddccd15474b0806",
+		"internal/provider/rules/rules_test.go":              "57963925307cc017b10e28c58e540ff6190e8fa0c8cedffd20d89b5b205afd45",
+		"integration/capability_fixture_test.go":             "63c4a25a9839aa7909be331bde76ea51bbebb9e71fe5bef66aa0c5843a549063",
+	}
+	for path, want := range contentHashes {
+		content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(path)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := sha256Hex(content); got != want {
+			t.Errorf("artifact content hash %s = %s, want %s", path, got, want)
+		}
+		if !strings.Contains(registry, want) {
+			t.Errorf("artifact registry missing content hash for %s", path)
+		}
+	}
+
+	bundleHashes := []struct {
+		paths []string
+		want  string
+	}{
+		{[]string{"internal/capability/capability.go", "internal/capability/allowlist.go", "internal/capability/collect.go"}, "f3981779d5940213ab1aa5fcbea18c698f9c94118fa7acd53c202b86a645c2b7"},
+		{[]string{"internal/applicability/applicability.go", "internal/applicability/edit.go"}, "b4d7f837f42ba3f59908cbe80b1ae5b1a994894e31a2d1e86f5db582cff576b5"},
+		{[]string{"integration/testdata/capability-fixtures.json", "internal/provider/rules/rules_test.go", "integration/capability_fixture_test.go"}, "0c47b2728ef6a8029b7ba7721ae87e6c84981cc8e82da06e2a78c98eab649c55"},
+	}
+	for _, bundle := range bundleHashes {
+		hash := sha256.New()
+		for _, path := range bundle.paths {
+			content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(path)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			hash.Write([]byte(path))
+			hash.Write([]byte{0})
+			hash.Write(content)
+			hash.Write([]byte{0})
+		}
+		if got := hex.EncodeToString(hash.Sum(nil)); got != bundle.want {
+			t.Errorf("artifact bundle hash %v = %s, want %s", bundle.paths, got, bundle.want)
+		}
+		if !strings.Contains(registry, bundle.want) {
+			t.Errorf("artifact registry missing bundle hash for %v", bundle.paths)
 		}
 	}
 }
@@ -536,18 +642,38 @@ func TestCheckedInRevisionEvidence(t *testing.T) {
 	initial := read(".local", "revisions", "SPECIFICATION-28ac242a7c7f4f15.md")
 	registered := read(".local", "revisions", "SPECIFICATION-5dc63862dfe786a6.md")
 	predecessor := read(".local", "revisions", "SPECIFICATION-ddff3b871cef51d2.md")
+	phaseA := read(".local", "revisions", "SPECIFICATION-f6a55193c3b420ec.md")
+	phaseBR1 := read(".local", "revisions", "SPECIFICATION-23a08cc1161da026.md")
+	phaseBR2 := read(".local", "revisions", "SPECIFICATION-12c6d5f823978edd.md")
+	phaseBR3 := read(".local", "revisions", "SPECIFICATION-514f7d5c2881b0d1.md")
+	phaseBR4 := read(".local", "revisions", "SPECIFICATION-f8816bbf262963ab.md")
 	current := read(".local", "SPECIFICATION.md")
 	migrationDiff := read(".local", "revisions", "SPECIFICATION-28ac-to-5dc.diff")
 	remediationDiff := read(".local", "revisions", "SPECIFICATION-28ac-to-phase-0-remediation-r1.diff")
 	anthropicDiff := read(".local", "revisions", "SPECIFICATION-ddff-to-phase-a-anthropic-r1.diff")
+	phaseBR1Diff := read(".local", "revisions", "SPECIFICATION-f6a-to-phase-b-applicability-r1.diff")
+	phaseBR2Diff := read(".local", "revisions", "SPECIFICATION-23a-to-phase-b-applicability-r2.diff")
+	phaseBR3Diff := read(".local", "revisions", "SPECIFICATION-12c-to-phase-b-applicability-r3.diff")
+	phaseBR4Diff := read(".local", "revisions", "SPECIFICATION-514f-to-phase-b-applicability-r4.diff")
+	phaseBR5Diff := read(".local", "revisions", "SPECIFICATION-f881-to-phase-b-applicability-r5.diff")
 	checks := map[string]string{
 		sha256Hex(initial):         "28ac242a7c7f4f15bdcc8ad052f504251380580f0749e9f4d257209eb9c61add",
 		sha256Hex(registered):      "5dc63862dfe786a6e45cf9155dc56a8ed3cae3769ff80dd135487e35958d5f5d",
 		sha256Hex(predecessor):     "ddff3b871cef51d2b137dd3d32e1ae8d57d98813cf2901d901066fa8e435ab3f",
-		sha256Hex(current):         "f6a55193c3b420ec28a68c050fb7be8a541753ee8a33b6c5900c9cef6ab5a676",
+		sha256Hex(phaseA):          "f6a55193c3b420ec28a68c050fb7be8a541753ee8a33b6c5900c9cef6ab5a676",
+		sha256Hex(phaseBR1):        "23a08cc1161da026da703a2e807dd1b2bd5d4c59015ab799732b47a819dd8c23",
+		sha256Hex(phaseBR2):        "12c6d5f823978eddf65efac9e07b9b90e73df8d3360373099698d80526017003",
+		sha256Hex(phaseBR3):        "514f7d5c2881b0d18cc18e87584324dafd1bd07a484195e78342599cba372d5e",
+		sha256Hex(phaseBR4):        "f8816bbf262963ab38b484eecb5ec17283f57de5aaa540c08608cf2f41a85616",
+		sha256Hex(current):         "4a9ec1befd556a231489d6a4e4b549d08ce6810df1f49782913e71ed6eca0481",
 		sha256Hex(migrationDiff):   "27a46e185cc9cf12b10b48c72c7a5e59ba30790527091809b811580f0416a47a",
 		sha256Hex(remediationDiff): "f31e3de8e608e4261d6fb10251b67fb56595e9cd6541946196caef730954c82f",
 		sha256Hex(anthropicDiff):   "dae1358bbac67a249050a46767dea16a4406a262889a6d83a454c68a3d2d6601",
+		sha256Hex(phaseBR1Diff):    "e7b44cce933da8242aea4d853378be457a1d832fca8693e5e1b697a3b81cf018",
+		sha256Hex(phaseBR2Diff):    "e9545bb13d9ad1b890ad6000b979dbb3780d1c7770d0cec047298ca926de78af",
+		sha256Hex(phaseBR3Diff):    "d966929ea13c24b17b10cf98da579578850d0537b7e66b13b244f61736a5e8a5",
+		sha256Hex(phaseBR4Diff):    "b97413cc9387c63d108ed366a62a418c951921f71ea84f6f47839b1957eed201",
+		sha256Hex(phaseBR5Diff):    "0c5cc7de643aa4eba438d9cc828e02a98c4320d8313b305c0a59de4b6b744bac",
 	}
 	for got, want := range checks {
 		if got != want {
@@ -560,14 +686,11 @@ func TestCheckedInRevisionEvidence(t *testing.T) {
 	// The phase-0-remediation-r2 predecessor (ddff) is the last revision whose
 	// normative bytes still reduce to the immutable 28ac assignment-start baseline
 	// after stripping requirement-ID markers and controlled workflow-hardening
-	// additions. The current revision (phase-a-anthropic-r1) deliberately diverges
-	// from that baseline: it supersedes REQ-PURPOSE-001, REQ-NON-GOAL-001,
-	// REQ-CONTEXT-015, and REQ-PERFORMANCE-010 and adds the section 6.8 direct
-	// Anthropic provider tranche (REQ-ANTHROPIC-001..010), putting behavior that
-	// REQ-NON-GOAL-001 previously excluded in scope. It therefore no longer reduces
-	// to the 28ac baseline and is instead bound to its predecessor by the registered
-	// semantic diff pinned above and by the (label, hash) pair asserted in
-	// TestRevisionLabelBinding.
+	// additions. Phase A deliberately diverges from that baseline by adding the
+	// direct Anthropic provider tranche. The immutable Phase A snapshot and every
+	// Phase B r1/r2/r3/r4 predecessor are therefore bound to the next revision by
+	// the registered semantic diffs pinned above; the current r5 bytes are
+	// additionally bound to their label by TestRevisionLabelBinding.
 	if normalizeSpecificationRevision(predecessor, true) != string(initial) {
 		t.Fatal("registered phase-0-remediation-r2 predecessor contains semantic changes outside stable IDs and specification-workflow hardening")
 	}
@@ -626,8 +749,8 @@ func TestRevisionLabelBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const boundLabel = "phase-a-anthropic-r1"
-	const boundSpecHash = "f6a55193c3b420ec28a68c050fb7be8a541753ee8a33b6c5900c9cef6ab5a676"
+	const boundLabel = "phase-b-applicability-r5"
+	const boundSpecHash = "4a9ec1befd556a231489d6a4e4b549d08ce6810df1f49782913e71ed6eca0481"
 	if manifest.RevisionLabel != boundLabel || manifest.SpecificationSHA256 != boundSpecHash {
 		t.Fatalf("revision binding = (%q, %q), want (%q, %q): a specification change or relabel must update both constants together and consciously choose the revision label",
 			manifest.RevisionLabel, manifest.SpecificationSHA256, boundLabel, boundSpecHash)
@@ -643,6 +766,15 @@ func TestCheckedInManifestValidates(t *testing.T) {
 	}
 	if len(ids) == 0 || len(manifest.Cases) == 0 || len(manifest.Findings) < 5 {
 		t.Fatalf("manifest incomplete: requirements=%d cases=%d findings=%d", len(ids), len(manifest.Cases), len(manifest.Findings))
+	}
+	if strings.Contains(manifest.Artifact.Compatibility, "keeps prior rejection findings open") || !strings.Contains(manifest.Artifact.Compatibility, "recorded fixed-and-conforming closures") {
+		t.Fatalf("manifest compatibility misstates retained finding closure state: %q", manifest.Artifact.Compatibility)
+	}
+	retained := map[string]bool{"P0-PHASEB-001": true, "P0-PHASEB-002": true, "P0-PHASEB-003": true}
+	for _, finding := range manifest.Findings {
+		if retained[finding.ID] && finding.Status != "fixed-and-conforming" {
+			t.Fatalf("retained Phase B finding %s status = %q, want fixed-and-conforming", finding.ID, finding.Status)
+		}
 	}
 }
 

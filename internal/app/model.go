@@ -69,6 +69,10 @@ type Deps struct {
 	Provider        provider.Provider
 	ActiveShell     string
 	InventorySource InventorySource
+	// DevEndpoint is the loopback development endpoint in use, or empty for a
+	// production session. When set, every candidate-bearing screen is labelled
+	// so a stubbed session cannot be mistaken for a real one (REQ-DEVENDPOINT-005).
+	DevEndpoint string
 }
 
 type Outcome struct {
@@ -85,6 +89,7 @@ type Model struct {
 	provider        provider.Provider
 	inventorySource InventorySource
 	activeShell     string
+	devEndpoint     string
 	screen          Screen
 	intent          string
 	candidate       provider.Candidate
@@ -152,6 +157,7 @@ func NewFromDeps(deps Deps) Model {
 		provider:        deps.Provider,
 		inventorySource: deps.InventorySource,
 		activeShell:     deps.ActiveShell,
+		devEndpoint:     deps.DevEndpoint,
 		screen:          screenInput,
 	}
 }
@@ -516,6 +522,18 @@ func (m Model) loadingView() string {
 // clipped away. Optional rows are added in keep-priority order only while they
 // fit the terminal's height budget; a toggled section that cannot fit collapses
 // to a one-line hint rather than pushing an essential row off a short screen.
+// devEndpointBanner labels a session pointed at a loopback development endpoint
+// so it cannot be mistaken for a production one (REQ-DEVENDPOINT-005). It names
+// the effective endpoint in sanitized words before any color styling, and is
+// empty for a normal session. Callers place it in a non-droppable row so a
+// cramped terminal cannot hide it.
+func (m Model) devEndpointBanner() string {
+	if m.devEndpoint == "" {
+		return ""
+	}
+	return warnStyle.Render("DEV ENDPOINT — provider requests go to " + textsafe.Visible(m.devEndpoint) + ", not the real provider")
+}
+
 func (m Model) reviewView() string {
 	command := commandStyle.Render(textsafe.Visible(m.command))
 	status := statusLine(m.validation, m.safety, m.applicability)
@@ -539,7 +557,11 @@ func (m Model) reviewView() string {
 	// drops below a single content row.
 	budget := m.budgetHeight()
 
+	banner := m.devEndpointBanner()
 	used := measure(command) + measure(status) + measure(actions)
+	if banner != "" {
+		used += measure(banner)
+	}
 
 	selected := map[string]string{}
 	consider := func(key, body, hint string) {
@@ -565,7 +587,11 @@ func (m Model) reviewView() string {
 	consider("context", usedContext, mutedStyle.Render("context hidden — resize or collapse to view"))
 	consider("intent", intent, "")
 
-	rows := []string{command, status}
+	rows := []string{}
+	if banner != "" {
+		rows = append(rows, banner)
+	}
+	rows = append(rows, command, status)
 	for _, key := range []string{"reasons", "why", "context", "intent"} {
 		if body, ok := selected[key]; ok {
 			rows = append(rows, body)
@@ -598,20 +624,29 @@ func (m Model) rowMeasurer() func(string) int {
 }
 
 func (m Model) editCommandView() string {
-	return m.fitSections([]string{
+	return m.fitSections(m.withDevBanner([]string{
 		headerStyle.Render("Edit command"),
 		m.commandInput.View(),
 		mutedStyle.Render("enter save · esc discard"),
-	})
+	}))
+}
+
+// withDevBanner prefixes the development-endpoint label when one is active.
+func (m Model) withDevBanner(sections []string) []string {
+	banner := m.devEndpointBanner()
+	if banner == "" {
+		return sections
+	}
+	return append([]string{banner}, sections...)
 }
 
 func (m Model) noSuggestionView() string {
-	return m.fitSections([]string{
+	return m.fitSections(m.withDevBanner([]string{
 		headerStyle.Render("No suggestion"),
 		section("Intent", textsafe.Visible(m.intent)),
 		"The provider returned no command candidate.",
 		mutedStyle.Render("enter/r retry · b back · esc cancel"),
-	})
+	}))
 }
 
 func section(title, body string) string {

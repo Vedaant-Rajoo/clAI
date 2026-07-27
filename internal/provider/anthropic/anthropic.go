@@ -94,14 +94,18 @@ Rules:
 
 // Provider compiles an intent into one candidate via Anthropic's Messages API.
 //
-// Only the four exported fields are set by CLI construction. The remaining seams
-// are unexported and exist for deterministic tests: an alternate base transport,
-// base URL, timeout, and a receipt sink.
+// CLI construction sets the exported fields. DevEndpoint is the loopback-only
+// development override (REQ-DEVENDPOINT-001..004): the CLI validates it is
+// lexically loopback before constructing the provider, and it replaces the
+// pinned production base URL so the full request path stays exercised. The
+// remaining seams are unexported and exist for deterministic tests: an alternate
+// base transport, base URL, timeout, and a receipt sink.
 type Provider struct {
 	APIKey       string
 	Model        string
 	Policy       machinecontext.Policy
 	SharedFields []string
+	DevEndpoint  string
 
 	baseURL     string
 	timeout     time.Duration
@@ -175,7 +179,14 @@ func (p Provider) Compile(ctx context.Context, request provider.Request) ([]prov
 		return nil, err
 	}
 
+	// Precedence: the unexported test seam, then the loopback-gated development
+	// override, then the pinned production endpoint. Both overrides are still
+	// classified lexically below, so neither can reach a remote host under a
+	// local-only policy or carry userinfo credentials.
 	baseURL := p.baseURL
+	if baseURL == "" {
+		baseURL = p.DevEndpoint
+	}
 	if baseURL == "" {
 		baseURL = defaultEndpoint
 	}

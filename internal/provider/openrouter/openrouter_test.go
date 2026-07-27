@@ -159,6 +159,67 @@ func TestCompileDoesNotReflectCustomHTTPReasonOrBody(t *testing.T) {
 	}
 }
 
+// TestDevEndpointDrivesFullPathAgainstLoopback proves the loopback development
+// override routes OpenRouter's complete request path to a caller-supplied
+// server with the credential in the header only (REQ-DEVENDPOINT-001/006,
+// REQ-ACCEPT-DEVENDPOINT-002).
+func TestDevEndpointDrivesFullPathAgainstLoopback(t *testing.T) {
+	var observedBody []byte
+	var observedAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		observedBody, _ = io.ReadAll(r.Body)
+		observedAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"command\":\"ls -la\",\"explanation\":\"lists files\"}"}}]}`)
+	}))
+	defer server.Close()
+
+	var receipt RequestReceipt
+	p := Provider{
+		APIKey:      "sk-or-secret",
+		DevEndpoint: server.URL,
+		Policy:      machinecontext.PolicyRemoteMinimal,
+		receiptSink: func(r RequestReceipt) { receipt = r },
+	}
+	candidates, err := p.Compile(context.Background(), provider.Request{Intent: "list files"})
+	if err != nil {
+		t.Fatalf("compile against loopback dev endpoint: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].Command != "ls -la" {
+		t.Fatalf("candidates = %+v, want the stub candidate via the shared strict decoder", candidates)
+	}
+	if observedAuth == "" || !strings.Contains(observedAuth, "sk-or-secret") {
+		t.Fatalf("Authorization header = %q, want the clai-resolved key", observedAuth)
+	}
+	if bytes.Contains(observedBody, []byte("sk-or-secret")) {
+		t.Fatalf("request body leaked the credential: %s", observedBody)
+	}
+	if bytes.Contains(receipt.RequestBody, []byte("sk-or-secret")) {
+		t.Fatalf("receipt leaked the credential")
+	}
+	if receipt.EffectiveEndpoint != server.URL {
+		t.Fatalf("receipt endpoint = %q, want the dev endpoint", receipt.EffectiveEndpoint)
+	}
+}
+
+// TestDevEndpointPrecedence pins seam > DevEndpoint > pinned production.
+func TestDevEndpointPrecedence(t *testing.T) {
+	var hit string
+	seam := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = "seam"
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"command\":\"ls\",\"explanation\":\"lists\"}"}}]}`)
+	}))
+	defer seam.Close()
+
+	p := Provider{APIKey: "k", endpoint: seam.URL, DevEndpoint: "http://127.0.0.1:9"}
+	if _, err := p.Compile(context.Background(), provider.Request{Intent: "list files"}); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if hit != "seam" {
+		t.Fatalf("request went to %q, want the unexported test seam to win", hit)
+	}
+}
+
 func TestCompileHonorsCallerCancellation(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})

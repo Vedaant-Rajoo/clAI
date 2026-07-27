@@ -1057,6 +1057,80 @@ func TestAnthropicContextWireGoldenAllPolicies(t *testing.T) {
 	}
 }
 
+// TestDevEndpointDrivesFullPathAgainstLoopback proves the loopback development
+// override (REQ-DEVENDPOINT-001/002/006, REQ-ACCEPT-DEVENDPOINT-002) routes the
+// complete production request path to a caller-supplied loopback server: the
+// credential travels in the request header only, the receipt records the
+// effective endpoint, and the shared strict decoder still applies.
+func TestDevEndpointDrivesFullPathAgainstLoopback(t *testing.T) {
+	var observedBody []byte
+	var observedKey string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		observedBody, _ = io.ReadAll(r.Body)
+		observedKey = r.Header.Get("x-api-key")
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, textStream("end_turn", validCandidate))
+	}))
+	defer server.Close()
+
+	var receipt provider.RequestReceipt
+	p := Provider{
+		APIKey:      "clai-secret-key",
+		DevEndpoint: server.URL,
+		Policy:      machinecontext.PolicyRemoteMinimal,
+		receiptSink: func(r provider.RequestReceipt) { receipt = r },
+	}
+	candidates, err := p.Compile(context.Background(), remoteRequest())
+	if err != nil {
+		t.Fatalf("compile against loopback dev endpoint: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].Command != "ls -la" {
+		t.Fatalf("candidates = %+v, want the stub candidate decoded by the shared strict decoder", candidates)
+	}
+	if observedKey != "clai-secret-key" {
+		t.Fatalf("credential header = %q, want the clai-resolved key", observedKey)
+	}
+	if bytes.Contains(observedBody, []byte("clai-secret-key")) {
+		t.Fatalf("request body leaked the credential: %s", observedBody)
+	}
+	if bytes.Contains(receipt.RequestBody, []byte("clai-secret-key")) {
+		t.Fatalf("receipt leaked the credential: %s", receipt.RequestBody)
+	}
+	if !bytes.Equal(observedBody, receipt.RequestBody) {
+		t.Fatalf("receipt bytes differ from server-observed bytes")
+	}
+	if receipt.EffectiveEndpoint != server.URL+"/v1/messages" {
+		t.Fatalf("receipt endpoint = %q, want the dev endpoint", receipt.EffectiveEndpoint)
+	}
+	sum := sha256.Sum256(observedBody)
+	if receipt.RequestBodyHash.Algorithm != "sha256" || receipt.RequestBodyHash.Value != hex.EncodeToString(sum[:]) {
+		t.Fatalf("hash = %+v, want sha256 over the exact bytes", receipt.RequestBodyHash)
+	}
+}
+
+// TestDevEndpointDoesNotOverrideTestSeamOrProduction pins the endpoint
+// precedence: the unexported test seam wins, then DevEndpoint, then the pinned
+// production endpoint (REQ-ANTHROPIC-012).
+func TestDevEndpointDoesNotOverrideTestSeamOrProduction(t *testing.T) {
+	ft := stringTransport(textStream("end_turn", validCandidate))
+	p := Provider{APIKey: "k", baseURL: "http://127.0.0.1:9", DevEndpoint: "http://127.0.0.1:8747", transport: ft}
+	if _, err := p.Compile(context.Background(), remoteRequest()); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if got := ft.urls[0]; !strings.HasPrefix(got, "http://127.0.0.1:9") {
+		t.Fatalf("url = %q, want the unexported test seam to win", got)
+	}
+
+	ft = stringTransport(textStream("end_turn", validCandidate))
+	p = Provider{APIKey: "k", transport: ft}
+	if _, err := p.Compile(context.Background(), remoteRequest()); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if got := ft.urls[0]; !strings.HasPrefix(got, defaultEndpoint) {
+		t.Fatalf("url = %q, want the pinned production endpoint with no override", got)
+	}
+}
+
 func TestReceiptCaptureFailuresAreBoundedAndFailClosed(t *testing.T) {
 	readErr := errors.New("read failed")
 	closeErr := errors.New("close failed")

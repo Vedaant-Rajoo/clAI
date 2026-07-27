@@ -90,6 +90,8 @@ Flags:
   --context-policy p  context policy: local-only | remote-minimal | remote-explicit
   --share-context f   share a field with remote-explicit (repeatable):
                       working_directory | git_root | git_branch
+  --dev-endpoint url  development only: send provider requests to a loopback
+                      endpoint instead of the real provider
 
 Exit codes:
   0  command accepted and written to the result file
@@ -135,6 +137,8 @@ Flags:
   --context-policy p context policy: local-only | remote-minimal | remote-explicit
   --share-context f  share a field with remote-explicit (repeatable):
                      working_directory | git_root | git_branch
+  --dev-endpoint url development only: send provider requests to a loopback
+                     endpoint instead of the real provider
   --version          print version and exit
 
 Use "clai help <command>" or "clai <command> help" for more information.

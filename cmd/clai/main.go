@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -141,7 +142,14 @@ func (c cli) runInteractive(args []string) int {
 		return exitUsage
 	}
 
-	policy, sharedFields, err := f.contextOptions()
+	// The endpoint is validated first because the context policy defaults on
+	// endpoint classification (REQ-CONTEXT-003, REQ-DEVENDPOINT-004).
+	devEndpoint, err := f.devEndpointOption()
+	if err != nil {
+		fmt.Fprintf(c.stderr, "clai: %v\nRun 'clai help' for usage.\n", err)
+		return exitUsage
+	}
+	policy, sharedFields, err := f.contextOptions(devEndpoint)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai: %v\nRun 'clai help' for usage.\n", err)
 		return exitUsage
@@ -151,14 +159,14 @@ func (c cli) runInteractive(args []string) int {
 		fmt.Fprintln(c.stdout, version)
 		return exitOK
 	}
-	p, err := selectProvider(*f.providerName, *f.model, *f.apiKey, *f.fallbackRules, policy, sharedFields)
+	p, err := selectProvider(*f.providerName, *f.model, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai: %v\n", err)
 		return exitError
 	}
 
 	inventory := capability.NewCached("")
-	outcome, err := executeTUI(p, inventory, "")
+	outcome, err := executeTUI(p, inventory, "", devEndpoint)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai: %v\n", err)
 		return exitError
@@ -197,7 +205,16 @@ func (c cli) runWidget(args []string) int {
 		fmt.Fprintln(c.stderr, "usage: clai widget --shell <fish|bash|zsh> --result-file <path>\nRun 'clai widget help' for usage.")
 		return exitUsage
 	}
-	policy, sharedFields, err := f.contextOptions()
+	// Validate every usage error together, before touching the result file or
+	// constructing a provider (REQ-DEVENDPOINT-002). The endpoint comes first
+	// because the context policy defaults on its classification
+	// (REQ-CONTEXT-003, REQ-DEVENDPOINT-004).
+	devEndpoint, err := f.devEndpointOption()
+	if err != nil {
+		fmt.Fprintf(c.stderr, "clai widget: %v\nRun 'clai widget help' for usage.\n", err)
+		return exitUsage
+	}
+	policy, sharedFields, err := f.contextOptions(devEndpoint)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai widget: %v\nRun 'clai widget help' for usage.\n", err)
 		return exitUsage
@@ -214,14 +231,14 @@ func (c cli) runWidget(args []string) int {
 		}
 	}()
 
-	p, err := selectProvider(*f.providerName, *f.model, *f.apiKey, *f.fallbackRules, policy, sharedFields)
+	p, err := selectProvider(*f.providerName, *f.model, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai widget: %v\n", err)
 		return exitError
 	}
 
 	inventory := capability.NewCached(*f.shell)
-	outcome, err := executeTUI(p, inventory, *f.shell)
+	outcome, err := executeTUI(p, inventory, *f.shell, devEndpoint)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai widget: %v\n", err)
 		return exitError
@@ -276,6 +293,7 @@ type providerFlags struct {
 	fallbackRules *bool
 	contextPolicy *contextPolicyFlag
 	sharedContext *sharedContextFlag
+	devEndpoint   *string
 }
 
 type contextPolicyFlag struct {
@@ -320,10 +338,45 @@ func registerProviderFlags(fs *flag.FlagSet) providerFlags {
 		fallbackRules: fs.Bool("fallback-rules", false, "fall back to local rules when the selected provider errors"),
 		contextPolicy: policy,
 		sharedContext: shared,
+		devEndpoint:   fs.String("dev-endpoint", "", "development only: send provider requests to a loopback endpoint"),
 	}
 }
 
-func (f providerFlags) contextOptions() (machinecontext.Policy, []string, error) {
+// devEndpointOption validates the loopback-only development override
+// (REQ-DEVENDPOINT-002/003). Every rejection happens here, before provider
+// construction, credential resolution, DNS, or network activity. Classification
+// is lexical, so a hostname that merely resolves to loopback is rejected.
+func (f providerFlags) devEndpointOption() (string, error) {
+	endpoint := strings.TrimSpace(*f.devEndpoint)
+	if endpoint == "" {
+		return "", nil
+	}
+	switch *f.providerName {
+	case "openrouter", "anthropic":
+	default:
+		return "", fmt.Errorf("--dev-endpoint is not valid for provider %q; it applies only to openrouter and anthropic", *f.providerName)
+	}
+	class, err := machinecontext.ClassifyEndpoint(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("invalid --dev-endpoint: %w", err)
+	}
+	// ClassifyEndpoint accepts any non-empty scheme; the transport only speaks
+	// HTTP, so restrict it here rather than failing later inside the provider.
+	if parsed, err := url.Parse(endpoint); err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", fmt.Errorf("--dev-endpoint must use http or https, got %q", endpoint)
+	}
+	if class != machinecontext.EndpointLoopback {
+		return "", fmt.Errorf("--dev-endpoint must address a loopback host, got %q", endpoint)
+	}
+	return endpoint, nil
+}
+
+// contextOptions resolves the effective context policy and shared fields.
+// devEndpoint is the already-validated loopback development endpoint, or empty
+// for a normal session; it is required here because REQ-CONTEXT-003 defaults on
+// endpoint classification, and a loopback development endpoint must default to
+// local-only exactly as any other loopback provider does (REQ-DEVENDPOINT-004).
+func (f providerFlags) contextOptions(devEndpoint string) (machinecontext.Policy, []string, error) {
 	shared, err := machinecontext.NormalizeExplicitFields(f.sharedContext.values)
 	if err != nil {
 		return "", nil, err
@@ -333,11 +386,12 @@ func (f providerFlags) contextOptions() (machinecontext.Policy, []string, error)
 		if len(shared) != 0 {
 			return "", nil, errors.New("--share-context requires an explicit --context-policy remote-explicit in the same invocation")
 		}
-		switch *f.providerName {
-		case "openrouter", "anthropic":
-			policy = machinecontext.PolicyRemoteMinimal
-		default:
-			policy = machinecontext.PolicyLocalOnly
+		policy = machinecontext.PolicyLocalOnly
+		if devEndpoint == "" {
+			switch *f.providerName {
+			case "openrouter", "anthropic":
+				policy = machinecontext.PolicyRemoteMinimal
+			}
 		}
 	}
 	if policy == machinecontext.PolicyRemoteExplicit {
@@ -382,8 +436,8 @@ func registerWidgetFlags(fs *flag.FlagSet) widgetFlags {
 	}
 }
 
-func runTUI(p provider.Provider, inventory *capability.Cached, activeShell string) (app.Outcome, error) {
-	model := app.NewFromDeps(app.Deps{Provider: p, ActiveShell: activeShell, InventorySource: inventory})
+func runTUI(p provider.Provider, inventory *capability.Cached, activeShell, devEndpoint string) (app.Outcome, error) {
+	model := app.NewFromDeps(app.Deps{Provider: p, ActiveShell: activeShell, InventorySource: inventory, DevEndpoint: devEndpoint})
 	options := []tea.ProgramOption{tea.WithOutput(os.Stderr), tea.WithAltScreen()}
 	if activeShell != "" {
 
@@ -518,7 +572,7 @@ func (f fallback) Compile(ctx context.Context, request provider.Request) ([]prov
 	return rules.Provider{}.Compile(ctx, request)
 }
 
-func selectProvider(name, model, apiKey string, fallbackRules bool, policy machinecontext.Policy, sharedFields []string) (provider.Provider, error) {
+func selectProvider(name, model, apiKey string, fallbackRules bool, policy machinecontext.Policy, sharedFields []string, devEndpoint string) (provider.Provider, error) {
 	switch name {
 	case "rules", "":
 		return rules.Provider{}, nil
@@ -527,7 +581,7 @@ func selectProvider(name, model, apiKey string, fallbackRules bool, policy machi
 		if err != nil {
 			return nil, err
 		}
-		var p provider.Provider = openrouter.Provider{APIKey: key, Model: model, Policy: policy, SharedFields: sharedFields}
+		var p provider.Provider = openrouter.Provider{APIKey: key, Model: model, Policy: policy, SharedFields: sharedFields, DevEndpoint: devEndpoint}
 		if fallbackRules {
 			p = fallback{primary: p}
 		}
@@ -537,7 +591,7 @@ func selectProvider(name, model, apiKey string, fallbackRules bool, policy machi
 		if err != nil {
 			return nil, err
 		}
-		var p provider.Provider = anthropic.Provider{APIKey: key, Model: model, Policy: policy, SharedFields: sharedFields}
+		var p provider.Provider = anthropic.Provider{APIKey: key, Model: model, Policy: policy, SharedFields: sharedFields, DevEndpoint: devEndpoint}
 		if fallbackRules {
 			p = fallback{primary: p}
 		}

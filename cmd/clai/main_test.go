@@ -21,7 +21,7 @@ import (
 )
 
 func TestSelectProviderDefaultIsRules(t *testing.T) {
-	p, err := selectProvider("rules", "", "", false, machinecontext.PolicyLocalOnly, nil)
+	p, err := selectProvider("rules", "", "", false, machinecontext.PolicyLocalOnly, nil, "")
 	if err != nil {
 		t.Fatalf("selectProvider: %v", err)
 	}
@@ -32,7 +32,7 @@ func TestSelectProviderDefaultIsRules(t *testing.T) {
 
 func TestSelectProviderOpenRouterUsesEnvKey(t *testing.T) {
 	t.Setenv("OPENROUTER_API_KEY", "sk-or-test")
-	p, err := selectProvider("openrouter", "some/model", "", false, machinecontext.PolicyRemoteMinimal, nil)
+	p, err := selectProvider("openrouter", "some/model", "", false, machinecontext.PolicyRemoteMinimal, nil, "")
 	if err != nil {
 		t.Fatalf("selectProvider: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestSelectProviderOpenRouterUsesEnvKey(t *testing.T) {
 
 func TestSelectProviderOpenRouterExplicitKeyWins(t *testing.T) {
 	t.Setenv("OPENROUTER_API_KEY", "env-key")
-	p, err := selectProvider("openrouter", "", "flag-key", false, machinecontext.PolicyRemoteMinimal, nil)
+	p, err := selectProvider("openrouter", "", "flag-key", false, machinecontext.PolicyRemoteMinimal, nil, "")
 	if err != nil {
 		t.Fatalf("selectProvider: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestSelectProviderOpenRouterExplicitKeyWins(t *testing.T) {
 
 func TestSelectProviderFallbackWraps(t *testing.T) {
 	t.Setenv("OPENROUTER_API_KEY", "sk-or-test")
-	p, err := selectProvider("openrouter", "", "", true, machinecontext.PolicyRemoteMinimal, nil)
+	p, err := selectProvider("openrouter", "", "", true, machinecontext.PolicyRemoteMinimal, nil, "")
 	if err != nil {
 		t.Fatalf("selectProvider: %v", err)
 	}
@@ -71,20 +71,20 @@ func TestSelectProviderFallbackWraps(t *testing.T) {
 }
 
 func TestSelectProviderUnknown(t *testing.T) {
-	if _, err := selectProvider("bogus", "", "", false, machinecontext.PolicyLocalOnly, nil); err == nil {
+	if _, err := selectProvider("bogus", "", "", false, machinecontext.PolicyLocalOnly, nil, ""); err == nil {
 		t.Error("want error for unknown provider")
 	}
 }
 
 func TestSelectProviderUnimplemented(t *testing.T) {
-	if _, err := selectProvider("openai", "", "", false, machinecontext.PolicyRemoteMinimal, nil); err == nil {
+	if _, err := selectProvider("openai", "", "", false, machinecontext.PolicyRemoteMinimal, nil, ""); err == nil {
 		t.Error("want error for unimplemented provider")
 	}
 }
 
 func TestSelectProviderAnthropicUsesEnvKey(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-	p, err := selectProvider("anthropic", "claude-opus-4-8", "", false, machinecontext.PolicyRemoteMinimal, nil)
+	p, err := selectProvider("anthropic", "claude-opus-4-8", "", false, machinecontext.PolicyRemoteMinimal, nil, "")
 	if err != nil {
 		t.Fatalf("selectProvider: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestSelectProviderAnthropicUsesEnvKey(t *testing.T) {
 func TestAnthropicModelDefaultAndOverride(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
 	t.Run("default left empty for provider default", func(t *testing.T) {
-		p, err := selectProvider("anthropic", "", "", false, machinecontext.PolicyRemoteMinimal, nil)
+		p, err := selectProvider("anthropic", "", "", false, machinecontext.PolicyRemoteMinimal, nil, "")
 		if err != nil {
 			t.Fatalf("selectProvider: %v", err)
 		}
@@ -115,7 +115,7 @@ func TestAnthropicModelDefaultAndOverride(t *testing.T) {
 		}
 	})
 	t.Run("CLI override forwarded verbatim", func(t *testing.T) {
-		p, err := selectProvider("anthropic", "claude-opus-4-8", "", false, machinecontext.PolicyRemoteMinimal, nil)
+		p, err := selectProvider("anthropic", "claude-opus-4-8", "", false, machinecontext.PolicyRemoteMinimal, nil, "")
 		if err != nil {
 			t.Fatalf("selectProvider: %v", err)
 		}
@@ -127,7 +127,7 @@ func TestAnthropicModelDefaultAndOverride(t *testing.T) {
 
 func TestSelectProviderAnthropicExplicitKeyWins(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "env-key")
-	p, err := selectProvider("anthropic", "", "flag-key", false, machinecontext.PolicyRemoteMinimal, nil)
+	p, err := selectProvider("anthropic", "", "flag-key", false, machinecontext.PolicyRemoteMinimal, nil, "")
 	if err != nil {
 		t.Fatalf("selectProvider: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestSelectProviderAnthropicExplicitKeyWins(t *testing.T) {
 
 func TestSelectProviderAnthropicFallbackWraps(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-	p, err := selectProvider("anthropic", "", "", true, machinecontext.PolicyRemoteMinimal, nil)
+	p, err := selectProvider("anthropic", "", "", true, machinecontext.PolicyRemoteMinimal, nil, "")
 	if err != nil {
 		t.Fatalf("selectProvider: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestSelectProviderAnthropicFallbackWraps(t *testing.T) {
 func TestSelectProviderAnthropicSharedFieldsForwarded(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
 	shared := []string{machinecontext.FieldWorkingDirectory}
-	p, err := selectProvider("anthropic", "", "", false, machinecontext.PolicyRemoteExplicit, shared)
+	p, err := selectProvider("anthropic", "", "", false, machinecontext.PolicyRemoteExplicit, shared, "")
 	if err != nil {
 		t.Fatalf("selectProvider: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestWidgetRejectsUnsafeResultBeforeTUI(t *testing.T) {
 
 	called := false
 	original := executeTUI
-	executeTUI = func(provider.Provider, *capability.Cached, string) (app.Outcome, error) {
+	executeTUI = func(provider.Provider, *capability.Cached, string, string) (app.Outcome, error) {
 		called = true
 		return app.Outcome{Command: "pwd", Accepted: true}, nil
 	}
@@ -291,7 +291,7 @@ func TestWidgetAcceptedWritesExactResult(t *testing.T) {
 	}
 
 	original := executeTUI
-	executeTUI = func(provider.Provider, *capability.Cached, string) (app.Outcome, error) {
+	executeTUI = func(provider.Provider, *capability.Cached, string, string) (app.Outcome, error) {
 		return app.Outcome{
 			Command:  `printf '%s' 'hello * $world 日本語'`,
 			Accepted: true,
@@ -325,7 +325,7 @@ func TestWidgetCancelledRemovesResult(t *testing.T) {
 	}
 
 	original := executeTUI
-	executeTUI = func(provider.Provider, *capability.Cached, string) (app.Outcome, error) {
+	executeTUI = func(provider.Provider, *capability.Cached, string, string) (app.Outcome, error) {
 		return app.Outcome{}, nil
 	}
 	t.Cleanup(func() { executeTUI = original })
@@ -347,7 +347,7 @@ func TestWidgetErrorRemovesResult(t *testing.T) {
 	}
 
 	original := executeTUI
-	executeTUI = func(provider.Provider, *capability.Cached, string) (app.Outcome, error) {
+	executeTUI = func(provider.Provider, *capability.Cached, string, string) (app.Outcome, error) {
 		return app.Outcome{}, errors.New("tui failed")
 	}
 	t.Cleanup(func() { executeTUI = original })
@@ -381,7 +381,7 @@ func TestWidgetBlockedCommandNotExportedAtBoundary(t *testing.T) {
 	}
 
 	original := executeTUI
-	executeTUI = func(provider.Provider, *capability.Cached, string) (app.Outcome, error) {
+	executeTUI = func(provider.Provider, *capability.Cached, string, string) (app.Outcome, error) {
 		return app.Outcome{Command: blocked, Accepted: true}, nil
 	}
 	t.Cleanup(func() { executeTUI = original })
@@ -408,7 +408,7 @@ func TestWidgetRejectsResultFileReplacementDuringTUI(t *testing.T) {
 	}
 
 	original := executeTUI
-	executeTUI = func(provider.Provider, *capability.Cached, string) (app.Outcome, error) {
+	executeTUI = func(provider.Provider, *capability.Cached, string, string) (app.Outcome, error) {
 		if err := os.Rename(path, originalPath); err != nil {
 			t.Fatal(err)
 		}
@@ -511,7 +511,7 @@ func TestApplicabilityHardRejectPreservesWidgetBuffer(t *testing.T) {
 	}
 
 	original := executeTUI
-	executeTUI = func(_ provider.Provider, inventory *capability.Cached, shell string) (app.Outcome, error) {
+	executeTUI = func(_ provider.Provider, inventory *capability.Cached, shell, _ string) (app.Outcome, error) {
 		if shell != "fish" {
 			t.Fatalf("shell = %q, want fish", shell)
 		}
@@ -547,7 +547,7 @@ func TestWidgetReDerivesEditedExecutables(t *testing.T) {
 	}
 
 	original := executeTUI
-	executeTUI = func(_ provider.Provider, _ *capability.Cached, _ string) (app.Outcome, error) {
+	executeTUI = func(_ provider.Provider, _ *capability.Cached, _, _ string) (app.Outcome, error) {
 		return app.Outcome{
 			Command:  "pwd",
 			Accepted: true,

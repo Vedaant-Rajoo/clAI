@@ -985,6 +985,72 @@ func TestApplicabilityIndependentThirdGate(t *testing.T) {
 	}
 }
 
+// TestDevEndpointLabelledOnCandidateScreens proves a loopback development
+// session is visibly labelled with the effective endpoint before any color
+// styling, on every screen that can display a candidate, and that a normal
+// session carries no such label (REQ-DEVENDPOINT-005, REQ-ACCEPT-DEVENDPOINT-003).
+func TestDevEndpointLabelledOnCandidateScreens(t *testing.T) {
+	const endpoint = "http://127.0.0.1:8747"
+	candidate := provider.Candidate{Command: "pwd", Explanation: "current directory"}
+	deps := Deps{
+		Provider:        stubProvider{candidates: []provider.Candidate{candidate}},
+		InventorySource: staticInventorySource{},
+		DevEndpoint:     endpoint,
+	}
+	model := submitIntent(t, NewFromDeps(deps), "where am i")
+	for _, want := range []string{"DEV ENDPOINT", endpoint, "not the real provider"} {
+		if view := model.View(); !strings.Contains(view, want) {
+			t.Fatalf("review view missing %q: %q", want, view)
+		}
+	}
+
+	edit, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	if view := edit.(Model).View(); !strings.Contains(view, "DEV ENDPOINT") {
+		t.Fatalf("edit view missing the development label: %q", view)
+	}
+
+	none := submitIntent(t, NewFromDeps(Deps{
+		Provider:        stubProvider{},
+		InventorySource: staticInventorySource{},
+		DevEndpoint:     endpoint,
+	}), "nothing matches")
+	if none.screen != screenNoSuggestion {
+		t.Fatalf("screen = %v, want no-suggestion", none.screen)
+	}
+	if view := none.View(); !strings.Contains(view, "DEV ENDPOINT") {
+		t.Fatalf("no-suggestion view missing the development label: %q", view)
+	}
+
+	production := submitIntent(t, NewFromDeps(Deps{
+		Provider:        stubProvider{candidates: []provider.Candidate{candidate}},
+		InventorySource: staticInventorySource{},
+	}), "where am i")
+	if view := production.View(); strings.Contains(view, "DEV ENDPOINT") {
+		t.Fatalf("production session was labelled as a development one: %q", view)
+	}
+}
+
+// TestDevEndpointLabelSanitizedAndSurvivesNarrowTerminal proves the label is
+// terminal-control sanitized and is not dropped when the review must collapse
+// optional sections to fit.
+func TestDevEndpointLabelSanitizedAndSurvivesNarrowTerminal(t *testing.T) {
+	model := submitIntent(t, NewFromDeps(Deps{
+		Provider:        stubProvider{candidates: []provider.Candidate{{Command: "pwd", Explanation: "why"}}},
+		InventorySource: staticInventorySource{},
+		DevEndpoint:     "http://127.0.0.1:8747/\x1b]52;c;payload\a",
+	}), "where am i")
+
+	view := model.View()
+	if strings.ContainsRune(view, '\x1b') || strings.ContainsRune(view, '\a') {
+		t.Fatalf("development label leaked terminal controls: %q", view)
+	}
+
+	resized, _ := model.Update(tea.WindowSizeMsg{Width: 60, Height: 8})
+	if view := resized.(Model).View(); !strings.Contains(view, "DEV ENDPOINT") {
+		t.Fatalf("development label was dropped on a short terminal: %q", view)
+	}
+}
+
 func TestReviewCommunicatesApplicableInWords(t *testing.T) {
 	candidate := provider.Candidate{Command: "pwd", Explanation: "current directory"}
 	model := submitIntent(t, NewFromDeps(Deps{

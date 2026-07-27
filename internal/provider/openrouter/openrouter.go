@@ -62,11 +62,16 @@ Rules:
 - Declare requirements that the command actually depends on.
 - Never include markdown fences or extra prose.`
 
+// Provider compiles an intent into candidates via OpenRouter's chat-completions
+// API. DevEndpoint is the loopback-only development override
+// (REQ-DEVENDPOINT-001..004); the CLI validates it is lexically loopback before
+// constructing the provider. The unexported seams remain test-only.
 type Provider struct {
 	APIKey       string
 	Model        string
 	Policy       machinecontext.Policy
 	SharedFields []string
+	DevEndpoint  string
 
 	endpoint    string
 	timeout     time.Duration
@@ -97,7 +102,13 @@ func (p Provider) Compile(ctx context.Context, request provider.Request) ([]prov
 		return nil, err
 	}
 
+	// Precedence: the unexported test seam, then the loopback-gated development
+	// override, then the pinned production endpoint. Both overrides are still
+	// classified lexically below.
 	endpoint := p.endpoint
+	if endpoint == "" {
+		endpoint = p.DevEndpoint
+	}
 	if endpoint == "" {
 		endpoint = defaultEndpoint
 	}

@@ -11,8 +11,8 @@ providers are opt-in.
 | `anthropic` | API key only (no third-party OAuth) | implemented |
 | `openai` | API key only (no third-party OAuth) | planned |
 
-Regardless of provider, every suggestion still goes through the review →
-validate → safety gates and is never auto-executed. When a provider has no
+Regardless of provider, every suggestion still goes through independent review,
+validation, safety, and applicability gates and is never auto-executed. When a provider has no
 suggestion for an intent, clai says so instead of inventing a command, and
 pressing `esc` while a request is loading cancels it without touching your
 shell buffer.
@@ -39,11 +39,14 @@ Runtime context sharing is controlled per invocation:
   with a remote endpoint.
 - `--context-policy remote-minimal` is the default for non-loopback remote
   providers (OpenRouter and direct Anthropic). The request body contains the
-  intent plus only normalized `os_family`, `shell_family`, and `project_kind`
-  (`git`, `non-git`, or `unknown`).
+  intent plus normalized OS family, shell family, project kind, platform
+  architecture, and presence/version status for this fixed tool allowlist only:
+  `git`, `rg`, `fd`, `jq`, `curl`, `wget`, `tar`, `sed`, `awk`, `grep`, `lsof`,
+  `ifconfig`, `ip`, and `bash`.
 - `--context-policy remote-explicit` requires the same invocation to include at
-  least one repeatable `--share-context` flag. The only allowed fields are
-  `working_directory`, `git_root`, and `git_branch`.
+  least one repeatable `--share-context` flag. It sends the same normalized
+  remote-minimal baseline plus only selected-and-available explicit fields. The
+  only explicit fields are `working_directory`, `git_root`, and `git_branch`.
 
 For example:
 
@@ -54,8 +57,11 @@ clai --provider openrouter --context-policy remote-explicit \
 
 Sharing approval is not persisted. Duplicate fields are deduplicated
 predictably. An approved field that is unavailable is omitted rather than
-invented. `remote-minimal` never includes absolute paths, Git roots or branches,
-Git remotes, host or user identity, shell history, command output, environment
+invented. `local-only` omits the context object entirely. Tool facts are limited
+to normalized `absent`, `present`, or `present:<numeric-version>` values;
+executable paths, raw probe output, and parse errors are never transmitted.
+`remote-minimal` also never includes absolute paths, Git roots or branches, Git
+remotes, host or user identity, shell history, prior command output, environment
 dumps, repository contents, or credentials.
 
 The API key is attached as an authorization header, not included in the JSON
@@ -145,12 +151,13 @@ clai --provider anthropic --model claude-sonnet-5
   diagnostic.
 - **Context privacy is identical to other remote providers.** Direct Anthropic
   defaults to `remote-minimal`; `local-only` fails closed against the production
-  endpoint, and `remote-explicit` includes only the invocation-approved
-  `--share-context` fields.
-- **Structured candidate output.** The request pins a strict `candidate/v1` JSON
-  schema (a `command` and an `explanation`). The response is decoded strictly:
-  both fields are required, and unknown fields, trailing JSON, or an empty
-  command are rejected rather than shown.
+  endpoint, and `remote-explicit` sends the remote-minimal baseline plus only
+  invocation-approved, selected-and-available `--share-context` fields.
+- **Structured candidate output.** The request pins strict `candidate/v2` JSON:
+  required `command` and `explanation` fields plus an optional bounded
+  `requirements` array for tool, shell, or OS applicability. A v1-shaped response
+  remains valid with no requirements. Unknown fields, trailing JSON, malformed
+  requirements, or an empty command are rejected rather than shown.
 - **Streaming is transport-only.** The SDK consumes the server-sent event stream
   incrementally, but the TUI stays on its loading state until one complete
   candidate is finalized. Partial text, partial JSON, thinking blocks, and

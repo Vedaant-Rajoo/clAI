@@ -7,10 +7,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Vedaant-Rajoo/clai/internal/applicability"
+	"github.com/Vedaant-Rajoo/clai/internal/capability"
 	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
 	"github.com/Vedaant-Rajoo/clai/internal/provider"
 	"github.com/Vedaant-Rajoo/clai/internal/provider/rules"
 	"github.com/Vedaant-Rajoo/clai/internal/safety"
+	"github.com/Vedaant-Rajoo/clai/internal/shellsyntax"
 	"github.com/Vedaant-Rajoo/clai/internal/textsafe"
 	"github.com/Vedaant-Rajoo/clai/internal/validate"
 	"github.com/charmbracelet/bubbles/cursor"
@@ -58,26 +61,48 @@ const (
 	compileTimeout = 120 * time.Second
 )
 
+type InventorySource interface {
+	Inventory(context.Context) capability.Inventory
+}
+
+type Deps struct {
+	Provider        provider.Provider
+	ActiveShell     string
+	InventorySource InventorySource
+}
+
+type Outcome struct {
+	Command      string
+	Accepted     bool
+	Requirements []capability.Requirement
+	Edited       bool
+}
+
 type Model struct {
-	input         textinput.Model
-	commandInput  textinput.Model
-	spinner       spinner.Model
-	provider      provider.Provider
-	activeShell   string
-	screen        Screen
-	intent        string
-	command       string
-	explanation   string
-	accepted      bool
-	context       machinecontext.Context
-	safety        safety.Result
-	validation    validate.Result
-	err           error
-	nextRequest   uint64
-	activeRequest uint64
-	cancelCompile context.CancelFunc
-	width         int
-	height        int
+	input           textinput.Model
+	commandInput    textinput.Model
+	spinner         spinner.Model
+	provider        provider.Provider
+	inventorySource InventorySource
+	activeShell     string
+	screen          Screen
+	intent          string
+	candidate       provider.Candidate
+	command         string
+	explanation     string
+	accepted        bool
+	edited          bool
+	context         machinecontext.Context
+	inventory       applicability.Inventory
+	applicability   applicability.Result
+	safety          safety.Result
+	validation      validate.Result
+	err             error
+	nextRequest     uint64
+	activeRequest   uint64
+	cancelCompile   context.CancelFunc
+	width           int
+	height          int
 	// whyExpanded and contextExpanded gate the two progressively disclosed
 	// review sections. Both default to collapsed so the suggested command stays
 	// the hero and the review fits short terminals; the user reveals them with
@@ -95,6 +120,14 @@ func NewWithProvider(p provider.Provider) Model {
 }
 
 func NewWithProviderAndShell(p provider.Provider, shell string) Model {
+	return NewFromDeps(Deps{
+		Provider:        p,
+		ActiveShell:     shell,
+		InventorySource: capability.NewCached(shell),
+	})
+}
+
+func NewFromDeps(deps Deps) Model {
 	input := textinput.New()
 	input.Placeholder = "Describe what you want to do..."
 	configureCursor(&input)
@@ -109,13 +142,17 @@ func NewWithProviderAndShell(p provider.Provider, shell string) Model {
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 
+	if deps.InventorySource == nil {
+		deps.InventorySource = capability.NewCached(deps.ActiveShell)
+	}
 	return Model{
-		input:        input,
-		commandInput: commandInput,
-		spinner:      sp,
-		provider:     p,
-		activeShell:  shell,
-		screen:       screenInput,
+		input:           input,
+		commandInput:    commandInput,
+		spinner:         sp,
+		provider:        deps.Provider,
+		inventorySource: deps.InventorySource,
+		activeShell:     deps.ActiveShell,
+		screen:          screenInput,
 	}
 }
 
@@ -134,6 +171,7 @@ func (m Model) Init() tea.Cmd {
 type compileResult struct {
 	requestID  uint64
 	context    machinecontext.Context
+	inventory  capability.Inventory
 	candidates []provider.Candidate
 	err        error
 }
@@ -144,19 +182,21 @@ func (m Model) compile(ctx context.Context, requestID uint64) tea.Cmd {
 	intent := m.intent
 	shell := m.activeShell
 	p := m.provider
+	inventorySource := m.inventorySource
 	return func() tea.Msg {
 		collected := machinecontext.CollectWithShell(shell)
+		inventory := inventorySource.Inventory(ctx)
 		if err := ctx.Err(); err != nil {
-			return compileResult{requestID: requestID, context: collected, err: err}
+			return compileResult{requestID: requestID, context: collected, inventory: inventory, err: err}
 		}
-		candidates, err := p.Compile(ctx, provider.Request{Intent: intent, Context: collected})
+		candidates, err := p.Compile(ctx, provider.Request{Intent: intent, Context: collected, Capabilities: inventory})
 		// If the client deadline fired, report it as the deadline error even when
 		// a provider surfaces the timeout in its own vocabulary, so the loading
 		// screen always resolves to the clear "compile timed out" failure.
 		if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			err = context.DeadlineExceeded
 		}
-		return compileResult{requestID: requestID, context: collected, candidates: candidates, err: err}
+		return compileResult{requestID: requestID, context: collected, inventory: inventory, candidates: candidates, err: err}
 	}
 }
 
@@ -172,8 +212,11 @@ func (m *Model) startCompile() tea.Cmd {
 	ctx, cancel := context.WithTimeout(context.Background(), compileTimeout)
 	m.cancelCompile = cancel
 	m.accepted = false
+	m.edited = false
+	m.candidate = provider.Candidate{}
 	m.command = ""
 	m.explanation = ""
+	m.applicability = applicability.Result{}
 	m.err = nil
 	// A new suggestion starts from the collapsed default so disclosure state
 	// never leaks across intents.
@@ -196,13 +239,21 @@ func configureCursor(input *textinput.Model) {
 	input.Cursor.SetMode(cursor.CursorStatic)
 }
 
-func (m Model) Accepted() bool {
-	return m.accepted
+func (m Model) Outcome() Outcome {
+	outcome := Outcome{
+		Command:  m.command,
+		Accepted: m.accepted,
+		Edited:   m.edited,
+	}
+	if !m.edited {
+		outcome.Requirements = append([]capability.Requirement(nil), m.candidate.Requirements...)
+	}
+	return outcome
 }
 
-func (m Model) Command() string {
-	return m.command
-}
+func (m Model) Accepted() bool { return m.Outcome().Accepted }
+
+func (m Model) Command() string { return m.Outcome().Command }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
@@ -232,6 +283,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cancelCompile = nil
 		m.activeRequest = 0
 		m.context = msg.context
+		m.inventory = msg.inventory
 		if msg.err != nil {
 			m.command = ""
 			m.explanation = ""
@@ -258,10 +310,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.screen = screenNoSuggestion
 			return m, nil
 		}
-		m.command = msg.candidates[0].Command
-		m.explanation = msg.candidates[0].Explanation
+		m.candidate = cloneCandidate(msg.candidates[0])
+		m.command = m.candidate.Command
+		m.explanation = m.candidate.Explanation
+		m.edited = false
 		m.safety = safety.Evaluate(m.command)
 		m.validation = validate.Command(m.command)
+		m.applicability = applicability.Evaluate(m.candidate.Requirements, m.inventory)
 		m.screen = screenReview
 		return m, nil
 	case tea.KeyMsg:
@@ -300,7 +355,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			if m.screen == screenReview {
-				if m.safety.Decision == safety.Block || !m.validation.Valid {
+				if m.safety.Decision == safety.Block || !m.validation.Valid || m.applicability.Decision == applicability.Rejected {
 					return m, nil
 				}
 				m.accepted = true
@@ -309,17 +364,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			if m.screen == screenEditCommand {
 				m.command = m.commandInput.Value()
+				m.edited = true
 				m.safety = safety.Evaluate(m.command)
 				m.validation = validate.Command(m.command)
+				m.applicability = applicability.EvaluateEdited(m.command, m.inventory)
 				m.commandInput.Blur()
 				m.screen = screenReview
 				return m, nil
 			}
 		case "b":
 			if m.screen == screenReview || m.screen == screenNoSuggestion {
+				m.candidate = provider.Candidate{}
 				m.command = ""
 				m.explanation = ""
 				m.accepted = false
+				m.edited = false
+				m.applicability = applicability.Result{}
 				m.input.SetValue(m.intent)
 				m.input.CursorEnd()
 				m.input.Focus()
@@ -458,17 +518,17 @@ func (m Model) loadingView() string {
 // to a one-line hint rather than pushing an essential row off a short screen.
 func (m Model) reviewView() string {
 	command := commandStyle.Render(textsafe.Visible(m.command))
-	status := statusLine(m.validation, m.safety)
-	actions := mutedStyle.Render(reviewActions(m.safety.Decision, m.validation.Valid, m.whyExpanded, m.contextExpanded))
+	status := statusLine(m.validation, m.safety, m.applicability)
+	actions := mutedStyle.Render(reviewActions(m.safety.Decision, m.validation.Valid, m.applicability.Decision, m.whyExpanded, m.contextExpanded))
 
-	reasons := reviewReasons(m.validation, m.safety)
+	reasons := reviewReasons(m.validation, m.safety, m.applicability)
 	why := ""
 	if m.whyExpanded {
 		why = section("Why", textsafe.Visible(m.explanation))
 	}
 	usedContext := ""
 	if m.contextExpanded {
-		usedContext = section("Context used", strings.Join(contextLines(m.context), "\n"))
+		usedContext = section("Context used", strings.Join(contextLines(m.context, m.inventory, m.candidate.Requirements, m.edited, m.command), "\n"))
 	}
 	intent := mutedStyle.Render("intent: " + textsafe.Visible(m.intent))
 
@@ -558,7 +618,7 @@ func section(title, body string) string {
 	return headerStyle.Render(title) + "\n" + body
 }
 
-func contextLines(c machinecontext.Context) []string {
+func contextLines(c machinecontext.Context, inventory applicability.Inventory, requirements []capability.Requirement, edited bool, command string) []string {
 	gitRepo := "no"
 	if c.GitRepository {
 		gitRepo = "yes"
@@ -569,7 +629,7 @@ func contextLines(c machinecontext.Context) []string {
 		branch = "none"
 	}
 
-	return []string{
+	lines := []string{
 		"cwd: " + textsafe.Visible(c.WorkingDirectory),
 		"shell: " + textsafe.Visible(c.Shell),
 		"os: " + textsafe.Visible(c.OS),
@@ -577,6 +637,88 @@ func contextLines(c machinecontext.Context) []string {
 		"git root: " + textsafe.Visible(contextValue(c.GitRoot, "none")),
 		"git branch: " + textsafe.Visible(branch),
 	}
+	seen := make(map[string]bool, len(lines))
+	for _, line := range lines {
+		seen[line] = true
+	}
+	for _, line := range relevantCapabilityLines(inventory, requirements, edited, command) {
+		if !seen[line] {
+			lines = append(lines, line)
+			seen[line] = true
+		}
+	}
+	return lines
+}
+
+// relevantCapabilityLines exposes only facts used by the current applicability
+// decision. It never includes inventory paths, probe output, or unrelated tools.
+func relevantCapabilityLines(inventory applicability.Inventory, requirements []capability.Requirement, edited bool, command string) []string {
+	if inventory == nil {
+		return nil
+	}
+	if edited {
+		return editedCapabilityLines(inventory, command)
+	}
+
+	seen := make(map[string]bool)
+	lines := make([]string, 0, len(requirements))
+	for _, requirement := range requirements {
+		switch requirement.Kind {
+		case capability.RequirementTool:
+			key := "tool:" + requirement.Name
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			lines = append(lines, toolCapabilityLine(inventory, requirement.Name))
+		case capability.RequirementShell:
+			if seen["shell"] {
+				continue
+			}
+			seen["shell"] = true
+			lines = append(lines, "shell: "+textsafe.Visible(string(inventory.Shell().Family)))
+		case capability.RequirementOS:
+			if seen["os"] {
+				continue
+			}
+			seen["os"] = true
+			lines = append(lines, "os: "+textsafe.Visible(inventory.OSFamily()))
+		}
+	}
+	return lines
+}
+
+func editedCapabilityLines(inventory applicability.Inventory, command string) []string {
+	parsed := shellsyntax.Parse(command)
+	if !parsed.Supported() {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var lines []string
+	for _, pipeline := range parsed.List.Pipelines {
+		for _, simple := range pipeline.Commands {
+			resolved := shellsyntax.ResolveExecutable(simple)
+			if !resolved.Found || resolved.Base == "" || seen[resolved.Base] {
+				continue
+			}
+			seen[resolved.Base] = true
+			lines = append(lines, toolCapabilityLine(inventory, resolved.Base))
+		}
+	}
+	return lines
+}
+
+func toolCapabilityLine(inventory applicability.Inventory, name string) string {
+	status := "absent"
+	if fact, known := inventory.LookupTool(name); known && fact.Present {
+		status = "present"
+		if fact.Version.Known() {
+			status += " " + fact.Version.String()
+		} else {
+			status += " (version unknown)"
+		}
+	}
+	return "tool " + textsafe.Visible(name) + ": " + textsafe.Visible(status)
 }
 
 func contextValue(value, fallback string) string {
@@ -587,28 +729,45 @@ func contextValue(value, fallback string) string {
 	return value
 }
 
-// statusLine collapses validation and safety into one row. Both decisions are
-// named in words — valid/invalid and allow/warn/block — so the review stays
-// unambiguous on a monochrome terminal; color only reinforces the words.
-func statusLine(validation validate.Result, result safety.Result) string {
+func cloneCandidate(candidate provider.Candidate) provider.Candidate {
+	candidate.Requirements = append([]capability.Requirement(nil), candidate.Requirements...)
+	return candidate
+}
+
+// statusLine names all three independent gates in words so the review remains
+// understandable without color; styling only reinforces those words.
+func statusLine(validation validate.Result, result safety.Result, appResult applicability.Result) string {
 	validity := allowStyle.Render("valid")
 	if !validation.Valid {
 		validity = blockStyle.Render("invalid")
 	}
 	decision := decisionStyle(result.Decision).Render(string(result.Decision))
-	return validity + mutedStyle.Render(" · ") + decision
+	appWord := "applicable"
+	appStyle := allowStyle
+	switch appResult.Decision {
+	case applicability.Marked:
+		appWord = "may not work"
+		appStyle = warnStyle
+	case applicability.Rejected:
+		appWord = "not for this shell/OS"
+		appStyle = blockStyle
+	}
+	return strings.Join([]string{validity, decision, appStyle.Render(appWord)}, mutedStyle.Render(" · "))
 }
 
 // reviewReasons renders the sanitized reasons behind a non-allow or invalid
 // decision, validation reasons first. It returns an empty string when the
 // command is both valid and allowed, keeping the default review screen minimal.
-func reviewReasons(validation validate.Result, result safety.Result) string {
+func reviewReasons(validation validate.Result, result safety.Result, appResult applicability.Result) string {
 	var reasons []string
 	if !validation.Valid {
 		reasons = append(reasons, validation.Reasons...)
 	}
 	if result.Decision != safety.Allow {
 		reasons = append(reasons, result.Reasons...)
+	}
+	if appResult.Decision != applicability.Applicable {
+		reasons = append(reasons, appResult.Reasons...)
 	}
 	if len(reasons) == 0 {
 		return ""
@@ -645,13 +804,15 @@ func decisionStyle(decision safety.Decision) lipgloss.Style {
 // token names the accept outcome in words (accept/blocked/invalid) so the
 // consequence of pressing enter is legible without color, and the "?"/"c" hints
 // reflect whether each disclosure section is currently open.
-func reviewActions(decision safety.Decision, valid, whyExpanded, contextExpanded bool) string {
+func reviewActions(decision safety.Decision, valid bool, appDecision applicability.Decision, whyExpanded, contextExpanded bool) string {
 	verb := "accept"
 	switch {
 	case !valid:
 		verb = "invalid"
 	case decision == safety.Block:
 		verb = "blocked"
+	case appDecision == applicability.Rejected:
+		verb = "inapplicable"
 	}
 
 	why := "? why"

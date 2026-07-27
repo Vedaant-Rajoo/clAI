@@ -68,7 +68,7 @@ func TestRemoteExplicitGrammarAndDeterministicSharing(t *testing.T) {
 		if policy != machinecontext.PolicyRemoteExplicit {
 			t.Fatalf("policy = %q", policy)
 		}
-		want := []string{machinecontext.FieldGitBranch, machinecontext.FieldWorkingDirectory}
+		want := []string{machinecontext.FieldWorkingDirectory, machinecontext.FieldGitBranch}
 		if !reflect.DeepEqual(shared, want) {
 			t.Fatalf("shared = %v, want %v", shared, want)
 		}

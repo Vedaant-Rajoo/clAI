@@ -11,7 +11,9 @@ import (
 	"strings"
 
 	"github.com/Vedaant-Rajoo/clai/internal/app"
+	"github.com/Vedaant-Rajoo/clai/internal/applicability"
 	"github.com/Vedaant-Rajoo/clai/internal/auth"
+	"github.com/Vedaant-Rajoo/clai/internal/capability"
 	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
 	"github.com/Vedaant-Rajoo/clai/internal/provider"
 	"github.com/Vedaant-Rajoo/clai/internal/provider/anthropic"
@@ -19,6 +21,7 @@ import (
 	"github.com/Vedaant-Rajoo/clai/internal/provider/rules"
 	"github.com/Vedaant-Rajoo/clai/internal/safety"
 	"github.com/Vedaant-Rajoo/clai/internal/shellinit"
+	"github.com/Vedaant-Rajoo/clai/internal/textsafe"
 	"github.com/Vedaant-Rajoo/clai/internal/validate"
 	"github.com/atotto/clipboard"
 	tea "github.com/charmbracelet/bubbletea"
@@ -154,23 +157,24 @@ func (c cli) runInteractive(args []string) int {
 		return exitError
 	}
 
-	command, accepted, err := executeTUI(p, "")
+	inventory := capability.NewCached("")
+	outcome, err := executeTUI(p, inventory, "")
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai: %v\n", err)
 		return exitError
 	}
-	if !accepted {
+	if !outcome.Accepted {
 		return exitOK
 	}
 
 	if *f.copyCommand {
-		if err := clipboard.WriteAll(command); err != nil {
+		if err := clipboard.WriteAll(outcome.Command); err != nil {
 			fmt.Fprintf(c.stderr, "clai: copy command: %v\n", err)
 			return exitError
 		}
 	}
 	if *f.printCommand {
-		fmt.Fprintln(c.stdout, command)
+		fmt.Fprintln(c.stdout, outcome.Command)
 	}
 	return exitOK
 }
@@ -216,33 +220,52 @@ func (c cli) runWidget(args []string) int {
 		return exitError
 	}
 
-	command, accepted, err := executeTUI(p, *f.shell)
+	inventory := capability.NewCached(*f.shell)
+	outcome, err := executeTUI(p, inventory, *f.shell)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai widget: %v\n", err)
 		return exitError
 	}
-	if !accepted {
+	if !outcome.Accepted {
 		return exitCancelled
 	}
 	// Transport boundary revalidation (REQ-INVARIANT-008): re-check the exact
-	// bytes about to be exported against both the structural gate
-	// (REQ-INVARIANT-003) and the safety gate (REQ-INVARIANT-004) independently
-	// of the TUI's in-model acceptance gating, so a blocked or invalid command
-	// can never reach widget transport even if the interactive gate regresses.
-	if result := validate.Command(command); !result.Valid {
-		fmt.Fprintf(c.stderr, "clai widget: accepted command is not exportable: %s\n", strings.Join(result.Reasons, " "))
+	// bytes about to be exported against structural, safety, file-identity, and
+	// applicability gates independently of the TUI review decision.
+	if result := validate.Command(outcome.Command); !result.Valid {
+		fmt.Fprintf(c.stderr, "clai widget: accepted command is not exportable: %s\n", textsafe.Visible(strings.Join(result.Reasons, " ")))
 		return exitError
 	}
-	if decision := safety.Evaluate(command); decision.Decision == safety.Block {
-		fmt.Fprintf(c.stderr, "clai widget: accepted command is blocked by safety and not exportable: %s\n", strings.Join(decision.Reasons, " "))
+	if decision := safety.Evaluate(outcome.Command); decision.Decision == safety.Block {
+		fmt.Fprintf(c.stderr, "clai widget: accepted command is blocked by safety and not exportable: %s\n", textsafe.Visible(strings.Join(decision.Reasons, " ")))
 		return exitError
 	}
-	if err := writeWidgetResult(*f.resultFile, command, resultIdentity); err != nil {
+	if err := verifyWidgetResult(*f.resultFile, resultIdentity); err != nil {
+		fmt.Fprintf(c.stderr, "clai widget: write result: %v\n", err)
+		return exitError
+	}
+	appResult := widgetApplicability(outcome, inventory.Inventory(context.Background()))
+	if appResult.Decision == applicability.Rejected {
+		fmt.Fprintf(c.stderr, "clai widget: accepted command is not for this shell/OS: %s\n", textsafe.Visible(strings.Join(appResult.Reasons, " ")))
+		return exitError
+	}
+	if err := writeWidgetResult(*f.resultFile, outcome.Command, resultIdentity); err != nil {
 		fmt.Fprintf(c.stderr, "clai widget: write result: %v\n", err)
 		return exitError
 	}
 	keepResult = true
 	return exitOK
+}
+
+// widgetApplicability is the fresh transport-boundary applicability decision.
+// The Edited discriminator selects the branch: an unedited outcome reevaluates
+// the transported candidate requirements, an edited outcome rederives
+// executables from the accepted command bytes and ignores those requirements.
+func widgetApplicability(outcome app.Outcome, snapshot capability.Inventory) applicability.Result {
+	if outcome.Edited {
+		return applicability.EvaluateEdited(outcome.Command, snapshot)
+	}
+	return applicability.Evaluate(outcome.Requirements, snapshot)
 }
 
 // providerFlags holds the flags shared by the interactive and widget commands.
@@ -359,15 +382,14 @@ func registerWidgetFlags(fs *flag.FlagSet) widgetFlags {
 	}
 }
 
-func runTUI(p provider.Provider, activeShell string) (string, bool, error) {
-	model := app.NewWithProvider(p)
+func runTUI(p provider.Provider, inventory *capability.Cached, activeShell string) (app.Outcome, error) {
+	model := app.NewFromDeps(app.Deps{Provider: p, ActiveShell: activeShell, InventorySource: inventory})
 	options := []tea.ProgramOption{tea.WithOutput(os.Stderr), tea.WithAltScreen()}
 	if activeShell != "" {
-		model = app.NewWithProviderAndShell(p, activeShell)
 
 		tty, err := openControllingTerminal()
 		if err != nil {
-			return "", false, fmt.Errorf("open controlling terminal: %w", err)
+			return app.Outcome{}, fmt.Errorf("open controlling terminal: %w", err)
 		}
 		defer tty.Close()
 		options = []tea.ProgramOption{tea.WithInput(tty), tea.WithOutput(tty), tea.WithAltScreen()}
@@ -376,14 +398,14 @@ func runTUI(p provider.Provider, activeShell string) (string, bool, error) {
 	program := tea.NewProgram(model, options...)
 	finalModel, err := program.Run()
 	if err != nil {
-		return "", false, err
+		return app.Outcome{}, err
 	}
 
 	result, ok := finalModel.(app.Model)
-	if !ok || !result.Accepted() {
-		return "", false, nil
+	if !ok {
+		return app.Outcome{}, nil
 	}
-	return result.Command(), true, nil
+	return result.Outcome(), nil
 }
 
 func validShell(shell string) bool {
@@ -425,6 +447,17 @@ func removeWidgetResultIfSame(path string, expected os.FileInfo) {
 		return
 	}
 	_ = os.Remove(path)
+}
+
+func verifyWidgetResult(path string, expected os.FileInfo) error {
+	before, err := inspectWidgetResult(path)
+	if err != nil {
+		return err
+	}
+	if expected == nil || !os.SameFile(expected, before) {
+		return errors.New("result file changed while the TUI was open")
+	}
+	return nil
 }
 
 func writeWidgetResult(path, command string, expected os.FileInfo) error {

@@ -647,6 +647,7 @@ func TestCheckedInRevisionEvidence(t *testing.T) {
 	phaseBR2 := read(".local", "revisions", "SPECIFICATION-12c6d5f823978edd.md")
 	phaseBR3 := read(".local", "revisions", "SPECIFICATION-514f7d5c2881b0d1.md")
 	phaseBR4 := read(".local", "revisions", "SPECIFICATION-f8816bbf262963ab.md")
+	phaseBR5 := read(".local", "revisions", "SPECIFICATION-4a9ec1befd556a23.md")
 	current := read(".local", "SPECIFICATION.md")
 	migrationDiff := read(".local", "revisions", "SPECIFICATION-28ac-to-5dc.diff")
 	remediationDiff := read(".local", "revisions", "SPECIFICATION-28ac-to-phase-0-remediation-r1.diff")
@@ -656,6 +657,7 @@ func TestCheckedInRevisionEvidence(t *testing.T) {
 	phaseBR3Diff := read(".local", "revisions", "SPECIFICATION-12c-to-phase-b-applicability-r3.diff")
 	phaseBR4Diff := read(".local", "revisions", "SPECIFICATION-514f-to-phase-b-applicability-r4.diff")
 	phaseBR5Diff := read(".local", "revisions", "SPECIFICATION-f881-to-phase-b-applicability-r5.diff")
+	phaseBR6Diff := read(".local", "revisions", "SPECIFICATION-4a9e-to-phase-b-devendpoint-r6.diff")
 	checks := map[string]string{
 		sha256Hex(initial):         "28ac242a7c7f4f15bdcc8ad052f504251380580f0749e9f4d257209eb9c61add",
 		sha256Hex(registered):      "5dc63862dfe786a6e45cf9155dc56a8ed3cae3769ff80dd135487e35958d5f5d",
@@ -665,7 +667,8 @@ func TestCheckedInRevisionEvidence(t *testing.T) {
 		sha256Hex(phaseBR2):        "12c6d5f823978eddf65efac9e07b9b90e73df8d3360373099698d80526017003",
 		sha256Hex(phaseBR3):        "514f7d5c2881b0d18cc18e87584324dafd1bd07a484195e78342599cba372d5e",
 		sha256Hex(phaseBR4):        "f8816bbf262963ab38b484eecb5ec17283f57de5aaa540c08608cf2f41a85616",
-		sha256Hex(current):         "4a9ec1befd556a231489d6a4e4b549d08ce6810df1f49782913e71ed6eca0481",
+		sha256Hex(phaseBR5):        "4a9ec1befd556a231489d6a4e4b549d08ce6810df1f49782913e71ed6eca0481",
+		sha256Hex(current):         "1541a84cbe057e422d2fa83421e8f7a4241c85e93c50ed702fd4a9ed15a1512f",
 		sha256Hex(migrationDiff):   "27a46e185cc9cf12b10b48c72c7a5e59ba30790527091809b811580f0416a47a",
 		sha256Hex(remediationDiff): "f31e3de8e608e4261d6fb10251b67fb56595e9cd6541946196caef730954c82f",
 		sha256Hex(anthropicDiff):   "dae1358bbac67a249050a46767dea16a4406a262889a6d83a454c68a3d2d6601",
@@ -674,6 +677,7 @@ func TestCheckedInRevisionEvidence(t *testing.T) {
 		sha256Hex(phaseBR3Diff):    "d966929ea13c24b17b10cf98da579578850d0537b7e66b13b244f61736a5e8a5",
 		sha256Hex(phaseBR4Diff):    "b97413cc9387c63d108ed366a62a418c951921f71ea84f6f47839b1957eed201",
 		sha256Hex(phaseBR5Diff):    "0c5cc7de643aa4eba438d9cc828e02a98c4320d8313b305c0a59de4b6b744bac",
+		sha256Hex(phaseBR6Diff):    "c6db712309d375431713d31aa7a389224bc28c82678fb974ddf6ecbe3293b7c5",
 	}
 	for got, want := range checks {
 		if got != want {
@@ -688,8 +692,8 @@ func TestCheckedInRevisionEvidence(t *testing.T) {
 	// after stripping requirement-ID markers and controlled workflow-hardening
 	// additions. Phase A deliberately diverges from that baseline by adding the
 	// direct Anthropic provider tranche. The immutable Phase A snapshot and every
-	// Phase B r1/r2/r3/r4 predecessor are therefore bound to the next revision by
-	// the registered semantic diffs pinned above; the current r5 bytes are
+	// Phase B r1..r5 predecessor is therefore bound to the next revision by the
+	// registered semantic diffs pinned above; the current r6 bytes are
 	// additionally bound to their label by TestRevisionLabelBinding.
 	if normalizeSpecificationRevision(predecessor, true) != string(initial) {
 		t.Fatal("registered phase-0-remediation-r2 predecessor contains semantic changes outside stable IDs and specification-workflow hardening")
@@ -749,8 +753,8 @@ func TestRevisionLabelBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const boundLabel = "phase-b-applicability-r5"
-	const boundSpecHash = "4a9ec1befd556a231489d6a4e4b549d08ce6810df1f49782913e71ed6eca0481"
+	const boundLabel = "phase-b-devendpoint-r6"
+	const boundSpecHash = "1541a84cbe057e422d2fa83421e8f7a4241c85e93c50ed702fd4a9ed15a1512f"
 	if manifest.RevisionLabel != boundLabel || manifest.SpecificationSHA256 != boundSpecHash {
 		t.Fatalf("revision binding = (%q, %q), want (%q, %q): a specification change or relabel must update both constants together and consciously choose the revision label",
 			manifest.RevisionLabel, manifest.SpecificationSHA256, boundLabel, boundSpecHash)

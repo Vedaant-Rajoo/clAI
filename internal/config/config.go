@@ -75,6 +75,12 @@ func validateConfiguredBasePath(path string) error {
 	return nil
 }
 
+// Save persists cfg to config.json (stub — hardened writer lands with the
+// GREEN step of this plan).
+func Save(cfg Config) error {
+	return errors.New("config save not implemented")
+}
+
 // Load reads config.json leniently. A missing file is a first-class "not
 // configured yet" outcome: (Config{}, nil) with no diagnostic. Any readable
 // but unparseable content — including an empty file — classifies as

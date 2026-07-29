@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/Vedaant-Rajoo/clai/internal/configroot"
 )
 
 // swapUserConfigDir points the package at a temporary base directory,
@@ -23,6 +25,25 @@ func swapUserConfigDir(t *testing.T) string {
 	old := userConfigDir
 	userConfigDir = func() (string, error) { return base, nil }
 	t.Cleanup(func() { userConfigDir = old })
+	return base
+}
+
+// swapConfigRoots points the shared resolver at an isolated preferred base.
+// Until Path consumes this seam, userConfigDir is also redirected to a distinct
+// safe directory so the RED test cannot inspect the developer's real config.
+func swapConfigRoots(t *testing.T) string {
+	t.Helper()
+	base := t.TempDir()
+	oldRoots := resolveConfigRoots
+	oldUserConfigDir := userConfigDir
+	resolveConfigRoots = func() (configroot.Roots, error) {
+		return configroot.Roots{Preferred: base}, nil
+	}
+	userConfigDir = func() (string, error) { return filepath.Join(base, "old-policy"), nil }
+	t.Cleanup(func() {
+		resolveConfigRoots = oldRoots
+		userConfigDir = oldUserConfigDir
+	})
 	return base
 }
 
@@ -42,8 +63,41 @@ func writeRawConfig(t *testing.T, base string, data []byte) string {
 	return path
 }
 
+func TestPreferredConfigPathUsesSharedRoot(t *testing.T) {
+	base := swapConfigRoots(t)
+
+	got, err := Path()
+	if err != nil {
+		t.Fatalf("Path: %v", err)
+	}
+	want := filepath.Join(base, "clai", fileName)
+	if got != want {
+		t.Fatalf("Path = %q, want shared preferred path %q", got, want)
+	}
+}
+
+func TestLoadReadsPreferredRoot(t *testing.T) {
+	base := swapConfigRoots(t)
+	writeRawConfig(t, base, []byte(`{"contract":"config-file/v1","provider":"anthropic","model":"claude-test","delivery":"stdout","init_completed":true}`))
+
+	got, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := Config{
+		Contract:      ConfigContract,
+		Provider:      "anthropic",
+		Model:         "claude-test",
+		Delivery:      "stdout",
+		InitCompleted: true,
+	}
+	if got != want {
+		t.Fatalf("Load = %+v, want %+v", got, want)
+	}
+}
+
 // TestLoadReadsHandWrittenConfigFile is the package half of the tracer: real
-// JSON bytes on disk, through the userConfigDir seam, decode into the exact
+// JSON bytes on disk, through the configured root seam, decode into the exact
 // Config values a hand-written file carries (CONF-01).
 func TestLoadReadsHandWrittenConfigFile(t *testing.T) {
 	base := swapUserConfigDir(t)

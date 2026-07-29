@@ -17,6 +17,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/Vedaant-Rajoo/clai/internal/configroot"
 )
 
 // ConfigContract identifies the config-file schema version (CONF-01).
@@ -24,9 +26,12 @@ const ConfigContract = "config-file/v1"
 
 const fileName = "config.json"
 
-// userConfigDir is a swappable seam mirroring internal/auth so tests can
-// point the package at a temporary base directory.
+// userConfigDir remains temporarily available while the shared-root tracer is
+// under test; Path switches to resolveConfigRoots in the GREEN implementation.
 var userConfigDir = os.UserConfigDir
+
+// resolveConfigRoots is the shared root-policy seam used by deterministic tests.
+var resolveConfigRoots = configroot.Resolve
 
 // ErrCorrupt classifies a readable but unparseable config file. Callers match
 // it with errors.Is to distinguish parse failures from I/O failures; either

@@ -158,10 +158,17 @@ func (c cli) runInteractive(args []string) int {
 		return exitUsage
 	}
 
+	// Explicit-set state is collected once, right after Parse: boolean
+	// delivery flags cannot use empty-string sentinels because a parsed false
+	// is indistinguishable from unset, so flag.Visit records which flags the
+	// user actually passed (CONF-03 adjacency edge).
+	explicit := map[string]bool{}
+	fs.Visit(func(fl *flag.Flag) { explicit[fl.Name] = true })
+
 	// Settings resolve before any provider-dependent validation so that a
 	// config-selected provider validates --dev-endpoint and defaults the
 	// context policy exactly like a flag-selected one (CONF-03).
-	_, resolvedProvider := c.resolveSettings(f.providerFlags)
+	cfg, resolvedProvider, resolvedModel := c.resolveSettings(f.providerFlags)
 
 	// The endpoint is validated first because the context policy defaults on
 	// endpoint classification (REQ-CONTEXT-003, REQ-DEVENDPOINT-004).
@@ -180,7 +187,7 @@ func (c cli) runInteractive(args []string) int {
 		fmt.Fprintln(c.stdout, version)
 		return exitOK
 	}
-	p, err := selectProvider(resolvedProvider, *f.model, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint)
+	p, err := selectProvider(resolvedProvider, resolvedModel, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai: %v\n", err)
 		return exitError
@@ -196,13 +203,18 @@ func (c cli) runInteractive(args []string) int {
 		return exitOK
 	}
 
-	if *f.copyCommand {
-		if err := clipboard.WriteAll(outcome.Command); err != nil {
+	// Delivery resolves through the same precedence chain as provider and
+	// model, with explicit-set state deciding the flag layer (CONF-03). Only
+	// the user-ACCEPTED command is ever delivered, and the clipboard-then-
+	// stdout order is preserved so both behaviors compose deterministically.
+	copyOut, printOut := config.ResolveDelivery(*f.copyCommand, *f.printCommand, explicit["copy"], explicit["print-command"], os.Getenv("CLAI_DELIVERY"), cfg.Delivery)
+	if copyOut {
+		if err := clipboardWrite(outcome.Command); err != nil {
 			fmt.Fprintf(c.stderr, "clai: copy command: %v\n", err)
 			return exitError
 		}
 	}
-	if *f.printCommand {
+	if printOut {
 		fmt.Fprintln(c.stdout, outcome.Command)
 	}
 	return exitOK
@@ -226,10 +238,12 @@ func (c cli) runWidget(args []string) int {
 		fmt.Fprintln(c.stderr, "usage: clai widget --shell <fish|bash|zsh> --result-file <path>\nRun 'clai widget help' for usage.")
 		return exitUsage
 	}
-	// The widget path performs the identical settings resolution as the
-	// interactive path (CONF-03) — skipping it here would silently break
-	// config.json and CLAI_PROVIDER users invoking through the shell widget.
-	_, resolvedProvider := c.resolveSettings(f.providerFlags)
+	// The widget path performs the identical provider and model resolution as
+	// the interactive path (CONF-03) — skipping it here would silently break
+	// config.json and CLAI_PROVIDER/CLAI_MODEL users invoking through the
+	// shell widget. Delivery resolution does not apply in widget mode: the
+	// result-file transport is fixed.
+	_, resolvedProvider, resolvedModel := c.resolveSettings(f.providerFlags)
 
 	// Validate every usage error together, before touching the result file or
 	// constructing a provider (REQ-DEVENDPOINT-002). The endpoint comes first
@@ -257,7 +271,7 @@ func (c cli) runWidget(args []string) int {
 		}
 	}()
 
-	p, err := selectProvider(resolvedProvider, *f.model, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint)
+	p, err := selectProvider(resolvedProvider, resolvedModel, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai widget: %v\n", err)
 		return exitError
@@ -368,19 +382,22 @@ func registerProviderFlags(fs *flag.FlagSet) providerFlags {
 	}
 }
 
-// resolveSettings loads config.json and resolves the effective provider name
-// through the flag > env > config > built-in precedence chain (CONF-03). A
-// failed load — corrupt file or I/O error alike — warns exactly once on
-// stderr and continues with a zero Config; config state never changes an exit
-// code (CONF-05). The Load error text already carries the quoted path.
-func (c cli) resolveSettings(f providerFlags) (config.Config, string) {
+// resolveSettings loads config.json and resolves the effective provider and
+// model through the flag > env > config > built-in precedence chain
+// (CONF-03). The model built-in stays "" so each remote provider applies its
+// own DefaultModel when no layer names one. A failed load — corrupt file or
+// I/O error alike — warns exactly once on stderr and continues with a zero
+// Config; config state never changes an exit code (CONF-05). The Load error
+// text already carries the quoted path.
+func (c cli) resolveSettings(f providerFlags) (config.Config, string, string) {
 	cfg, err := loadConfig()
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai: warning: %v; continuing with defaults\n", err)
 		cfg = config.Config{}
 	}
-	resolved := config.Resolve(*f.providerName, os.Getenv("CLAI_PROVIDER"), cfg.Provider, "rules")
-	return cfg, resolved
+	resolvedProvider := config.Resolve(*f.providerName, os.Getenv("CLAI_PROVIDER"), cfg.Provider, "rules")
+	resolvedModel := config.Resolve(*f.model, os.Getenv("CLAI_MODEL"), cfg.Model, "")
+	return cfg, resolvedProvider, resolvedModel
 }
 
 // devEndpointOption validates the loopback-only development override

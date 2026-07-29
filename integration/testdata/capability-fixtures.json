@@ -1,0 +1,20 @@
+{
+  "schema": "capability-fixtures/v1",
+  "intent": "search for TODO",
+  "fixtures": [
+    {
+      "name": "rg present",
+      "rg_present": true,
+      "command": "rg TODO",
+      "explanation": "Selected rg because it is installed.",
+      "requirement": {"kind": "tool", "name": "rg"}
+    },
+    {
+      "name": "rg absent and grep present",
+      "rg_present": false,
+      "command": "grep -r TODO .",
+      "explanation": "Selected grep fallback because rg is absent.",
+      "requirement": {"kind": "tool", "name": "grep"}
+    }
+  ]
+}

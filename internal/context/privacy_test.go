@@ -1,8 +1,12 @@
 package machinecontext
 
 import (
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/Vedaant-Rajoo/clai/internal/capability"
 )
 
 func TestClassifyEndpointLexically(t *testing.T) {
@@ -40,11 +44,9 @@ func TestClassifyEndpointRejectsUserinfo(t *testing.T) {
 		"https://username:password@openrouter.ai/v1",
 		"http://username@localhost:8080/v1",
 	} {
-		t.Run(endpoint, func(t *testing.T) {
-			if _, err := ClassifyEndpoint(endpoint); err == nil || err.Error() != "provider endpoint must not contain userinfo" {
-				t.Fatalf("err = %v, want userinfo rejection", err)
-			}
-		})
+		if _, err := ClassifyEndpoint(endpoint); err == nil || err.Error() != "provider endpoint must not contain userinfo" {
+			t.Fatalf("ClassifyEndpoint(%q) error = %v", endpoint, err)
+		}
 	}
 }
 
@@ -60,112 +62,201 @@ func TestPolicyDefaults(t *testing.T) {
 	}
 }
 
-func TestSelectRemoteMinimalMetadataAndOrdering(t *testing.T) {
+func TestContextV2CanonicalFieldsAndMetadata(t *testing.T) {
+	inventory := fixtureInventory(map[string]capability.ToolFact{
+		"rg":   {Name: "rg", Present: true, Path: "/fixture/bin/rg", Version: "14.1.0"},
+		"grep": {Name: "grep", Present: true, Path: "/fixture/bin/grep"},
+	})
 	selection, err := Select(Context{
-		OS: "DARWIN", Shell: "/opt/homebrew/bin/fish", ShellProvenance: "widget-declared-shell", WorkingDirectory: "/secret/project",
-		GitRepository: true, GitRoot: "/secret/project", GitBranch: "private-branch",
-	}, PolicyRemoteMinimal, nil)
+		WorkingDirectory: "/private/work",
+		GitRepository:    true,
+		GitRoot:          "/private/work",
+		GitBranch:        "private-branch",
+	}, inventory, PolicyRemoteMinimal, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	wantNames := []string{FieldOSFamily, FieldShellFamily, FieldProjectKind, FieldWorkingDirectory, FieldGitRoot, FieldGitBranch}
+	wantNames := []string{FieldOSFamily, FieldShellFamily, FieldProjectKind, FieldPlatformArch}
+	for _, name := range capability.ToolNames() {
+		wantNames = append(wantNames, "tool_"+name)
+	}
+	wantNames = append(wantNames, FieldWorkingDirectory, FieldGitRoot, FieldGitBranch)
+
 	gotNames := make([]string, 0, len(selection.Capsule.Fields))
 	for _, field := range selection.Capsule.Fields {
 		gotNames = append(gotNames, field.Name)
-		if field.SchemaVersion != CapsuleVersion || field.Provenance == "" || field.Sensitivity == "" || field.Freshness == "" || field.Reason == "" {
-			t.Errorf("incomplete metadata: %+v", field)
+		if field.SchemaVersion != CapsuleVersion || field.Sensitivity != "low" || field.Freshness != "invocation" || field.Transformation != TransformationNormalized {
+			t.Errorf("metadata mismatch for %s: %+v", field.Name, field)
+		}
+		if len(field.Provenance) == 0 || field.Reason == "" {
+			t.Errorf("missing provenance/reason for %s: %+v", field.Name, field)
+		}
+		if field.Sharing == SharingRedacted {
+			t.Errorf("Phase B must not redact fields: %+v", field)
 		}
 	}
 	if !reflect.DeepEqual(gotNames, wantNames) {
 		t.Fatalf("field order = %v, want %v", gotNames, wantNames)
 	}
-	for _, field := range selection.Capsule.Fields[:3] {
-		if field.Sharing != SharingSelected || field.Value == "" || field.Reason != "selected by remote-minimal baseline" {
-			t.Errorf("minimal field metadata mismatch: %+v", field)
+	byName := fieldsByName(selection)
+	if byName[FieldOSFamily].Value != "linux" || !reflect.DeepEqual(byName[FieldOSFamily].Provenance, []string{"runtime.GOOS"}) {
+		t.Fatalf("os field = %+v", byName[FieldOSFamily])
+	}
+	if byName[FieldShellFamily].Value != "bash" || !reflect.DeepEqual(byName[FieldShellFamily].Provenance, []string{"SHELL"}) {
+		t.Fatalf("shell field = %+v", byName[FieldShellFamily])
+	}
+	if byName[FieldPlatformArch].Value != "arm64" {
+		t.Fatalf("arch field = %+v", byName[FieldPlatformArch])
+	}
+	if byName["tool_rg"].Value != "present:14.1.0" || !reflect.DeepEqual(byName["tool_rg"].Provenance, []string{"exec.LookPath:rg", "probe:rg"}) {
+		t.Fatalf("rg field = %+v", byName["tool_rg"])
+	}
+	if byName["tool_grep"].Value != "present" || !reflect.DeepEqual(byName["tool_grep"].Provenance, []string{"exec.LookPath:grep"}) {
+		t.Fatalf("grep field = %+v", byName["tool_grep"])
+	}
+	if byName["tool_git"].Value != "absent" {
+		t.Fatalf("git field = %+v", byName["tool_git"])
+	}
+	for _, field := range selection.Capsule.Fields {
+		if strings.Contains(field.Value, "/fixture/bin") {
+			t.Fatalf("field %s leaked an executable path: %+v", field.Name, field)
 		}
 	}
-	if got := selection.Capsule.Fields[1].Provenance; got != "widget-declared-shell" {
-		t.Fatalf("shell provenance = %q, want widget-declared-shell", got)
-	}
-	for _, field := range selection.Capsule.Fields[3:] {
-		if field.Sharing != SharingRedacted || field.Value != "" || field.Transformation != TransformationRedacted || field.Reason != "not included by remote-minimal policy" {
-			t.Errorf("sensitive field redaction mismatch: %+v", field)
+	for _, name := range explicitFieldOrder {
+		if byName[name].Sharing != SharingOmitted || byName[name].Value != "" {
+			t.Fatalf("minimal explicit field %s = %+v", name, byName[name])
 		}
 	}
 }
 
-func TestSelectManualContextUsesProviderRequestShellProvenance(t *testing.T) {
-	selection, err := Select(Context{OS: "linux", Shell: "/bin/bash"}, PolicyRemoteMinimal, nil)
+func TestContextPolicyWireAllPolicies(t *testing.T) {
+	inventory := fixtureInventory(map[string]capability.ToolFact{
+		"rg": {Name: "rg", Present: true, Path: "/fixture/bin/rg", Version: "14.1.0"},
+	})
+	context := Context{
+		WorkingDirectory: "/work",
+		GitRepository:    true,
+		GitRoot:          "/work",
+		GitBranch:        "dev",
+	}
+
+	local, err := Select(context, inventory, PolicyLocalOnly, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	field := selection.Capsule.Fields[1]
-	if field.Name != FieldShellFamily || field.Provenance != "provider-request" || field.Value != "bash" {
-		t.Fatalf("manual shell metadata = %+v, want provider-request provenance", field)
+	minimal, err := Select(context, inventory, PolicyRemoteMinimal, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicit, err := Select(context, inventory, PolicyRemoteExplicit, []string{FieldGitBranch, FieldWorkingDirectory})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	localJSON := marshalPayload(t, ProviderPayloadFor("intent", local))
+	if string(localJSON) != `{"intent":"intent"}` {
+		t.Fatalf("local-only payload = %s", localJSON)
+	}
+
+	contextJSON := `{"os_family":"linux","shell_family":"bash","project_kind":"git","platform_arch":"arm64","tools":` + expectedToolsJSON(map[string]string{"rg": "present:14.1.0"})
+	minimalJSON := marshalPayload(t, ProviderPayloadFor("intent", minimal))
+	wantMinimal := `{"intent":"intent","context":` + contextJSON + `}}`
+	if string(minimalJSON) != wantMinimal {
+		t.Fatalf("minimal body = %s, want %s", minimalJSON, wantMinimal)
+	}
+	assertToolWireOrder(t, minimalJSON)
+
+	explicitJSON := marshalPayload(t, ProviderPayloadFor("intent", explicit))
+	wantExplicit := `{"intent":"intent","context":` + contextJSON + `,"working_directory":"/work","git_branch":"dev"}}`
+	if string(explicitJSON) != wantExplicit {
+		t.Fatalf("explicit body = %s, want %s", explicitJSON, wantExplicit)
 	}
 }
 
-func TestSelectRemoteExplicitDedupeAndUnavailable(t *testing.T) {
-	fields, err := NormalizeExplicitFields([]string{FieldGitBranch, FieldWorkingDirectory, FieldGitBranch})
+func TestNormalizeExplicitFieldsCanonicalOrder(t *testing.T) {
+	fields, err := NormalizeExplicitFields([]string{FieldGitBranch, FieldWorkingDirectory, FieldGitRoot, FieldGitBranch})
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{FieldGitBranch, FieldWorkingDirectory}
+	want := []string{FieldWorkingDirectory, FieldGitRoot, FieldGitBranch}
 	if !reflect.DeepEqual(fields, want) {
 		t.Fatalf("fields = %v, want %v", fields, want)
 	}
-
-	selection, err := Select(Context{
-		OS: "linux", Shell: "bash", ShellProvenance: "SHELL", WorkingDirectory: "/work",
-		GitRepository: true, GitRoot: "/work",
-	}, PolicyRemoteExplicit, fields)
-	if err != nil {
-		t.Fatal(err)
-	}
-	byName := map[string]Field{}
-	for _, field := range selection.Capsule.Fields {
-		byName[field.Name] = field
-	}
-	if field := byName[FieldWorkingDirectory]; field.Sharing != SharingSelected || field.Reason != "approved by invocation-scoped remote-explicit allowlist" {
-		t.Fatalf("working directory = %+v", field)
-	}
-	if field := byName[FieldShellFamily]; field.Provenance != "SHELL" || field.Reason != "selected by remote-explicit baseline" {
-		t.Fatalf("shell family = %+v", field)
-	}
-	if field := byName[FieldGitRoot]; field.Sharing != SharingRedacted || field.Transformation != TransformationRedacted || field.Reason != "not approved by invocation-scoped remote-explicit allowlist" {
-		t.Fatalf("git root = %+v", field)
-	}
-	if field := byName[FieldGitBranch]; field.Sharing != SharingOmitted || field.Transformation != TransformationOmitted || field.Reason != "approved field unavailable from filesystem-git-HEAD" {
-		t.Fatalf("git branch = %+v", field)
-	}
-}
-
-func TestSelectLocalOnlyReasonsDistinguishRedactedAndOmitted(t *testing.T) {
-	selection, err := Select(Context{OS: "linux", Shell: "bash", ShellProvenance: "SHELL", WorkingDirectory: "/work"}, PolicyLocalOnly, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	byName := map[string]Field{}
-	for _, field := range selection.Capsule.Fields {
-		byName[field.Name] = field
-	}
-	if field := byName[FieldWorkingDirectory]; field.Sharing != SharingRedacted || field.Reason != "local-only policy prohibits context sharing" {
-		t.Fatalf("working directory = %+v", field)
-	}
-	if field := byName[FieldGitBranch]; field.Sharing != SharingOmitted || field.Reason != "field unavailable from filesystem-git-HEAD" {
-		t.Fatalf("git branch = %+v", field)
+	if _, err := NormalizeExplicitFields([]string{"hostname"}); err == nil {
+		t.Fatal("unknown explicit field accepted")
 	}
 }
 
 func TestSelectRejectsInvalidSharingCombinations(t *testing.T) {
-	if _, err := Select(Context{}, PolicyRemoteExplicit, nil); err == nil {
+	inventory := fixtureInventory(nil)
+	if _, err := Select(Context{}, inventory, PolicyRemoteExplicit, nil); err == nil {
 		t.Fatal("remote-explicit without fields accepted")
 	}
-	if _, err := Select(Context{}, PolicyRemoteMinimal, []string{FieldGitBranch}); err == nil {
+	if _, err := Select(Context{}, inventory, PolicyRemoteMinimal, []string{FieldGitBranch}); err == nil {
 		t.Fatal("remote-minimal with fields accepted")
 	}
-	if _, err := NormalizeExplicitFields([]string{"hostname"}); err == nil {
-		t.Fatal("unknown shared field accepted")
+}
+
+func fieldsByName(selection Selection) map[string]Field {
+	result := make(map[string]Field, len(selection.Capsule.Fields))
+	for _, field := range selection.Capsule.Fields {
+		result[field.Name] = field
 	}
+	return result
+}
+
+func marshalPayload(t *testing.T, payload ProviderPayload) []byte {
+	t.Helper()
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func expectedToolsJSON(present map[string]string) string {
+	var result strings.Builder
+	result.WriteByte('[')
+	for index, name := range capability.ToolNames() {
+		if index > 0 {
+			result.WriteByte(',')
+		}
+		status := present[name]
+		if status == "" {
+			status = "absent"
+		}
+		result.WriteString(`{"name":"` + name + `","status":"` + status + `"}`)
+	}
+	result.WriteByte(']')
+	return result.String()
+}
+
+func assertToolWireOrder(t *testing.T, data []byte) {
+	t.Helper()
+	previous := -1
+	for _, name := range capability.ToolNames() {
+		index := strings.Index(string(data), `{"name":"`+name+`","status":"`)
+		if index <= previous {
+			t.Fatalf("tool %q out of order in %s", name, data)
+		}
+		previous = index
+	}
+}
+
+// fixtureInventory builds a deterministic inventory through the capability
+// test seam so selection semantics are asserted without real subprocess
+// probes; probe execution itself is covered by internal/capability tests and
+// the controlled integration fixture.
+func fixtureInventory(present map[string]capability.ToolFact) capability.Inventory {
+	tools := make([]capability.ToolFact, 0, len(capability.ToolNames()))
+	for _, name := range capability.ToolNames() {
+		if fact, ok := present[name]; ok {
+			tools = append(tools, fact)
+			continue
+		}
+		tools = append(tools, capability.ToolFact{Name: name})
+	}
+	shell := capability.ShellIdentity{Family: capability.ShellBash, Path: "/bin/bash", Provenance: capability.ShellFromEnv}
+	return capability.NewFixtureInventory("linux", "arm64", shell, tools)
 }

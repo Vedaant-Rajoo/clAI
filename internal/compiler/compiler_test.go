@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Vedaant-Rajoo/clai/internal/capability"
 	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
 	"github.com/Vedaant-Rajoo/clai/internal/validate"
 )
@@ -130,6 +131,30 @@ func TestFixmeIntentSearchesForFixme(t *testing.T) {
 	}
 }
 
+func TestCompileAttachesKnownToolRequirements(t *testing.T) {
+	tests := []struct {
+		name    string
+		request Request
+		tool    string
+	}{
+		{"git", Request{Intent: "show status", Context: gitRepo}, "git"},
+		{"rg", Request{Intent: "show todo"}, "rg"},
+		{"lsof", Request{Intent: "open ports"}, "lsof"},
+		{"ifconfig", Request{Intent: "ip address"}, "ifconfig"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := Compile(tt.request)
+			if len(result.Requirements) != 1 || result.Requirements[0].Kind != capability.RequirementTool || result.Requirements[0].Name != tt.tool {
+				t.Fatalf("requirements = %+v, want tool %q", result.Requirements, tt.tool)
+			}
+		})
+	}
+	if result := Compile(Request{Intent: "where am i"}); len(result.Requirements) != 0 {
+		t.Fatalf("pwd requirements = %+v, want none", result.Requirements)
+	}
+}
+
 func TestGitDependentRulesOutsideRepositoryReturnNoSuggestion(t *testing.T) {
 	intents := []string{
 		"git status",
@@ -143,7 +168,7 @@ func TestGitDependentRulesOutsideRepositoryReturnNoSuggestion(t *testing.T) {
 	for _, intent := range intents {
 		t.Run(intent, func(t *testing.T) {
 			result := Compile(Request{Intent: intent, Context: noRepo})
-			if result != (Result{}) {
+			if result.Command != "" || result.Explanation != "" || len(result.Requirements) != 0 {
 				t.Fatalf("Compile(%q outside Git) = %+v, want empty no-suggestion result", intent, result)
 			}
 		})

@@ -1,5 +1,12 @@
 // Package shellsyntax parses a deliberately small, non-evaluating shell syntax
 // subset shared by Fish, Bash, and Zsh.
+//
+// Braces are handled by construct rather than by character. An empty pair is
+// literal text in all three shells and is ordinary word data, so idioms such as
+// `xargs -I{}` and `find -exec {} \;` parse; a pair occupying a command-dispatch
+// position is still rejected, because an executable name is not data. Brace
+// expansion changes word count and is dialect-divergent, and brace groups change
+// execution structure, so both stay outside the subset.
 package shellsyntax
 
 // Span is a half-open byte range in the original source.

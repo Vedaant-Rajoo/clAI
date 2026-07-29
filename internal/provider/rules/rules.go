@@ -3,6 +3,7 @@ package rules
 import (
 	"context"
 
+	"github.com/Vedaant-Rajoo/clai/internal/capability"
 	"github.com/Vedaant-Rajoo/clai/internal/compiler"
 	"github.com/Vedaant-Rajoo/clai/internal/provider"
 )
@@ -15,8 +16,9 @@ func (Provider) Compile(ctx context.Context, request provider.Request) ([]provid
 	}
 
 	result := compiler.Compile(compiler.Request{
-		Intent:  request.Intent,
-		Context: request.Context,
+		Intent:       request.Intent,
+		Context:      request.Context,
+		Capabilities: request.Capabilities,
 	})
 
 	if err := ctx.Err(); err != nil {
@@ -27,7 +29,8 @@ func (Provider) Compile(ctx context.Context, request provider.Request) ([]provid
 	}
 
 	return []provider.Candidate{{
-		Command:     result.Command,
-		Explanation: result.Explanation,
+		Command:      result.Command,
+		Explanation:  result.Explanation,
+		Requirements: append([]capability.Requirement(nil), result.Requirements...),
 	}}, nil
 }

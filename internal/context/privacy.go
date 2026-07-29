@@ -5,15 +5,14 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"path/filepath"
-	"runtime"
-	"sort"
 	"strings"
+
+	"github.com/Vedaant-Rajoo/clai/internal/capability"
 )
 
 const (
-	CapsuleVersion  = "context-capsule/v1"
-	SelectorVersion = "context-selector/v1"
+	CapsuleVersion  = "context-capsule/v2"
+	SelectorVersion = "context-selector/v2"
 )
 
 type Policy string
@@ -33,13 +32,7 @@ const (
 
 type Transformation string
 
-const (
-	TransformationRaw        Transformation = "raw"
-	TransformationNormalized Transformation = "normalized"
-	TransformationRedacted   Transformation = "redacted"
-	TransformationInferred   Transformation = "inferred"
-	TransformationOmitted    Transformation = "omitted"
-)
+const TransformationNormalized Transformation = "normalized"
 
 type SharingDecision string
 
@@ -53,26 +46,27 @@ const (
 	FieldOSFamily         = "os_family"
 	FieldShellFamily      = "shell_family"
 	FieldProjectKind      = "project_kind"
+	FieldPlatformArch     = "platform_arch"
 	FieldWorkingDirectory = "working_directory"
 	FieldGitRoot          = "git_root"
 	FieldGitBranch        = "git_branch"
 )
 
-var explicitFields = map[string]bool{
-	FieldWorkingDirectory: true,
-	FieldGitRoot:          true,
-	FieldGitBranch:        true,
+var explicitFieldOrder = [...]string{
+	FieldWorkingDirectory,
+	FieldGitRoot,
+	FieldGitBranch,
 }
 
 type Field struct {
 	Name           string          `json:"name"`
-	SchemaVersion  string          `json:"schema_version"`
 	Value          string          `json:"value,omitempty"`
-	Provenance     string          `json:"provenance"`
+	SchemaVersion  string          `json:"schema_version"`
+	Provenance     []string        `json:"provenance"`
 	Sensitivity    string          `json:"sensitivity"`
-	Freshness      string          `json:"freshness,omitempty"`
+	Freshness      string          `json:"freshness"`
 	Transformation Transformation  `json:"transformation"`
-	Sharing        SharingDecision `json:"sharing_decision"`
+	Sharing        SharingDecision `json:"sharing"`
 	Reason         string          `json:"reason"`
 }
 
@@ -86,6 +80,30 @@ type Selection struct {
 	Capsule Capsule
 }
 
+// ProviderContext is the deterministic provider wire representation of selected
+// context. Field order is contract-bearing because encoding/json preserves Go
+// struct field order.
+type ProviderContext struct {
+	OSFamily         string         `json:"os_family"`
+	ShellFamily      string         `json:"shell_family"`
+	ProjectKind      string         `json:"project_kind"`
+	PlatformArch     string         `json:"platform_arch"`
+	Tools            []ProviderTool `json:"tools"`
+	WorkingDirectory string         `json:"working_directory,omitempty"`
+	GitRoot          string         `json:"git_root,omitempty"`
+	GitBranch        string         `json:"git_branch,omitempty"`
+}
+
+type ProviderTool struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+}
+
+type ProviderPayload struct {
+	Intent  string           `json:"intent"`
+	Context *ProviderContext `json:"context,omitempty"`
+}
+
 func ParsePolicy(value string) (Policy, error) {
 	policy := Policy(value)
 	switch policy {
@@ -96,21 +114,29 @@ func ParsePolicy(value string) (Policy, error) {
 	}
 }
 
-func IsExplicitField(name string) bool { return explicitFields[name] }
-
-func NormalizeExplicitFields(fields []string) ([]string, error) {
-	seen := make(map[string]bool, len(fields))
-	result := make([]string, 0, len(fields))
-	for _, field := range fields {
-		if !IsExplicitField(field) {
-			return nil, fmt.Errorf("invalid shared context field %q (want working_directory, git_root, or git_branch)", field)
-		}
-		if !seen[field] {
-			seen[field] = true
-			result = append(result, field)
+func IsExplicitField(name string) bool {
+	for _, candidate := range explicitFieldOrder {
+		if name == candidate {
+			return true
 		}
 	}
-	sort.Strings(result)
+	return false
+}
+
+func NormalizeExplicitFields(fields []string) ([]string, error) {
+	selected := make(map[string]bool, len(fields))
+	for _, name := range fields {
+		if !IsExplicitField(name) {
+			return nil, fmt.Errorf("invalid shared context field %q (want working_directory, git_root, or git_branch)", name)
+		}
+		selected[name] = true
+	}
+	result := make([]string, 0, len(selected))
+	for _, name := range explicitFieldOrder {
+		if selected[name] {
+			result = append(result, name)
+		}
+	}
 	return result, nil
 }
 
@@ -139,7 +165,9 @@ func DefaultPolicy(localProvider bool, class EndpointClass) Policy {
 	return PolicyRemoteMinimal
 }
 
-func Select(c Context, policy Policy, shared []string) (Selection, error) {
+// Select applies context-selector/v2 to one collected machine context and the
+// immutable capability inventory for this process invocation.
+func Select(c Context, inventory capability.Inventory, policy Policy, shared []string) (Selection, error) {
 	if _, err := ParsePolicy(string(policy)); err != nil {
 		return Selection{}, err
 	}
@@ -148,116 +176,110 @@ func Select(c Context, policy Policy, shared []string) (Selection, error) {
 		return Selection{}, err
 	}
 	if policy == PolicyRemoteExplicit && len(shared) == 0 {
-		return Selection{}, fmt.Errorf("remote-explicit requires at least one shared context field")
+		return Selection{}, errors.New("remote-explicit requires at least one shared context field")
 	}
 	if policy != PolicyRemoteExplicit && len(shared) != 0 {
-		return Selection{}, fmt.Errorf("shared context fields require remote-explicit")
+		return Selection{}, errors.New("shared context fields require remote-explicit")
 	}
 
-	allowed := make(map[string]bool, len(shared)+3)
-	if policy != PolicyLocalOnly {
-		allowed[FieldOSFamily] = true
-		allowed[FieldShellFamily] = true
-		allowed[FieldProjectKind] = true
-	}
+	selectedExplicit := make(map[string]bool, len(shared))
 	for _, name := range shared {
-		allowed[name] = true
+		selectedExplicit[name] = true
 	}
 
-	values := []Field{
-		field(FieldOSFamily, normalizeOS(c.OS), "runtime.GOOS", "low", TransformationNormalized),
-		field(FieldShellFamily, normalizeShell(c.Shell), shellProvenance(c), "low", TransformationNormalized),
-		field(FieldProjectKind, projectKind(c), "filesystem-git-discovery", "low", TransformationInferred),
-		field(FieldWorkingDirectory, c.WorkingDirectory, "os.Getwd", "sensitive", TransformationRaw),
-		field(FieldGitRoot, c.GitRoot, "filesystem-git-root", "sensitive", TransformationRaw),
-		field(FieldGitBranch, c.GitBranch, "filesystem-git-HEAD", "sensitive", TransformationRaw),
+	fields := make([]Field, 0, 4+len(capability.ToolNames())+len(explicitFieldOrder))
+	baselineSelected := policy != PolicyLocalOnly
+	shell := inventory.Shell()
+	shellFamily := string(shell.Family)
+	if shellFamily == "" {
+		shellFamily = string(capability.ShellUnknown)
 	}
+	shellProvenance := string(shell.Provenance)
+	if shellProvenance == "" {
+		shellProvenance = string(capability.ShellFromEnv)
+	}
+	osFamily := inventory.OSFamily()
+	if osFamily == "" {
+		osFamily = "unknown"
+	}
+	arch := inventory.Arch()
+	if arch == "" {
+		arch = "unknown"
+	}
+	fields = append(fields,
+		newField(FieldOSFamily, osFamily, []string{"runtime.GOOS"}, baselineSelected, baselineReason(policy)),
+		newField(FieldShellFamily, shellFamily, []string{shellProvenance}, baselineSelected, baselineReason(policy)),
+		newField(FieldProjectKind, projectKind(c), []string{"filesystem"}, baselineSelected, baselineReason(policy)),
+		newField(FieldPlatformArch, arch, []string{"runtime.GOARCH"}, baselineSelected, baselineReason(policy)),
+	)
 
-	for i := range values {
-		f := &values[i]
-		if f.Value == "" {
-			f.Transformation = TransformationOmitted
-			f.Sharing = SharingOmitted
-			switch {
-			case policy == PolicyRemoteExplicit && allowed[f.Name] && IsExplicitField(f.Name):
-				f.Reason = "approved field unavailable from " + f.Provenance
-			case allowed[f.Name]:
-				f.Reason = "policy-selected field unavailable from " + f.Provenance
-			default:
-				f.Reason = "field unavailable from " + f.Provenance
+	for _, name := range capability.ToolNames() {
+		fact, found := inventory.LookupTool(name)
+		status := "absent"
+		provenance := []string{"exec.LookPath:" + name}
+		if found && fact.Present {
+			status = "present"
+			if fact.Version.Known() {
+				status += ":" + fact.Version.String()
+				provenance = append(provenance, "probe:"+name)
 			}
-			continue
 		}
-		if allowed[f.Name] {
-			f.Sharing = SharingSelected
-			switch {
-			case IsExplicitField(f.Name):
-				f.Reason = "approved by invocation-scoped remote-explicit allowlist"
-			case policy == PolicyRemoteExplicit:
-				f.Reason = "selected by remote-explicit baseline"
-			default:
-				f.Reason = "selected by remote-minimal baseline"
-			}
-			continue
-		}
-		f.Value = ""
-		f.Transformation = TransformationRedacted
-		f.Sharing = SharingRedacted
-		switch policy {
-		case PolicyLocalOnly:
-			f.Reason = "local-only policy prohibits context sharing"
-		case PolicyRemoteMinimal:
-			f.Reason = "not included by remote-minimal policy"
-		case PolicyRemoteExplicit:
-			f.Reason = "not approved by invocation-scoped remote-explicit allowlist"
-		}
+		fields = append(fields, newField("tool_"+name, status, provenance, baselineSelected, baselineReason(policy)))
 	}
 
-	return Selection{Policy: policy, Capsule: Capsule{Version: CapsuleVersion, Fields: values}}, nil
+	explicitValues := map[string]struct {
+		value      string
+		provenance []string
+	}{
+		FieldWorkingDirectory: {c.WorkingDirectory, []string{"filesystem"}},
+		FieldGitRoot:          {c.GitRoot, []string{"filesystem"}},
+		FieldGitBranch:        {c.GitBranch, []string{"filesystem"}},
+	}
+	for _, name := range explicitFieldOrder {
+		value := explicitValues[name]
+		selected := policy == PolicyRemoteExplicit && selectedExplicit[name] && value.value != ""
+		reason := "not selected by context policy"
+		if policy == PolicyRemoteExplicit && selectedExplicit[name] {
+			if value.value == "" {
+				reason = "selected field unavailable"
+			} else {
+				reason = "approved by invocation-scoped remote-explicit allowlist"
+			}
+		}
+		fields = append(fields, newField(name, value.value, value.provenance, selected, reason))
+	}
+
+	return Selection{Policy: policy, Capsule: Capsule{Version: CapsuleVersion, Fields: fields}}, nil
 }
 
-func field(name, value, provenance, sensitivity string, transformation Transformation) Field {
+func newField(name, value string, provenance []string, selected bool, reason string) Field {
+	sharing := SharingOmitted
+	if selected {
+		sharing = SharingSelected
+	} else {
+		value = ""
+	}
 	return Field{
-		Name: name, SchemaVersion: CapsuleVersion, Value: value,
-		Provenance: provenance, Sensitivity: sensitivity, Freshness: "request-time",
-		Transformation: transformation,
+		Name:           name,
+		Value:          value,
+		SchemaVersion:  CapsuleVersion,
+		Provenance:     append([]string(nil), provenance...),
+		Sensitivity:    "low",
+		Freshness:      "invocation",
+		Transformation: TransformationNormalized,
+		Sharing:        sharing,
+		Reason:         reason,
 	}
 }
 
-func normalizeOS(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	if value == "" {
-		value = runtime.GOOS
-	}
-	switch value {
-	case "darwin", "linux", "windows", "freebsd", "openbsd", "netbsd", "dragonfly", "solaris", "aix", "plan9":
-		return value
+func baselineReason(policy Policy) string {
+	switch policy {
+	case PolicyLocalOnly:
+		return "local-only policy omits provider context"
+	case PolicyRemoteExplicit:
+		return "selected by remote-explicit baseline"
 	default:
-		return "unknown"
-	}
-}
-
-func shellProvenance(c Context) string {
-	switch c.ShellProvenance {
-	case "widget-declared-shell", "SHELL":
-		return c.ShellProvenance
-	default:
-		return "provider-request"
-	}
-}
-
-func normalizeShell(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "unknown"
-	}
-	base := strings.ToLower(filepath.Base(value))
-	base = strings.TrimSuffix(base, ".exe")
-	switch base {
-	case "fish", "bash", "zsh":
-		return base
-	default:
-		return "unknown"
+		return "selected by remote-minimal baseline"
 	}
 }
 
@@ -269,4 +291,43 @@ func projectKind(c Context) string {
 		return "non-git"
 	}
 	return "unknown"
+}
+
+// ProviderPayloadFor converts a selection into the shared deterministic prompt
+// payload used by remote providers. local-only leaves Context nil so the JSON
+// member is omitted entirely.
+func ProviderPayloadFor(intent string, selection Selection) ProviderPayload {
+	payload := ProviderPayload{Intent: intent}
+	if selection.Policy == PolicyLocalOnly {
+		return payload
+	}
+
+	wire := &ProviderContext{Tools: make([]ProviderTool, 0, len(capability.ToolNames()))}
+	for _, field := range selection.Capsule.Fields {
+		if field.Sharing != SharingSelected {
+			continue
+		}
+		switch field.Name {
+		case FieldOSFamily:
+			wire.OSFamily = field.Value
+		case FieldShellFamily:
+			wire.ShellFamily = field.Value
+		case FieldProjectKind:
+			wire.ProjectKind = field.Value
+		case FieldPlatformArch:
+			wire.PlatformArch = field.Value
+		case FieldWorkingDirectory:
+			wire.WorkingDirectory = field.Value
+		case FieldGitRoot:
+			wire.GitRoot = field.Value
+		case FieldGitBranch:
+			wire.GitBranch = field.Value
+		default:
+			if name, ok := strings.CutPrefix(field.Name, "tool_"); ok {
+				wire.Tools = append(wire.Tools, ProviderTool{Name: name, Status: field.Value})
+			}
+		}
+	}
+	payload.Context = wire
+	return payload
 }

@@ -6,12 +6,15 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/Vedaant-Rajoo/clai/internal/app"
+	"github.com/Vedaant-Rajoo/clai/internal/applicability"
 	"github.com/Vedaant-Rajoo/clai/internal/auth"
+	"github.com/Vedaant-Rajoo/clai/internal/capability"
 	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
 	"github.com/Vedaant-Rajoo/clai/internal/provider"
 	"github.com/Vedaant-Rajoo/clai/internal/provider/anthropic"
@@ -19,6 +22,7 @@ import (
 	"github.com/Vedaant-Rajoo/clai/internal/provider/rules"
 	"github.com/Vedaant-Rajoo/clai/internal/safety"
 	"github.com/Vedaant-Rajoo/clai/internal/shellinit"
+	"github.com/Vedaant-Rajoo/clai/internal/textsafe"
 	"github.com/Vedaant-Rajoo/clai/internal/validate"
 	"github.com/atotto/clipboard"
 	tea "github.com/charmbracelet/bubbletea"
@@ -138,7 +142,27 @@ func (c cli) runInteractive(args []string) int {
 		return exitUsage
 	}
 
-	policy, sharedFields, err := f.contextOptions()
+	// Go's flag package stops at the first non-flag argument, so a trailing
+	// positional would otherwise be silently ignored and start the TUI. A
+	// trailing help request is honored; anything else is a usage error, matching
+	// the widget command's stricter handling.
+	if fs.NArg() != 0 {
+		if fs.NArg() == 1 && isHelpArg(fs.Arg(0)) {
+			printMainHelp(c.stdout)
+			return exitOK
+		}
+		fmt.Fprintf(c.stderr, "clai: unexpected argument %q\nRun 'clai help' for usage.\n", fs.Arg(0))
+		return exitUsage
+	}
+
+	// The endpoint is validated first because the context policy defaults on
+	// endpoint classification (REQ-CONTEXT-003, REQ-DEVENDPOINT-004).
+	devEndpoint, err := f.devEndpointOption()
+	if err != nil {
+		fmt.Fprintf(c.stderr, "clai: %v\nRun 'clai help' for usage.\n", err)
+		return exitUsage
+	}
+	policy, sharedFields, err := f.contextOptions(devEndpoint)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai: %v\nRun 'clai help' for usage.\n", err)
 		return exitUsage
@@ -148,29 +172,30 @@ func (c cli) runInteractive(args []string) int {
 		fmt.Fprintln(c.stdout, version)
 		return exitOK
 	}
-	p, err := selectProvider(*f.providerName, *f.model, *f.apiKey, *f.fallbackRules, policy, sharedFields)
+	p, err := selectProvider(*f.providerName, *f.model, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai: %v\n", err)
 		return exitError
 	}
 
-	command, accepted, err := executeTUI(p, "")
+	inventory := capability.NewCached("")
+	outcome, err := executeTUI(p, inventory, "", devEndpoint)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai: %v\n", err)
 		return exitError
 	}
-	if !accepted {
+	if !outcome.Accepted {
 		return exitOK
 	}
 
 	if *f.copyCommand {
-		if err := clipboard.WriteAll(command); err != nil {
+		if err := clipboard.WriteAll(outcome.Command); err != nil {
 			fmt.Fprintf(c.stderr, "clai: copy command: %v\n", err)
 			return exitError
 		}
 	}
 	if *f.printCommand {
-		fmt.Fprintln(c.stdout, command)
+		fmt.Fprintln(c.stdout, outcome.Command)
 	}
 	return exitOK
 }
@@ -193,7 +218,16 @@ func (c cli) runWidget(args []string) int {
 		fmt.Fprintln(c.stderr, "usage: clai widget --shell <fish|bash|zsh> --result-file <path>\nRun 'clai widget help' for usage.")
 		return exitUsage
 	}
-	policy, sharedFields, err := f.contextOptions()
+	// Validate every usage error together, before touching the result file or
+	// constructing a provider (REQ-DEVENDPOINT-002). The endpoint comes first
+	// because the context policy defaults on its classification
+	// (REQ-CONTEXT-003, REQ-DEVENDPOINT-004).
+	devEndpoint, err := f.devEndpointOption()
+	if err != nil {
+		fmt.Fprintf(c.stderr, "clai widget: %v\nRun 'clai widget help' for usage.\n", err)
+		return exitUsage
+	}
+	policy, sharedFields, err := f.contextOptions(devEndpoint)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai widget: %v\nRun 'clai widget help' for usage.\n", err)
 		return exitUsage
@@ -210,39 +244,58 @@ func (c cli) runWidget(args []string) int {
 		}
 	}()
 
-	p, err := selectProvider(*f.providerName, *f.model, *f.apiKey, *f.fallbackRules, policy, sharedFields)
+	p, err := selectProvider(*f.providerName, *f.model, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai widget: %v\n", err)
 		return exitError
 	}
 
-	command, accepted, err := executeTUI(p, *f.shell)
+	inventory := capability.NewCached(*f.shell)
+	outcome, err := executeTUI(p, inventory, *f.shell, devEndpoint)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai widget: %v\n", err)
 		return exitError
 	}
-	if !accepted {
+	if !outcome.Accepted {
 		return exitCancelled
 	}
 	// Transport boundary revalidation (REQ-INVARIANT-008): re-check the exact
-	// bytes about to be exported against both the structural gate
-	// (REQ-INVARIANT-003) and the safety gate (REQ-INVARIANT-004) independently
-	// of the TUI's in-model acceptance gating, so a blocked or invalid command
-	// can never reach widget transport even if the interactive gate regresses.
-	if result := validate.Command(command); !result.Valid {
-		fmt.Fprintf(c.stderr, "clai widget: accepted command is not exportable: %s\n", strings.Join(result.Reasons, " "))
+	// bytes about to be exported against structural, safety, file-identity, and
+	// applicability gates independently of the TUI review decision.
+	if result := validate.Command(outcome.Command); !result.Valid {
+		fmt.Fprintf(c.stderr, "clai widget: accepted command is not exportable: %s\n", textsafe.Visible(strings.Join(result.Reasons, " ")))
 		return exitError
 	}
-	if decision := safety.Evaluate(command); decision.Decision == safety.Block {
-		fmt.Fprintf(c.stderr, "clai widget: accepted command is blocked by safety and not exportable: %s\n", strings.Join(decision.Reasons, " "))
+	if decision := safety.Evaluate(outcome.Command); decision.Decision == safety.Block {
+		fmt.Fprintf(c.stderr, "clai widget: accepted command is blocked by safety and not exportable: %s\n", textsafe.Visible(strings.Join(decision.Reasons, " ")))
 		return exitError
 	}
-	if err := writeWidgetResult(*f.resultFile, command, resultIdentity); err != nil {
+	if err := verifyWidgetResult(*f.resultFile, resultIdentity); err != nil {
+		fmt.Fprintf(c.stderr, "clai widget: write result: %v\n", err)
+		return exitError
+	}
+	appResult := widgetApplicability(outcome, inventory.Inventory(context.Background()))
+	if appResult.Decision == applicability.Rejected {
+		fmt.Fprintf(c.stderr, "clai widget: accepted command is not for this shell/OS: %s\n", textsafe.Visible(strings.Join(appResult.Reasons, " ")))
+		return exitError
+	}
+	if err := writeWidgetResult(*f.resultFile, outcome.Command, resultIdentity); err != nil {
 		fmt.Fprintf(c.stderr, "clai widget: write result: %v\n", err)
 		return exitError
 	}
 	keepResult = true
 	return exitOK
+}
+
+// widgetApplicability is the fresh transport-boundary applicability decision.
+// The Edited discriminator selects the branch: an unedited outcome reevaluates
+// the transported candidate requirements, an edited outcome rederives
+// executables from the accepted command bytes and ignores those requirements.
+func widgetApplicability(outcome app.Outcome, snapshot capability.Inventory) applicability.Result {
+	if outcome.Edited {
+		return applicability.EvaluateEdited(outcome.Command, snapshot)
+	}
+	return applicability.Evaluate(outcome.Requirements, snapshot)
 }
 
 // providerFlags holds the flags shared by the interactive and widget commands.
@@ -253,6 +306,7 @@ type providerFlags struct {
 	fallbackRules *bool
 	contextPolicy *contextPolicyFlag
 	sharedContext *sharedContextFlag
+	devEndpoint   *string
 }
 
 type contextPolicyFlag struct {
@@ -297,10 +351,45 @@ func registerProviderFlags(fs *flag.FlagSet) providerFlags {
 		fallbackRules: fs.Bool("fallback-rules", false, "fall back to local rules when the selected provider errors"),
 		contextPolicy: policy,
 		sharedContext: shared,
+		devEndpoint:   fs.String("dev-endpoint", "", "development only: send provider requests to a loopback endpoint"),
 	}
 }
 
-func (f providerFlags) contextOptions() (machinecontext.Policy, []string, error) {
+// devEndpointOption validates the loopback-only development override
+// (REQ-DEVENDPOINT-002/003). Every rejection happens here, before provider
+// construction, credential resolution, DNS, or network activity. Classification
+// is lexical, so a hostname that merely resolves to loopback is rejected.
+func (f providerFlags) devEndpointOption() (string, error) {
+	endpoint := strings.TrimSpace(*f.devEndpoint)
+	if endpoint == "" {
+		return "", nil
+	}
+	switch *f.providerName {
+	case "openrouter", "anthropic":
+	default:
+		return "", fmt.Errorf("--dev-endpoint is not valid for provider %q; it applies only to openrouter and anthropic", *f.providerName)
+	}
+	class, err := machinecontext.ClassifyEndpoint(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("invalid --dev-endpoint: %w", err)
+	}
+	// ClassifyEndpoint accepts any non-empty scheme; the transport only speaks
+	// HTTP, so restrict it here rather than failing later inside the provider.
+	if parsed, err := url.Parse(endpoint); err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", fmt.Errorf("--dev-endpoint must use http or https, got %q", endpoint)
+	}
+	if class != machinecontext.EndpointLoopback {
+		return "", fmt.Errorf("--dev-endpoint must address a loopback host, got %q", endpoint)
+	}
+	return endpoint, nil
+}
+
+// contextOptions resolves the effective context policy and shared fields.
+// devEndpoint is the already-validated loopback development endpoint, or empty
+// for a normal session; it is required here because REQ-CONTEXT-003 defaults on
+// endpoint classification, and a loopback development endpoint must default to
+// local-only exactly as any other loopback provider does (REQ-DEVENDPOINT-004).
+func (f providerFlags) contextOptions(devEndpoint string) (machinecontext.Policy, []string, error) {
 	shared, err := machinecontext.NormalizeExplicitFields(f.sharedContext.values)
 	if err != nil {
 		return "", nil, err
@@ -310,11 +399,12 @@ func (f providerFlags) contextOptions() (machinecontext.Policy, []string, error)
 		if len(shared) != 0 {
 			return "", nil, errors.New("--share-context requires an explicit --context-policy remote-explicit in the same invocation")
 		}
-		switch *f.providerName {
-		case "openrouter", "anthropic":
-			policy = machinecontext.PolicyRemoteMinimal
-		default:
-			policy = machinecontext.PolicyLocalOnly
+		policy = machinecontext.PolicyLocalOnly
+		if devEndpoint == "" {
+			switch *f.providerName {
+			case "openrouter", "anthropic":
+				policy = machinecontext.PolicyRemoteMinimal
+			}
 		}
 	}
 	if policy == machinecontext.PolicyRemoteExplicit {
@@ -359,15 +449,14 @@ func registerWidgetFlags(fs *flag.FlagSet) widgetFlags {
 	}
 }
 
-func runTUI(p provider.Provider, activeShell string) (string, bool, error) {
-	model := app.NewWithProvider(p)
+func runTUI(p provider.Provider, inventory *capability.Cached, activeShell, devEndpoint string) (app.Outcome, error) {
+	model := app.NewFromDeps(app.Deps{Provider: p, ActiveShell: activeShell, InventorySource: inventory, DevEndpoint: devEndpoint})
 	options := []tea.ProgramOption{tea.WithOutput(os.Stderr), tea.WithAltScreen()}
 	if activeShell != "" {
-		model = app.NewWithProviderAndShell(p, activeShell)
 
 		tty, err := openControllingTerminal()
 		if err != nil {
-			return "", false, fmt.Errorf("open controlling terminal: %w", err)
+			return app.Outcome{}, fmt.Errorf("open controlling terminal: %w", err)
 		}
 		defer tty.Close()
 		options = []tea.ProgramOption{tea.WithInput(tty), tea.WithOutput(tty), tea.WithAltScreen()}
@@ -376,14 +465,14 @@ func runTUI(p provider.Provider, activeShell string) (string, bool, error) {
 	program := tea.NewProgram(model, options...)
 	finalModel, err := program.Run()
 	if err != nil {
-		return "", false, err
+		return app.Outcome{}, err
 	}
 
 	result, ok := finalModel.(app.Model)
-	if !ok || !result.Accepted() {
-		return "", false, nil
+	if !ok {
+		return app.Outcome{}, nil
 	}
-	return result.Command(), true, nil
+	return result.Outcome(), nil
 }
 
 func validShell(shell string) bool {
@@ -425,6 +514,17 @@ func removeWidgetResultIfSame(path string, expected os.FileInfo) {
 		return
 	}
 	_ = os.Remove(path)
+}
+
+func verifyWidgetResult(path string, expected os.FileInfo) error {
+	before, err := inspectWidgetResult(path)
+	if err != nil {
+		return err
+	}
+	if expected == nil || !os.SameFile(expected, before) {
+		return errors.New("result file changed while the TUI was open")
+	}
+	return nil
 }
 
 func writeWidgetResult(path, command string, expected os.FileInfo) error {
@@ -485,7 +585,7 @@ func (f fallback) Compile(ctx context.Context, request provider.Request) ([]prov
 	return rules.Provider{}.Compile(ctx, request)
 }
 
-func selectProvider(name, model, apiKey string, fallbackRules bool, policy machinecontext.Policy, sharedFields []string) (provider.Provider, error) {
+func selectProvider(name, model, apiKey string, fallbackRules bool, policy machinecontext.Policy, sharedFields []string, devEndpoint string) (provider.Provider, error) {
 	switch name {
 	case "rules", "":
 		return rules.Provider{}, nil
@@ -494,7 +594,7 @@ func selectProvider(name, model, apiKey string, fallbackRules bool, policy machi
 		if err != nil {
 			return nil, err
 		}
-		var p provider.Provider = openrouter.Provider{APIKey: key, Model: model, Policy: policy, SharedFields: sharedFields}
+		var p provider.Provider = openrouter.Provider{APIKey: key, Model: model, Policy: policy, SharedFields: sharedFields, DevEndpoint: devEndpoint}
 		if fallbackRules {
 			p = fallback{primary: p}
 		}
@@ -504,7 +604,7 @@ func selectProvider(name, model, apiKey string, fallbackRules bool, policy machi
 		if err != nil {
 			return nil, err
 		}
-		var p provider.Provider = anthropic.Provider{APIKey: key, Model: model, Policy: policy, SharedFields: sharedFields}
+		var p provider.Provider = anthropic.Provider{APIKey: key, Model: model, Policy: policy, SharedFields: sharedFields, DevEndpoint: devEndpoint}
 		if fallbackRules {
 			p = fallback{primary: p}
 		}

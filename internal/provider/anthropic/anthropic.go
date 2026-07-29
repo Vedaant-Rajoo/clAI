@@ -81,45 +81,38 @@ var (
 	defaultReceiptSink = func(provider.RequestReceipt) {}
 )
 
-const systemPrompt = `You convert a natural-language intent into a single shell command.
+const systemPrompt = `You convert a natural-language intent into a single shell command candidate.
 
 Rules:
+- Return one candidate/v2 object with command, explanation, and optional requirements.
+- requirements contains zero to eight actual dependencies using kind tool, shell, or os and lowercase ASCII names.
+- min_version is optional and valid only for tool requirements as a numeric dotted version.
 - The command must be a single line, safe to paste into the user's shell.
-- The explanation is one short sentence saying why this command fits.
-- Use only the environment context included in the user message.`
+- The command must stay inside the shell syntax subset shared by Fish, Bash, and Zsh. Allowed: plain words, single and double quotes, backslash escapes, leading NAME=value assignments, the env and command wrappers, ; && || and | to combine commands, input/output/append redirects, and the literal brace pair {} as used by xargs -I{} and find -exec {} \;.
+- Never use command substitution $(...) or backticks, parameter expansion such as $VAR or ${VAR}, brace expansion such as {a,b} or {1..3}, brace groups { ...; }, subshells ( ... ), comments, here-documents, background &, or passing a command string to a shell with -c. A command using any of these is rejected before the user can accept it, so choose a formulation that avoids them.
+- The explanation is one short sentence saying why this command fits the supplied capability facts.
+- Use only the normalized capability and environment facts included in the user message; never infer executable paths or raw probe output.
+- Declare requirements that the command actually depends on.`
 
 // Provider compiles an intent into one candidate via Anthropic's Messages API.
 //
-// Only the four exported fields are set by CLI construction. The remaining seams
-// are unexported and exist for deterministic tests: an alternate base transport,
-// base URL, timeout, and a receipt sink.
+// CLI construction sets the exported fields. DevEndpoint is the loopback-only
+// development override (REQ-DEVENDPOINT-001..004): the CLI validates it is
+// lexically loopback before constructing the provider, and it replaces the
+// pinned production base URL so the full request path stays exercised. The
+// remaining seams are unexported and exist for deterministic tests: an alternate
+// base transport, base URL, timeout, and a receipt sink.
 type Provider struct {
 	APIKey       string
 	Model        string
 	Policy       machinecontext.Policy
 	SharedFields []string
+	DevEndpoint  string
 
 	baseURL     string
 	timeout     time.Duration
 	transport   http.RoundTripper
 	receiptSink func(provider.RequestReceipt)
-}
-
-// promptContext mirrors the OpenRouter prompt semantics: only the context
-// fields the policy selected are ever populated. It is intentionally not the
-// OpenRouter wire envelope — the SDK owns the Messages request shape.
-type promptContext struct {
-	OSFamily         string `json:"os_family,omitempty"`
-	ShellFamily      string `json:"shell_family,omitempty"`
-	ProjectKind      string `json:"project_kind,omitempty"`
-	WorkingDirectory string `json:"working_directory,omitempty"`
-	GitRoot          string `json:"git_root,omitempty"`
-	GitBranch        string `json:"git_branch,omitempty"`
-}
-
-type promptPayload struct {
-	Intent  string        `json:"intent"`
-	Context promptContext `json:"context"`
 }
 
 // streamLifecycle validates the Anthropic SSE message/block lifecycle separately
@@ -188,7 +181,14 @@ func (p Provider) Compile(ctx context.Context, request provider.Request) ([]prov
 		return nil, err
 	}
 
+	// Precedence: the unexported test seam, then the loopback-gated development
+	// override, then the pinned production endpoint. Both overrides are still
+	// classified lexically below, so neither can reach a remote host under a
+	// local-only policy or carry userinfo credentials.
 	baseURL := p.baseURL
+	if baseURL == "" {
+		baseURL = p.DevEndpoint
+	}
 	if baseURL == "" {
 		baseURL = defaultEndpoint
 	}
@@ -203,7 +203,7 @@ func (p Provider) Compile(ctx context.Context, request provider.Request) ([]prov
 	if policy == machinecontext.PolicyLocalOnly && class == machinecontext.EndpointRemote {
 		return nil, errors.New("anthropic: local-only context policy prohibits a remote endpoint")
 	}
-	selection, err := machinecontext.Select(request.Context, policy, p.SharedFields)
+	selection, err := machinecontext.Select(request.Context, request.Capabilities, policy, p.SharedFields)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: context policy: %w", err)
 	}
@@ -338,27 +338,7 @@ func (p Provider) Compile(ctx context.Context, request provider.Request) ([]prov
 // buildUserContent marshals the intent plus only the policy-selected context
 // fields into the user message text.
 func buildUserContent(intent string, selection machinecontext.Selection) ([]byte, error) {
-	values := promptContext{}
-	for _, field := range selection.Capsule.Fields {
-		if field.Sharing != machinecontext.SharingSelected {
-			continue
-		}
-		switch field.Name {
-		case machinecontext.FieldOSFamily:
-			values.OSFamily = field.Value
-		case machinecontext.FieldShellFamily:
-			values.ShellFamily = field.Value
-		case machinecontext.FieldProjectKind:
-			values.ProjectKind = field.Value
-		case machinecontext.FieldWorkingDirectory:
-			values.WorkingDirectory = field.Value
-		case machinecontext.FieldGitRoot:
-			values.GitRoot = field.Value
-		case machinecontext.FieldGitBranch:
-			values.GitBranch = field.Value
-		}
-	}
-	return json.Marshal(promptPayload{Intent: intent, Context: values})
+	return json.Marshal(machinecontext.ProviderPayloadFor(intent, selection))
 }
 
 // classifyStopReason maps the final stop reason to success or a fail-closed

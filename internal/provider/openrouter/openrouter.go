@@ -17,6 +17,7 @@ import (
 
 	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
 	"github.com/Vedaant-Rajoo/clai/internal/provider"
+	"github.com/Vedaant-Rajoo/clai/internal/provider/candidatejson"
 	"github.com/Vedaant-Rajoo/clai/internal/textsafe"
 )
 
@@ -49,20 +50,30 @@ var (
 	ErrServer = errors.New("openrouter: upstream server error")
 )
 
-const systemPrompt = `You convert a natural-language intent into a single shell command.
+const systemPrompt = `You convert a natural-language intent into a single shell command candidate.
 
 Rules:
-- Reply with ONLY a JSON object: {"command": "...", "explanation": "..."}.
+- Reply with ONLY one candidate/v2 JSON object containing command, explanation, and optional requirements.
+- requirements is an array of zero to eight objects with kind tool, shell, or os; name must be lowercase ASCII using only a-z, 0-9, dot, underscore, or hyphen.
+- min_version is optional and may be used only for a tool requirement as a numeric dotted version.
 - The command must be a single line, safe to paste into the user's shell.
-- The explanation is one short sentence saying why this command fits.
-- Never include markdown fences or extra prose.
-- Use only the environment context included in the user message.`
+- The command must stay inside the shell syntax subset shared by Fish, Bash, and Zsh. Allowed: plain words, single and double quotes, backslash escapes, leading NAME=value assignments, the env and command wrappers, ; && || and | to combine commands, input/output/append redirects, and the literal brace pair {} as used by xargs -I{} and find -exec {} \;.
+- Never use command substitution $(...) or backticks, parameter expansion such as $VAR or ${VAR}, brace expansion such as {a,b} or {1..3}, brace groups { ...; }, subshells ( ... ), comments, here-documents, background &, or passing a command string to a shell with -c. A command using any of these is rejected before the user can accept it, so choose a formulation that avoids them.
+- The explanation is one short sentence saying why this command fits the supplied capability facts.
+- Use only the normalized capability and environment facts included in the user message; never infer executable paths or raw probe output.
+- Declare requirements that the command actually depends on.
+- Never include markdown fences or extra prose.`
 
+// Provider compiles an intent into candidates via OpenRouter's chat-completions
+// API. DevEndpoint is the loopback-only development override
+// (REQ-DEVENDPOINT-001..004); the CLI validates it is lexically loopback before
+// constructing the provider. The unexported seams remain test-only.
 type Provider struct {
 	APIKey       string
 	Model        string
 	Policy       machinecontext.Policy
 	SharedFields []string
+	DevEndpoint  string
 
 	endpoint    string
 	timeout     time.Duration
@@ -88,26 +99,18 @@ type message struct {
 	Content string `json:"content"`
 }
 
-type promptContext struct {
-	OSFamily         string `json:"os_family,omitempty"`
-	ShellFamily      string `json:"shell_family,omitempty"`
-	ProjectKind      string `json:"project_kind,omitempty"`
-	WorkingDirectory string `json:"working_directory,omitempty"`
-	GitRoot          string `json:"git_root,omitempty"`
-	GitBranch        string `json:"git_branch,omitempty"`
-}
-
-type promptPayload struct {
-	Intent  string        `json:"intent"`
-	Context promptContext `json:"context"`
-}
-
 func (p Provider) Compile(ctx context.Context, request provider.Request) ([]provider.Candidate, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
+	// Precedence: the unexported test seam, then the loopback-gated development
+	// override, then the pinned production endpoint. Both overrides are still
+	// classified lexically below.
 	endpoint := p.endpoint
+	if endpoint == "" {
+		endpoint = p.DevEndpoint
+	}
 	if endpoint == "" {
 		endpoint = defaultEndpoint
 	}
@@ -122,7 +125,7 @@ func (p Provider) Compile(ctx context.Context, request provider.Request) ([]prov
 	if policy == machinecontext.PolicyLocalOnly && class == machinecontext.EndpointRemote {
 		return nil, errors.New("openrouter: local-only context policy prohibits a remote endpoint")
 	}
-	selection, err := machinecontext.Select(request.Context, policy, p.SharedFields)
+	selection, err := machinecontext.Select(request.Context, request.Capabilities, policy, p.SharedFields)
 	if err != nil {
 		return nil, fmt.Errorf("openrouter: context policy: %w", err)
 	}
@@ -189,27 +192,7 @@ func (p Provider) Compile(ctx context.Context, request provider.Request) ([]prov
 }
 
 func buildRequestBody(model, intent string, selection machinecontext.Selection) ([]byte, error) {
-	contextValues := promptContext{}
-	for _, field := range selection.Capsule.Fields {
-		if field.Sharing != machinecontext.SharingSelected {
-			continue
-		}
-		switch field.Name {
-		case machinecontext.FieldOSFamily:
-			contextValues.OSFamily = field.Value
-		case machinecontext.FieldShellFamily:
-			contextValues.ShellFamily = field.Value
-		case machinecontext.FieldProjectKind:
-			contextValues.ProjectKind = field.Value
-		case machinecontext.FieldWorkingDirectory:
-			contextValues.WorkingDirectory = field.Value
-		case machinecontext.FieldGitRoot:
-			contextValues.GitRoot = field.Value
-		case machinecontext.FieldGitBranch:
-			contextValues.GitBranch = field.Value
-		}
-	}
-	payloadBytes, err := json.Marshal(promptPayload{Intent: intent, Context: contextValues})
+	payloadBytes, err := json.Marshal(machinecontext.ProviderPayloadFor(intent, selection))
 	if err != nil {
 		return nil, err
 	}
@@ -345,21 +328,15 @@ func responseContent(body []byte) (string, error) {
 
 func parseCandidate(raw string) (provider.Candidate, error) {
 	trimmed := strings.TrimSpace(raw)
-	// Tolerate markdown fences despite the prompt forbidding them.
-	trimmed = strings.TrimPrefix(trimmed, "```json")
-	trimmed = strings.TrimPrefix(trimmed, "```")
-	trimmed = strings.TrimSuffix(trimmed, "```")
-	trimmed = strings.TrimSpace(trimmed)
-
-	var parsed struct {
-		Command     string `json:"command"`
-		Explanation string `json:"explanation"`
+	for _, prefix := range []string{"```json\n", "```\n"} {
+		if strings.HasPrefix(trimmed, prefix) && strings.HasSuffix(trimmed, "\n```") {
+			trimmed = strings.TrimSuffix(strings.TrimPrefix(trimmed, prefix), "\n```")
+			break
+		}
 	}
-	if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil {
+	candidate, err := candidatejson.Decode([]byte(trimmed))
+	if err != nil {
 		return provider.Candidate{}, fmt.Errorf("openrouter: parse response: %w", err)
 	}
-	if parsed.Command == "" {
-		return provider.Candidate{}, errors.New("openrouter: response contained no command")
-	}
-	return provider.Candidate{Command: parsed.Command, Explanation: parsed.Explanation}, nil
+	return candidate, nil
 }

@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Vedaant-Rajoo/clai/internal/applicability"
+	"github.com/Vedaant-Rajoo/clai/internal/capability"
 	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
 	"github.com/Vedaant-Rajoo/clai/internal/provider"
 	tea "github.com/charmbracelet/bubbletea"
@@ -20,6 +22,14 @@ type stubProvider struct {
 
 func (s stubProvider) Compile(context.Context, provider.Request) ([]provider.Candidate, error) {
 	return s.candidates, s.err
+}
+
+type staticInventorySource struct {
+	inventory capability.Inventory
+}
+
+func (source staticInventorySource) Inventory(context.Context) capability.Inventory {
+	return source.inventory
 }
 
 type recordingProvider struct {
@@ -948,4 +958,353 @@ func TestAnthropicTransportOnlyNoPartialCandidate(t *testing.T) {
 	t.Run("LateResultAfterEscapeNotReviewedOrExported", TestEscapeBeforeResultPreventsLateCandidateReviewOrExport)
 	t.Run("SupersededResultIgnored", TestStaleResultFromSupersededRequestIsIgnored)
 	t.Run("ResizeDuringLoadingKeepsRequestAlive", TestResizeDuringLoadingKeepsRequestAlive)
+}
+
+func TestApplicabilityIndependentThirdGate(t *testing.T) {
+	candidate := provider.Candidate{
+		Command:     "pwd",
+		Explanation: "current directory",
+		Requirements: []capability.Requirement{{
+			Kind: capability.RequirementShell,
+			Name: "fish",
+		}},
+	}
+	model := submitIntent(t, NewFromDeps(Deps{
+		Provider:        stubProvider{candidates: []provider.Candidate{candidate}},
+		InventorySource: staticInventorySource{},
+	}), "where am i")
+	if !model.validation.Valid || model.safety.Decision != "allow" {
+		t.Fatalf("precondition gates = validation %+v safety %+v", model.validation, model.safety)
+	}
+	if model.applicability.Decision != applicability.Rejected {
+		t.Fatalf("applicability = %+v, want hard rejection", model.applicability)
+	}
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if updated.(Model).Accepted() {
+		t.Fatal("hard applicability rejection was accepted")
+	}
+}
+
+// TestDevEndpointLabelledOnCandidateScreens proves a loopback development
+// session is visibly labelled with the effective endpoint before any color
+// styling, on every screen that can display a candidate, and that a normal
+// session carries no such label (REQ-DEVENDPOINT-005, REQ-ACCEPT-DEVENDPOINT-003).
+func TestDevEndpointLabelledOnCandidateScreens(t *testing.T) {
+	const endpoint = "http://127.0.0.1:8747"
+	candidate := provider.Candidate{Command: "pwd", Explanation: "current directory"}
+	deps := Deps{
+		Provider:        stubProvider{candidates: []provider.Candidate{candidate}},
+		InventorySource: staticInventorySource{},
+		DevEndpoint:     endpoint,
+	}
+	model := submitIntent(t, NewFromDeps(deps), "where am i")
+	for _, want := range []string{"DEV ENDPOINT", endpoint, "not the real provider"} {
+		if view := model.View(); !strings.Contains(view, want) {
+			t.Fatalf("review view missing %q: %q", want, view)
+		}
+	}
+
+	edit, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	if view := edit.(Model).View(); !strings.Contains(view, "DEV ENDPOINT") {
+		t.Fatalf("edit view missing the development label: %q", view)
+	}
+
+	none := submitIntent(t, NewFromDeps(Deps{
+		Provider:        stubProvider{},
+		InventorySource: staticInventorySource{},
+		DevEndpoint:     endpoint,
+	}), "nothing matches")
+	if none.screen != screenNoSuggestion {
+		t.Fatalf("screen = %v, want no-suggestion", none.screen)
+	}
+	if view := none.View(); !strings.Contains(view, "DEV ENDPOINT") {
+		t.Fatalf("no-suggestion view missing the development label: %q", view)
+	}
+
+	production := submitIntent(t, NewFromDeps(Deps{
+		Provider:        stubProvider{candidates: []provider.Candidate{candidate}},
+		InventorySource: staticInventorySource{},
+	}), "where am i")
+	if view := production.View(); strings.Contains(view, "DEV ENDPOINT") {
+		t.Fatalf("production session was labelled as a development one: %q", view)
+	}
+}
+
+// TestDevEndpointLabelSanitizedAndSurvivesNarrowTerminal proves the label is
+// terminal-control sanitized and is not dropped when the review must collapse
+// optional sections to fit.
+func TestDevEndpointLabelSanitizedAndSurvivesNarrowTerminal(t *testing.T) {
+	model := submitIntent(t, NewFromDeps(Deps{
+		Provider:        stubProvider{candidates: []provider.Candidate{{Command: "pwd", Explanation: "why"}}},
+		InventorySource: staticInventorySource{},
+		DevEndpoint:     "http://127.0.0.1:8747/\x1b]52;c;payload\a",
+	}), "where am i")
+
+	view := model.View()
+	if strings.ContainsRune(view, '\x1b') || strings.ContainsRune(view, '\a') {
+		t.Fatalf("development label leaked terminal controls: %q", view)
+	}
+
+	resized, _ := model.Update(tea.WindowSizeMsg{Width: 60, Height: 8})
+	if view := resized.(Model).View(); !strings.Contains(view, "DEV ENDPOINT") {
+		t.Fatalf("development label was dropped on a short terminal: %q", view)
+	}
+}
+
+func TestReviewCommunicatesApplicableInWords(t *testing.T) {
+	candidate := provider.Candidate{Command: "pwd", Explanation: "current directory"}
+	model := submitIntent(t, NewFromDeps(Deps{
+		Provider:        stubProvider{candidates: []provider.Candidate{candidate}},
+		InventorySource: staticInventorySource{},
+	}), "where am i")
+	if model.applicability.Decision != applicability.Applicable {
+		t.Fatalf("applicability = %+v, want applicable", model.applicability)
+	}
+	if view := model.View(); !strings.Contains(view, "applicable") {
+		t.Fatalf("review view does not communicate applicability in words: %q", view)
+	}
+}
+
+func TestUnknownShellInventoryHardRejectsUnknownRequirement(t *testing.T) {
+	candidate := provider.Candidate{
+		Command:     "pwd",
+		Explanation: "current directory",
+		Requirements: []capability.Requirement{{
+			Kind: capability.RequirementShell,
+			Name: "unknown",
+		}},
+	}
+	inventory := capability.NewFixtureInventory("unknown", "arm64", capability.ShellIdentity{Family: capability.ShellUnknown}, nil)
+	model := submitIntent(t, NewFromDeps(Deps{
+		Provider:        stubProvider{candidates: []provider.Candidate{candidate}},
+		InventorySource: staticInventorySource{inventory: inventory},
+	}), "where am i")
+	if model.applicability.Decision != applicability.Rejected {
+		t.Fatalf("applicability = %+v, want hard rejection for unknown machine shell", model.applicability)
+	}
+	if view := model.View(); !strings.Contains(view, "not for this shell/OS") {
+		t.Fatalf("review view does not communicate hard rejection: %q", view)
+	}
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if updated.(Model).Accepted() {
+		t.Fatal("unknown-shell hard rejection was accepted")
+	}
+}
+
+func TestApplicabilitySelectionAndWidgetBoundary(t *testing.T) {
+	candidate := provider.Candidate{
+		Command:     "pwd",
+		Explanation: "current directory",
+		Requirements: []capability.Requirement{{
+			Kind: capability.RequirementTool,
+			Name: "definitely_missing_clai_tool",
+		}},
+	}
+	model := submitIntent(t, NewFromDeps(Deps{
+		Provider:        stubProvider{candidates: []provider.Candidate{candidate}},
+		InventorySource: staticInventorySource{},
+	}), "where am i")
+	if model.applicability.Decision != applicability.Marked {
+		t.Fatalf("applicability = %+v, want soft mark", model.applicability)
+	}
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	accepted := updated.(Model)
+	if !accepted.Accepted() {
+		t.Fatal("soft-marked candidate was not accepted")
+	}
+	outcome := accepted.Outcome()
+	if outcome.Edited || len(outcome.Requirements) != 1 || outcome.Requirements[0].Name != "definitely_missing_clai_tool" {
+		t.Fatalf("outcome = %+v, want immutable unedited requirements", outcome)
+	}
+}
+
+func TestCandidateExplanationAndApplicabilityReasonsSanitized(t *testing.T) {
+	candidate := provider.Candidate{
+		Command:     "pwd",
+		Explanation: "why\x1b]52;c;payload\a",
+		Requirements: []capability.Requirement{{
+			Kind: capability.RequirementTool,
+			Name: "bad\x1btool",
+		}},
+	}
+	model := submitIntent(t, NewFromDeps(Deps{
+		Provider:        stubProvider{candidates: []provider.Candidate{candidate}},
+		InventorySource: staticInventorySource{},
+	}), "review")
+	model.whyExpanded = true
+	view := model.View()
+	if strings.ContainsRune(view, '\x1b') || strings.ContainsRune(view, '\a') {
+		t.Fatalf("view leaked terminal controls: %q", view)
+	}
+	for _, want := range []string{`\u{001B}`, "may not work", "tool bad"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("view missing %q: %q", want, view)
+		}
+	}
+}
+
+func TestEditedOutcomeDiscriminator(t *testing.T) {
+	candidate := provider.Candidate{
+		Command:     "pwd",
+		Explanation: "current directory",
+		Requirements: []capability.Requirement{{
+			Kind: capability.RequirementOS,
+			Name: "darwin",
+		}},
+	}
+	model := submitIntent(t, NewFromDeps(Deps{
+		Provider:        stubProvider{candidates: []provider.Candidate{candidate}},
+		InventorySource: staticInventorySource{},
+	}), "where am i")
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	model = updated.(Model)
+	model.commandInput.SetValue("pwd")
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.applicability.Decision != applicability.Marked {
+		t.Fatalf("edited applicability = %+v, want presence-only mark", model.applicability)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	outcome := updated.(Model).Outcome()
+	if !outcome.Accepted || !outcome.Edited || len(outcome.Requirements) != 0 {
+		t.Fatalf("edited outcome = %+v, want accepted edited command without model requirements", outcome)
+	}
+}
+
+func TestEditReviewDerivesExecutablesFromBytes(t *testing.T) {
+	candidate := provider.Candidate{
+		Command:     "pwd",
+		Explanation: "current directory",
+		Requirements: []capability.Requirement{{
+			Kind: capability.RequirementShell,
+			Name: "fish",
+		}},
+	}
+	model := submitIntent(t, NewFromDeps(Deps{
+		Provider:        stubProvider{candidates: []provider.Candidate{candidate}},
+		InventorySource: staticInventorySource{},
+	}), "run commands")
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	model = updated.(Model)
+	model.commandInput.SetValue("env FOO=bar /usr/bin/rg TODO | command missing --flag")
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.applicability.Decision != applicability.Marked {
+		t.Fatalf("edited applicability = %+v, want marked", model.applicability)
+	}
+	if len(model.applicability.Reasons) != 2 || !strings.Contains(model.applicability.Reasons[0], "tool rg") || !strings.Contains(model.applicability.Reasons[1], "tool missing") {
+		t.Fatalf("edited reasons = %v, want executable-position order", model.applicability.Reasons)
+	}
+	if !model.edited || len(model.Outcome().Requirements) != 0 {
+		t.Fatalf("edited state retained model requirements: %+v", model.Outcome())
+	}
+}
+
+func TestEditedParseUncertaintyDefersToValidation(t *testing.T) {
+	model := submitIntent(t, NewFromDeps(Deps{
+		Provider: stubProvider{candidates: []provider.Candidate{{
+			Command:     "pwd",
+			Explanation: "current directory",
+		}}},
+		InventorySource: staticInventorySource{},
+	}), "run a command")
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	model = updated.(Model)
+	model.commandInput.SetValue("echo $(missing)")
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.validation.Valid {
+		t.Fatal("structural validation accepted parser uncertainty")
+	}
+	if model.applicability.Decision != applicability.Applicable || len(model.applicability.Reasons) != 0 {
+		t.Fatalf("applicability asserted on parser uncertainty: %+v", model.applicability)
+	}
+}
+
+type reviewInventory struct {
+	os    string
+	shell capability.ShellFamily
+	tools map[string]capability.ToolFact
+}
+
+func (inventory reviewInventory) OSFamily() string { return inventory.os }
+func (inventory reviewInventory) Shell() capability.ShellIdentity {
+	return capability.ShellIdentity{Family: inventory.shell, Path: "/secret/shell"}
+}
+func (inventory reviewInventory) LookupTool(name string) (capability.ToolFact, bool) {
+	fact, ok := inventory.tools[name]
+	return fact, ok
+}
+
+func TestReviewDisplaysRelevantCapabilityFacts(t *testing.T) {
+	candidate := provider.Candidate{
+		Command:     "rg TODO",
+		Explanation: "searches TODO markers",
+		Requirements: []capability.Requirement{
+			{Kind: capability.RequirementTool, Name: "rg", MinVersion: "14.1"},
+			{Kind: capability.RequirementShell, Name: "bash"},
+			{Kind: capability.RequirementOS, Name: "linux"},
+			{Kind: capability.RequirementTool, Name: "rg"},
+		},
+	}
+	model := submitIntent(t, NewFromDeps(Deps{
+		Provider:        stubProvider{candidates: []provider.Candidate{candidate}},
+		InventorySource: staticInventorySource{},
+	}), "search TODO")
+	model.inventory = reviewInventory{
+		os:    "darwin",
+		shell: capability.ShellFish,
+		tools: map[string]capability.ToolFact{
+			"rg":  {Name: "rg", Present: true, Path: "/secret/bin/rg", Version: "14.1.0"},
+			"git": {Name: "git", Present: true, Path: "/secret/bin/git", Version: "2.50.0"},
+		},
+	}
+	model.applicability = applicability.Evaluate(model.candidate.Requirements, model.inventory)
+	model.context = machinecontext.Context{Shell: "fish", OS: "darwin"}
+	model.contextExpanded = true
+
+	view := model.View()
+	for _, want := range []string{"tool rg: present 14.1.0", "shell: fish", "os: darwin"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("review missing relevant capability fact %q: %q", want, view)
+		}
+	}
+	if strings.Count(view, "tool rg: present 14.1.0") != 1 {
+		t.Fatalf("duplicate relevant tool fact in review: %q", view)
+	}
+	for _, forbidden := range []string{"tool git:", "/secret/bin/rg", "/secret/bin/git", "/secret/shell"} {
+		if strings.Contains(view, forbidden) {
+			t.Fatalf("review exposed irrelevant or path metadata %q: %q", forbidden, view)
+		}
+	}
+
+	model.edited = true
+	model.command = "command /usr/bin/rg TODO | missing"
+	edited := model.View()
+	for _, want := range []string{"tool rg: present 14.1.0", "tool missing: absent"} {
+		if !strings.Contains(edited, want) {
+			t.Fatalf("edited review missing derived fact %q: %q", want, edited)
+		}
+	}
+	// The command hero intentionally displays exact command bytes; capability
+	// facts themselves must use only resolved base names.
+	facts := relevantCapabilityLines(model.inventory, model.candidate.Requirements, true, model.command)
+	if strings.Contains(strings.Join(facts, "\n"), "/usr/bin/rg") {
+		t.Fatalf("edited capability facts exposed executable path: %v", facts)
+	}
+
+	// A literal brace pair is word data, so an edited command using the xargs
+	// replacement idiom parses and its executable positions are derived rather
+	// than skipped for parse uncertainty. Only genuine executable positions are
+	// derived: rg is an argument to xargs here, not a command of its own.
+	braced := relevantCapabilityLines(model.inventory, nil, true, "rg --files | xargs -I{} du -h {}")
+	joined := strings.Join(braced, "\n")
+	for _, want := range []string{"tool rg: present 14.1.0", "tool xargs: absent"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("edited brace command missing derived fact %q: %v", want, braced)
+		}
+	}
+	if strings.Contains(joined, "{}") || strings.Contains(joined, "-I") {
+		t.Fatalf("capability facts leaked brace or flag syntax: %v", braced)
+	}
 }

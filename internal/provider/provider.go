@@ -3,17 +3,20 @@ package provider
 import (
 	"context"
 
+	"github.com/Vedaant-Rajoo/clai/internal/capability"
 	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
 )
 
 type Request struct {
-	Intent  string
-	Context machinecontext.Context
+	Intent       string
+	Context      machinecontext.Context
+	Capabilities capability.Inventory
 }
 
 type Candidate struct {
-	Command     string
-	Explanation string
+	Command      string
+	Explanation  string
+	Requirements []capability.Requirement
 }
 
 // Provider compiles a natural-language intent into shell command candidates.

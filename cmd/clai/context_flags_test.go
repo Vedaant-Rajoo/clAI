@@ -38,7 +38,7 @@ func TestContextPolicyDefaults(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, shared, err := flags.contextOptions()
+			got, shared, err := flags.contextOptions("")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -61,14 +61,14 @@ func TestRemoteExplicitGrammarAndDeterministicSharing(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		policy, shared, err := flags.contextOptions()
+		policy, shared, err := flags.contextOptions("")
 		if err != nil {
 			t.Fatal(err)
 		}
 		if policy != machinecontext.PolicyRemoteExplicit {
 			t.Fatalf("policy = %q", policy)
 		}
-		want := []string{machinecontext.FieldGitBranch, machinecontext.FieldWorkingDirectory}
+		want := []string{machinecontext.FieldWorkingDirectory, machinecontext.FieldGitBranch}
 		if !reflect.DeepEqual(shared, want) {
 			t.Fatalf("shared = %v, want %v", shared, want)
 		}
@@ -90,7 +90,7 @@ func TestContextFlagConflicts(t *testing.T) {
 			if parseErr != nil {
 				t.Fatal(parseErr)
 			}
-			if _, _, err := flags.contextOptions(); err == nil {
+			if _, _, err := flags.contextOptions(""); err == nil {
 				t.Fatal("conflicting flags accepted")
 			}
 		})
@@ -121,7 +121,7 @@ func TestRemoteExplicitApprovalIsInvocationScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := first.contextOptions(); err != nil {
+	if _, _, err := first.contextOptions(""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -129,7 +129,7 @@ func TestRemoteExplicitApprovalIsInvocationScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := second.contextOptions(); err == nil {
+	if _, _, err := second.contextOptions(""); err == nil {
 		t.Fatal("later invocation reused earlier sharing approval")
 	}
 }

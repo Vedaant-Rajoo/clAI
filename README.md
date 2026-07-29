@@ -31,9 +31,17 @@ are opt-in. Direct Anthropic uses the official Anthropic SDK and defaults to
 `claude-sonnet-5`; its streaming is internal only, so partial model output never
 enters review — the TUI stays on loading until one complete candidate is ready.
 Remote providers default to a minimal context policy that sends the intent plus
-normalized OS family, shell family, and project kind only. Absolute paths and Git
-details require invocation-scoped `--context-policy remote-explicit` with
-repeatable `--share-context` approvals; `local-only` fails closed for remote
-endpoints.
+normalized OS family, shell family, project kind, platform architecture, and
+presence/version status for a fixed 14-tool allowlist. It never sends executable
+paths, raw probe output, history, prior output, environment dumps, identity,
+credentials, or repository contents. Absolute paths and Git details require
+invocation-scoped `--context-policy remote-explicit` with repeatable
+`--share-context` approvals; `local-only` omits context and fails closed for
+remote endpoints.
+
+To exercise a remote provider without spending API calls, run
+`go run ./cmd/clai-stubprovider` and pass `--dev-endpoint http://127.0.0.1:8747`.
+The override accepts loopback hosts only and labels every screen, so it cannot
+send traffic off-host or be mistaken for a real session.
 
 - [Provider setup, auth, and context privacy](docs/providers.md)

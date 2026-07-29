@@ -83,8 +83,10 @@ Usage:
 Flags:
   --shell name        active shell: fish | bash | zsh
   --result-file path  caller-created file the accepted command is written to
-  --provider name     provider: rules | openrouter | anthropic (default: rules, or $CLAI_PROVIDER)
+  --provider name     provider: rules | openrouter | anthropic
+                      (default: rules, or $CLAI_PROVIDER, or config.json)
   --model name        model override for LLM providers
+                      (default: $CLAI_MODEL, or config.json, or the provider's own)
   --api-key key       API key override for LLM providers
   --fallback-rules    fall back to local rules when the provider errors
   --context-policy p  context policy: local-only | remote-minimal | remote-explicit
@@ -129,9 +131,13 @@ Commands:
 	fmt.Fprint(w, `
 Flags:
   --copy             copy the accepted command to the clipboard
+                     (or delivery setting in config.json)
   --print-command    print the accepted command to stdout
-  --provider name    provider: rules | openrouter | anthropic (default: rules, or $CLAI_PROVIDER)
+                     (or delivery setting in config.json)
+  --provider name    provider: rules | openrouter | anthropic
+                     (default: rules, or $CLAI_PROVIDER, or config.json)
   --model name       model override for LLM providers
+                     (default: $CLAI_MODEL, or config.json, or the provider's own)
   --api-key key      API key override for LLM providers
   --fallback-rules   fall back to local rules when the provider errors
   --context-policy p context policy: local-only | remote-minimal | remote-explicit
@@ -140,6 +146,14 @@ Flags:
   --dev-endpoint url development only: send provider requests to a loopback
                      endpoint instead of the real provider
   --version          print version and exit
+
+Environment:
+  CLAI_PROVIDER      default provider: rules | openrouter | anthropic
+  CLAI_MODEL         default model for LLM providers
+  CLAI_DELIVERY      default delivery: clipboard | stdout | insert
+
+Flags override environment variables; both override the config file at
+<UserConfigDir>/clai/config.json (the platform user configuration directory).
 
 Use "clai help <command>" or "clai <command> help" for more information.
 `)

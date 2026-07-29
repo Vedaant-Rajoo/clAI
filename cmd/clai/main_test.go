@@ -3,14 +3,17 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/Vedaant-Rajoo/clai/internal/app"
 	"github.com/Vedaant-Rajoo/clai/internal/applicability"
 	"github.com/Vedaant-Rajoo/clai/internal/capability"
+	"github.com/Vedaant-Rajoo/clai/internal/config"
 	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
 	"github.com/Vedaant-Rajoo/clai/internal/provider"
 	"github.com/Vedaant-Rajoo/clai/internal/provider/anthropic"
@@ -157,6 +160,178 @@ func TestSelectProviderAnthropicSharedFieldsForwarded(t *testing.T) {
 	ap := p.(anthropic.Provider)
 	if len(ap.SharedFields) != 1 || ap.SharedFields[0] != machinecontext.FieldWorkingDirectory {
 		t.Errorf("SharedFields = %v, want [working_directory]", ap.SharedFields)
+	}
+}
+
+// captureSelectedProvider swaps the executeTUI seam so tests can observe
+// exactly which provider the command constructed, without running a real TUI.
+// The returned pointer is filled in when the command reaches the TUI boundary.
+func captureSelectedProvider(t *testing.T) *provider.Provider {
+	t.Helper()
+	var got provider.Provider
+	original := executeTUI
+	executeTUI = func(p provider.Provider, _ *capability.Cached, _, _ string) (app.Outcome, error) {
+		got = p
+		return app.Outcome{}, nil
+	}
+	t.Cleanup(func() { executeTUI = original })
+	return &got
+}
+
+// swapLoadConfig swaps the loadConfig seam, mirroring the executeTUI pattern,
+// so cmd tests control exactly what config.Load appears to return.
+func swapLoadConfig(t *testing.T, cfg config.Config, err error) {
+	t.Helper()
+	original := loadConfig
+	loadConfig = func() (config.Config, error) { return cfg, err }
+	t.Cleanup(func() { loadConfig = original })
+}
+
+// TestProviderPrecedenceEndToEnd is the tracer proof for CONF-01/CONF-03: a
+// config.json provider value selects the constructed provider at the
+// selectProvider boundary, env overrides config, and an explicit flag
+// overrides both — in the interactive path.
+func TestProviderPrecedenceEndToEnd(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "sk-or-test")
+
+	cases := []struct {
+		name           string
+		cfg            config.Config
+		envProvider    string
+		args           []string
+		wantOpenRouter bool
+	}{
+		{
+			name:           "config selects provider when flag and env are unset",
+			cfg:            config.Config{Contract: config.ConfigContract, Provider: "openrouter"},
+			envProvider:    "",
+			wantOpenRouter: true,
+		},
+		{
+			name:           "env overrides config",
+			cfg:            config.Config{Contract: config.ConfigContract, Provider: "openrouter"},
+			envProvider:    "rules",
+			wantOpenRouter: false,
+		},
+		{
+			name:           "flag overrides env and config",
+			cfg:            config.Config{Contract: config.ConfigContract, Provider: "openrouter"},
+			envProvider:    "openrouter",
+			args:           []string{"--provider", "rules"},
+			wantOpenRouter: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CLAI_PROVIDER", tc.envProvider)
+			swapLoadConfig(t, tc.cfg, nil)
+			got := captureSelectedProvider(t)
+
+			c, _, errBuf := captureCLI()
+			if code := c.run(tc.args); code != exitOK {
+				t.Fatalf("run(%v) = %d, want %d; stderr: %s", tc.args, code, exitOK, errBuf.String())
+			}
+			if *got == nil {
+				t.Fatal("executeTUI was not reached")
+			}
+			_, isOpenRouter := (*got).(openrouter.Provider)
+			if isOpenRouter != tc.wantOpenRouter {
+				t.Fatalf("provider = %T, want openrouter=%v", *got, tc.wantOpenRouter)
+			}
+			if !tc.wantOpenRouter {
+				if _, isRules := (*got).(rules.Provider); !isRules {
+					t.Fatalf("provider = %T, want rules.Provider", *got)
+				}
+			}
+		})
+	}
+}
+
+// TestWidgetProviderPrecedenceUsesConfig proves the widget path performs the
+// identical resolution: a config-selected provider reaches selectProvider even
+// though no flag or env names it (Pitfall 3 — the widget path must not be
+// skipped by the rewiring).
+func TestWidgetProviderPrecedenceUsesConfig(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "sk-or-test")
+	t.Setenv("CLAI_PROVIDER", "")
+	swapLoadConfig(t, config.Config{Contract: config.ConfigContract, Provider: "openrouter"}, nil)
+	got := captureSelectedProvider(t)
+
+	path := filepath.Join(t.TempDir(), "result")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c, _, errBuf := captureCLI()
+	code := c.run([]string{"widget", "--shell", "fish", "--result-file", path})
+	if code != exitCancelled {
+		t.Fatalf("run(widget) = %d, want %d; stderr: %s", code, exitCancelled, errBuf.String())
+	}
+	if *got == nil {
+		t.Fatal("executeTUI was not reached")
+	}
+	if _, ok := (*got).(openrouter.Provider); !ok {
+		t.Fatalf("provider = %T, want openrouter.Provider from config", *got)
+	}
+}
+
+// TestCorruptConfigWarnsOnceAndContinues locks the CONF-05 cmd contract: any
+// non-nil Load error — corrupt file or plain I/O failure — produces exactly
+// one stderr warning, leaves stdout untouched, keeps the exit code identical
+// to a no-config run, and falls back to the built-in rules provider.
+func TestCorruptConfigWarnsOnceAndContinues(t *testing.T) {
+	t.Setenv("CLAI_PROVIDER", "")
+
+	// Baseline: a missing config (zero Config, nil error) is fully silent.
+	swapLoadConfig(t, config.Config{}, nil)
+	baselineGot := captureSelectedProvider(t)
+	c, out, errBuf := captureCLI()
+	baselineCode := c.run(nil)
+	if baselineCode != exitOK {
+		t.Fatalf("baseline run = %d, want %d; stderr: %s", baselineCode, exitOK, errBuf.String())
+	}
+	if out.String() != "" || errBuf.String() != "" {
+		t.Fatalf("baseline streams not empty: stdout=%q stderr=%q", out.String(), errBuf.String())
+	}
+	if _, ok := (*baselineGot).(rules.Provider); !ok {
+		t.Fatalf("baseline provider = %T, want rules.Provider", *baselineGot)
+	}
+
+	warning := regexp.MustCompile(`clai: warning: .*continuing with defaults`)
+	cases := []struct {
+		name    string
+		loadErr error
+	}{
+		{
+			name:    "corrupt config file",
+			loadErr: fmt.Errorf("parse config file %q: %w (invalid character 'n')", "/tmp/config.json", config.ErrCorrupt),
+		},
+		{
+			name:    "non-corrupt IO error",
+			loadErr: fmt.Errorf("read config file %q: %w", "/tmp/config.json", errors.New("permission denied")),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			swapLoadConfig(t, config.Config{}, tc.loadErr)
+			got := captureSelectedProvider(t)
+
+			c, out, errBuf := captureCLI()
+			code := c.run(nil)
+			if code != baselineCode {
+				t.Fatalf("exit = %d, want the no-config exit %d", code, baselineCode)
+			}
+			if out.String() != "" {
+				t.Fatalf("stdout = %q, want empty (warning must not corrupt piped output)", out.String())
+			}
+			lines := warning.FindAllString(errBuf.String(), -1)
+			if len(lines) != 1 {
+				t.Fatalf("stderr warnings = %d, want exactly one; stderr: %q", len(lines), errBuf.String())
+			}
+			if _, ok := (*got).(rules.Provider); !ok {
+				t.Fatalf("provider = %T, want rules.Provider default", *got)
+			}
+		})
 	}
 }
 

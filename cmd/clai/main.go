@@ -15,6 +15,7 @@ import (
 	"github.com/Vedaant-Rajoo/clai/internal/applicability"
 	"github.com/Vedaant-Rajoo/clai/internal/auth"
 	"github.com/Vedaant-Rajoo/clai/internal/capability"
+	"github.com/Vedaant-Rajoo/clai/internal/config"
 	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
 	"github.com/Vedaant-Rajoo/clai/internal/provider"
 	"github.com/Vedaant-Rajoo/clai/internal/provider/anthropic"
@@ -31,6 +32,7 @@ import (
 var (
 	version    = "dev"
 	executeTUI = runTUI
+	loadConfig = config.Load
 )
 
 const (
@@ -155,14 +157,19 @@ func (c cli) runInteractive(args []string) int {
 		return exitUsage
 	}
 
+	// Settings resolve before any provider-dependent validation so that a
+	// config-selected provider validates --dev-endpoint and defaults the
+	// context policy exactly like a flag-selected one (CONF-03).
+	_, resolvedProvider := c.resolveSettings(f.providerFlags)
+
 	// The endpoint is validated first because the context policy defaults on
 	// endpoint classification (REQ-CONTEXT-003, REQ-DEVENDPOINT-004).
-	devEndpoint, err := f.devEndpointOption()
+	devEndpoint, err := f.devEndpointOption(resolvedProvider)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai: %v\nRun 'clai help' for usage.\n", err)
 		return exitUsage
 	}
-	policy, sharedFields, err := f.contextOptions(devEndpoint)
+	policy, sharedFields, err := f.contextOptions(devEndpoint, resolvedProvider)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai: %v\nRun 'clai help' for usage.\n", err)
 		return exitUsage
@@ -172,7 +179,7 @@ func (c cli) runInteractive(args []string) int {
 		fmt.Fprintln(c.stdout, version)
 		return exitOK
 	}
-	p, err := selectProvider(*f.providerName, *f.model, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint)
+	p, err := selectProvider(resolvedProvider, *f.model, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai: %v\n", err)
 		return exitError
@@ -218,16 +225,21 @@ func (c cli) runWidget(args []string) int {
 		fmt.Fprintln(c.stderr, "usage: clai widget --shell <fish|bash|zsh> --result-file <path>\nRun 'clai widget help' for usage.")
 		return exitUsage
 	}
+	// The widget path performs the identical settings resolution as the
+	// interactive path (CONF-03) — skipping it here would silently break
+	// config.json and CLAI_PROVIDER users invoking through the shell widget.
+	_, resolvedProvider := c.resolveSettings(f.providerFlags)
+
 	// Validate every usage error together, before touching the result file or
 	// constructing a provider (REQ-DEVENDPOINT-002). The endpoint comes first
 	// because the context policy defaults on its classification
 	// (REQ-CONTEXT-003, REQ-DEVENDPOINT-004).
-	devEndpoint, err := f.devEndpointOption()
+	devEndpoint, err := f.devEndpointOption(resolvedProvider)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai widget: %v\nRun 'clai widget help' for usage.\n", err)
 		return exitUsage
 	}
-	policy, sharedFields, err := f.contextOptions(devEndpoint)
+	policy, sharedFields, err := f.contextOptions(devEndpoint, resolvedProvider)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai widget: %v\nRun 'clai widget help' for usage.\n", err)
 		return exitUsage
@@ -244,7 +256,7 @@ func (c cli) runWidget(args []string) int {
 		}
 	}()
 
-	p, err := selectProvider(*f.providerName, *f.model, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint)
+	p, err := selectProvider(resolvedProvider, *f.model, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai widget: %v\n", err)
 		return exitError
@@ -345,7 +357,7 @@ func registerProviderFlags(fs *flag.FlagSet) providerFlags {
 	fs.Var(policy, "context-policy", "context policy: local-only | remote-minimal | remote-explicit")
 	fs.Var(shared, "share-context", "share one context field (repeatable): working_directory | git_root | git_branch")
 	return providerFlags{
-		providerName:  fs.String("provider", envOr("CLAI_PROVIDER", "rules"), "provider: rules | openrouter | anthropic"),
+		providerName:  fs.String("provider", "", "provider: rules | openrouter | anthropic"),
 		model:         fs.String("model", "", "model override for LLM providers"),
 		apiKey:        fs.String("api-key", "", "API key override for LLM providers"),
 		fallbackRules: fs.Bool("fallback-rules", false, "fall back to local rules when the selected provider errors"),
@@ -355,19 +367,36 @@ func registerProviderFlags(fs *flag.FlagSet) providerFlags {
 	}
 }
 
+// resolveSettings loads config.json and resolves the effective provider name
+// through the flag > env > config > built-in precedence chain (CONF-03). A
+// failed load — corrupt file or I/O error alike — warns exactly once on
+// stderr and continues with a zero Config; config state never changes an exit
+// code (CONF-05). The Load error text already carries the quoted path.
+func (c cli) resolveSettings(f providerFlags) (config.Config, string) {
+	cfg, err := loadConfig()
+	if err != nil {
+		fmt.Fprintf(c.stderr, "clai: warning: %v; continuing with defaults\n", err)
+		cfg = config.Config{}
+	}
+	resolved := config.Resolve(*f.providerName, os.Getenv("CLAI_PROVIDER"), cfg.Provider, "rules")
+	return cfg, resolved
+}
+
 // devEndpointOption validates the loopback-only development override
 // (REQ-DEVENDPOINT-002/003). Every rejection happens here, before provider
 // construction, credential resolution, DNS, or network activity. Classification
 // is lexical, so a hostname that merely resolves to loopback is rejected.
-func (f providerFlags) devEndpointOption() (string, error) {
+// resolvedProvider is the post-precedence provider name (CONF-03): switching
+// on the raw flag here would treat a config-selected remote provider as rules.
+func (f providerFlags) devEndpointOption(resolvedProvider string) (string, error) {
 	endpoint := strings.TrimSpace(*f.devEndpoint)
 	if endpoint == "" {
 		return "", nil
 	}
-	switch *f.providerName {
+	switch resolvedProvider {
 	case "openrouter", "anthropic":
 	default:
-		return "", fmt.Errorf("--dev-endpoint is not valid for provider %q; it applies only to openrouter and anthropic", *f.providerName)
+		return "", fmt.Errorf("--dev-endpoint is not valid for provider %q; it applies only to openrouter and anthropic", resolvedProvider)
 	}
 	class, err := machinecontext.ClassifyEndpoint(endpoint)
 	if err != nil {
@@ -389,7 +418,10 @@ func (f providerFlags) devEndpointOption() (string, error) {
 // for a normal session; it is required here because REQ-CONTEXT-003 defaults on
 // endpoint classification, and a loopback development endpoint must default to
 // local-only exactly as any other loopback provider does (REQ-DEVENDPOINT-004).
-func (f providerFlags) contextOptions(devEndpoint string) (machinecontext.Policy, []string, error) {
+// resolvedProvider is the post-precedence provider name (CONF-03) so a
+// config-selected remote provider defaults to remote-minimal exactly like a
+// flag-selected one.
+func (f providerFlags) contextOptions(devEndpoint, resolvedProvider string) (machinecontext.Policy, []string, error) {
 	shared, err := machinecontext.NormalizeExplicitFields(f.sharedContext.values)
 	if err != nil {
 		return "", nil, err
@@ -401,7 +433,7 @@ func (f providerFlags) contextOptions(devEndpoint string) (machinecontext.Policy
 		}
 		policy = machinecontext.PolicyLocalOnly
 		if devEndpoint == "" {
-			switch *f.providerName {
+			switch resolvedProvider {
 			case "openrouter", "anthropic":
 				policy = machinecontext.PolicyRemoteMinimal
 			}
@@ -559,13 +591,6 @@ func writeWidgetResult(path, command string, expected os.FileInfo) error {
 		return err
 	}
 	return file.Sync()
-}
-
-func envOr(name, fallback string) string {
-	if value := os.Getenv(name); value != "" {
-		return value
-	}
-	return fallback
 }
 
 // fallback wraps a provider so that on error it retries with local rules,

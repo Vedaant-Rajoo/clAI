@@ -6,8 +6,16 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/Vedaant-Rajoo/clai/internal/config"
 	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
 )
+
+// resolvedProviderForTest mirrors production resolution for direct option
+// calls: the flag value with the built-in rules default and no env or config
+// layer, matching what resolveSettings produces when neither is set.
+func resolvedProviderForTest(f providerFlags) string {
+	return config.Resolve(*f.providerName, "", "", "rules")
+}
 
 func parseProviderFlagsForTest(t *testing.T, widget bool, args ...string) (providerFlags, error) {
 	t.Helper()
@@ -38,7 +46,7 @@ func TestContextPolicyDefaults(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, shared, err := flags.contextOptions("")
+			got, shared, err := flags.contextOptions("", resolvedProviderForTest(flags))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -61,7 +69,7 @@ func TestRemoteExplicitGrammarAndDeterministicSharing(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		policy, shared, err := flags.contextOptions("")
+		policy, shared, err := flags.contextOptions("", resolvedProviderForTest(flags))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -90,7 +98,7 @@ func TestContextFlagConflicts(t *testing.T) {
 			if parseErr != nil {
 				t.Fatal(parseErr)
 			}
-			if _, _, err := flags.contextOptions(""); err == nil {
+			if _, _, err := flags.contextOptions("", resolvedProviderForTest(flags)); err == nil {
 				t.Fatal("conflicting flags accepted")
 			}
 		})
@@ -121,7 +129,7 @@ func TestRemoteExplicitApprovalIsInvocationScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := first.contextOptions(""); err != nil {
+	if _, _, err := first.contextOptions("", resolvedProviderForTest(first)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -129,7 +137,7 @@ func TestRemoteExplicitApprovalIsInvocationScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := second.contextOptions(""); err == nil {
+	if _, _, err := second.contextOptions("", resolvedProviderForTest(second)); err == nil {
 		t.Fatal("later invocation reused earlier sharing approval")
 	}
 }

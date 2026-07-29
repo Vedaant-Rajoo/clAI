@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -270,6 +272,66 @@ func TestWidgetProviderPrecedenceUsesConfig(t *testing.T) {
 	}
 	if _, ok := (*got).(openrouter.Provider); !ok {
 		t.Fatalf("provider = %T, want openrouter.Provider from config", *got)
+	}
+}
+
+// TestCorruptConfigWarnsOnceAndContinues locks the CONF-05 cmd contract: any
+// non-nil Load error — corrupt file or plain I/O failure — produces exactly
+// one stderr warning, leaves stdout untouched, keeps the exit code identical
+// to a no-config run, and falls back to the built-in rules provider.
+func TestCorruptConfigWarnsOnceAndContinues(t *testing.T) {
+	t.Setenv("CLAI_PROVIDER", "")
+
+	// Baseline: a missing config (zero Config, nil error) is fully silent.
+	swapLoadConfig(t, config.Config{}, nil)
+	baselineGot := captureSelectedProvider(t)
+	c, out, errBuf := captureCLI()
+	baselineCode := c.run(nil)
+	if baselineCode != exitOK {
+		t.Fatalf("baseline run = %d, want %d; stderr: %s", baselineCode, exitOK, errBuf.String())
+	}
+	if out.String() != "" || errBuf.String() != "" {
+		t.Fatalf("baseline streams not empty: stdout=%q stderr=%q", out.String(), errBuf.String())
+	}
+	if _, ok := (*baselineGot).(rules.Provider); !ok {
+		t.Fatalf("baseline provider = %T, want rules.Provider", *baselineGot)
+	}
+
+	warning := regexp.MustCompile(`clai: warning: .*continuing with defaults`)
+	cases := []struct {
+		name    string
+		loadErr error
+	}{
+		{
+			name:    "corrupt config file",
+			loadErr: fmt.Errorf("parse config file %q: %w (invalid character 'n')", "/tmp/config.json", config.ErrCorrupt),
+		},
+		{
+			name:    "non-corrupt IO error",
+			loadErr: fmt.Errorf("read config file %q: %w", "/tmp/config.json", errors.New("permission denied")),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			swapLoadConfig(t, config.Config{}, tc.loadErr)
+			got := captureSelectedProvider(t)
+
+			c, out, errBuf := captureCLI()
+			code := c.run(nil)
+			if code != baselineCode {
+				t.Fatalf("exit = %d, want the no-config exit %d", code, baselineCode)
+			}
+			if out.String() != "" {
+				t.Fatalf("stdout = %q, want empty (warning must not corrupt piped output)", out.String())
+			}
+			lines := warning.FindAllString(errBuf.String(), -1)
+			if len(lines) != 1 {
+				t.Fatalf("stderr warnings = %d, want exactly one; stderr: %q", len(lines), errBuf.String())
+			}
+			if _, ok := (*got).(rules.Provider); !ok {
+				t.Fatalf("provider = %T, want rules.Provider default", *got)
+			}
+		})
 	}
 }
 

@@ -16,34 +16,16 @@ import (
 	"github.com/Vedaant-Rajoo/clai/internal/configroot"
 )
 
-// swapUserConfigDir points the package at a temporary base directory,
-// mirroring the internal/auth seam convention, and restores the real seam on
-// cleanup.
-func swapUserConfigDir(t *testing.T) string {
-	t.Helper()
-	base := t.TempDir()
-	old := userConfigDir
-	userConfigDir = func() (string, error) { return base, nil }
-	t.Cleanup(func() { userConfigDir = old })
-	return base
-}
-
-// swapConfigRoots points the shared resolver at an isolated preferred base.
-// Until Path consumes this seam, userConfigDir is also redirected to a distinct
-// safe directory so the RED test cannot inspect the developer's real config.
+// swapConfigRoots points the shared resolver at an isolated preferred base
+// and restores the production resolver on cleanup.
 func swapConfigRoots(t *testing.T) string {
 	t.Helper()
 	base := t.TempDir()
-	oldRoots := resolveConfigRoots
-	oldUserConfigDir := userConfigDir
+	old := resolveConfigRoots
 	resolveConfigRoots = func() (configroot.Roots, error) {
 		return configroot.Roots{Preferred: base}, nil
 	}
-	userConfigDir = func() (string, error) { return filepath.Join(base, "old-policy"), nil }
-	t.Cleanup(func() {
-		resolveConfigRoots = oldRoots
-		userConfigDir = oldUserConfigDir
-	})
+	t.Cleanup(func() { resolveConfigRoots = old })
 	return base
 }
 
@@ -100,7 +82,7 @@ func TestLoadReadsPreferredRoot(t *testing.T) {
 // JSON bytes on disk, through the configured root seam, decode into the exact
 // Config values a hand-written file carries (CONF-01).
 func TestLoadReadsHandWrittenConfigFile(t *testing.T) {
-	base := swapUserConfigDir(t)
+	base := swapConfigRoots(t)
 	writeRawConfig(t, base, []byte(`{"contract":"config-file/v1","provider":"openrouter"}`))
 
 	cfg, err := Load()
@@ -119,7 +101,7 @@ func TestLoadReadsHandWrittenConfigFile(t *testing.T) {
 // all means a zero Config and no error, so a fresh install behaves exactly
 // like today.
 func TestLoadMissingFileIsSilent(t *testing.T) {
-	swapUserConfigDir(t)
+	swapConfigRoots(t)
 
 	cfg, err := Load()
 	if err != nil {
@@ -153,7 +135,7 @@ func TestLoadClassification(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			base := swapUserConfigDir(t)
+			base := swapConfigRoots(t)
 			writeRawConfig(t, base, tc.data)
 
 			cfg, err := Load()
@@ -220,7 +202,7 @@ func readConfigBytes(t *testing.T, base string) []byte {
 // transient temp files behind.
 func TestSaveLoadRoundTrip(t *testing.T) {
 	requireUnix(t)
-	base := swapUserConfigDir(t)
+	base := swapConfigRoots(t)
 
 	in := Config{Provider: "openrouter", Model: "anthropic/claude", Delivery: "clipboard", InitCompleted: true}
 	if err := Save(in); err != nil {
@@ -243,7 +225,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 // a zero-value Config.
 func TestSaveStampsContract(t *testing.T) {
 	requireUnix(t)
-	base := swapUserConfigDir(t)
+	base := swapConfigRoots(t)
 
 	if err := Save(Config{}); err != nil {
 		t.Fatalf("Save zero Config: %v", err)
@@ -258,7 +240,7 @@ func TestSaveStampsContract(t *testing.T) {
 // hardened writer must enforce (T-01-08).
 func TestSavePermissions(t *testing.T) {
 	requireUnix(t)
-	base := swapUserConfigDir(t)
+	base := swapConfigRoots(t)
 
 	if err := Save(Config{Provider: "rules"}); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -283,7 +265,7 @@ func TestSavePermissions(t *testing.T) {
 // Config twice succeeds and produces byte-identical file content.
 func TestSaveIdempotent(t *testing.T) {
 	requireUnix(t)
-	base := swapUserConfigDir(t)
+	base := swapConfigRoots(t)
 
 	cfg := Config{Provider: "openrouter", Model: "m", InitCompleted: true}
 	if err := Save(cfg); err != nil {
@@ -305,7 +287,7 @@ func TestSaveIdempotent(t *testing.T) {
 // complete writer's JSON — never interleaved bytes (T-01-07). Run with -race.
 func TestConcurrentSave(t *testing.T) {
 	requireUnix(t)
-	base := swapUserConfigDir(t)
+	base := swapConfigRoots(t)
 
 	const writers = 8
 	errs := make([]error, writers)
@@ -375,7 +357,7 @@ func TestConfigMarshalContainsNoCredentialFields(t *testing.T) {
 // directory listing, not by absence of one known name.
 func TestInitCompletedRoundTrip(t *testing.T) {
 	requireUnix(t)
-	base := swapUserConfigDir(t)
+	base := swapConfigRoots(t)
 
 	if err := Save(Config{InitCompleted: true}); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -410,7 +392,7 @@ func TestInitCompletedRoundTrip(t *testing.T) {
 // raw-field round-tripping later is additive.
 func TestSaveDropsUnknownFields(t *testing.T) {
 	requireUnix(t)
-	base := swapUserConfigDir(t)
+	base := swapConfigRoots(t)
 	writeRawConfig(t, base, []byte(`{"provider":"rules","future_field":true}`))
 
 	cfg, err := Load()
@@ -439,7 +421,7 @@ func TestLoadUnreadableFileIsIOErrorNotCorrupt(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("root bypasses file permission checks")
 	}
-	base := swapUserConfigDir(t)
+	base := swapConfigRoots(t)
 	path := writeRawConfig(t, base, []byte(`{"provider":"rules"}`))
 	if err := os.Chmod(path, 0o000); err != nil {
 		t.Fatal(err)

@@ -1,5 +1,5 @@
-// Package config persists clai's behavioral settings to
-// <UserConfigDir>/clai/config.json under the config-file/v1 contract.
+// Package config persists clai's behavioral settings to the shared preferred
+// configuration root under the config-file/v1 contract.
 //
 // The persisted struct carries user choices only: provider, model, delivery,
 // and init_completed. It structurally cannot hold credentials — API keys
@@ -15,8 +15,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/Vedaant-Rajoo/clai/internal/configroot"
 )
@@ -25,10 +23,6 @@ import (
 const ConfigContract = "config-file/v1"
 
 const fileName = "config.json"
-
-// userConfigDir remains temporarily available while the shared-root tracer is
-// under test; Path switches to resolveConfigRoots in the GREEN implementation.
-var userConfigDir = os.UserConfigDir
 
 // resolveConfigRoots is the shared root-policy seam used by deterministic tests.
 var resolveConfigRoots = configroot.Resolve
@@ -48,39 +42,16 @@ type Config struct {
 	InitCompleted bool   `json:"init_completed"`
 }
 
-// Path returns the config file location <UserConfigDir>/clai/config.json,
-// mirroring internal/auth's derivation so config.json and credentials.json
-// provably share a base directory (CONF-01).
+// Path returns config.json below the shared preferred clai root (CONF-01).
 func Path() (string, error) {
-	dir, err := userConfigDir()
+	roots, err := resolveConfigRoots()
 	if err != nil {
-		return "", fmt.Errorf("locate user config directory: %w", err)
+		return "", fmt.Errorf("resolve config roots: %w", err)
 	}
-	if err := validateConfiguredBasePath(dir); err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "clai", fileName), nil
+	return roots.PreferredPath(fileName), nil
 }
 
-// validateConfiguredBasePath rejects relative bases and dot path components,
-// duplicated verbatim from internal/auth (which this phase must not modify).
-func validateConfiguredBasePath(path string) error {
-	if !filepath.IsAbs(path) {
-		return errors.New("user config directory must be absolute")
-	}
-	volume := filepath.VolumeName(path)
-	remainder := strings.TrimPrefix(path, volume)
-	for _, component := range strings.FieldsFunc(remainder, func(r rune) bool {
-		return r == '/' || r == '\\'
-	}) {
-		if component == "." || component == ".." {
-			return errors.New("user config directory must not contain dot path components")
-		}
-	}
-	return nil
-}
-
-// Save atomically persists cfg to <UserConfigDir>/clai/config.json via the
+// Save atomically persists cfg to <preferred-base>/clai/config.json via the
 // platform writer (flock + temp + fsync + rename, 0600/0700 on unix;
 // fail-closed elsewhere). The config-file/v1 contract is stamped
 // unconditionally — every written file identifies its schema version even

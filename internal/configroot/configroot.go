@@ -9,9 +9,11 @@ package configroot
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 var (
@@ -29,12 +31,99 @@ type Roots struct {
 
 // Resolve discovers clai's configuration roots for the current platform.
 func Resolve() (Roots, error) {
-	return Roots{}, errors.New("config root resolution is not implemented")
+	xdg, _ := lookupEnv("XDG_CONFIG_HOME")
+
+	switch currentGOOS {
+	case "darwin":
+		home, err := userHomeDir()
+		if err != nil {
+			return Roots{}, fmt.Errorf("locate user home directory: %w", err)
+		}
+		return resolve(currentGOOS, xdg, home, "")
+	case "linux":
+		home := ""
+		if xdg == "" {
+			var err error
+			home, err = userHomeDir()
+			if err != nil {
+				return Roots{}, fmt.Errorf("locate user home directory: %w", err)
+			}
+		}
+		return resolve(currentGOOS, xdg, home, "")
+	default:
+		platformConfig, err := userConfigDir()
+		if err != nil {
+			return Roots{}, fmt.Errorf("locate user config directory: %w", err)
+		}
+		return resolve(currentGOOS, xdg, "", platformConfig)
+	}
 }
 
 // resolve applies the platform root policy to already-collected inputs.
 func resolve(goos, xdg, home, platformConfig string) (Roots, error) {
-	return Roots{}, errors.New("config root resolution is not implemented")
+	switch goos {
+	case "darwin":
+		home, err := validateBase("HOME", home)
+		if err != nil {
+			return Roots{}, err
+		}
+		preferred := filepath.Join(home, ".config")
+		if xdg != "" {
+			preferred, err = validateBase("XDG_CONFIG_HOME", xdg)
+			if err != nil {
+				return Roots{}, err
+			}
+		}
+		return Roots{
+			Preferred: preferred,
+			Legacy:    filepath.Join(home, "Library", "Application Support"),
+		}, nil
+	case "linux":
+		if xdg != "" {
+			preferred, err := validateBase("XDG_CONFIG_HOME", xdg)
+			if err != nil {
+				return Roots{}, err
+			}
+			return Roots{Preferred: preferred}, nil
+		}
+		home, err := validateBase("HOME", home)
+		if err != nil {
+			return Roots{}, err
+		}
+		return Roots{Preferred: filepath.Join(home, ".config")}, nil
+	default:
+		preferred, err := validateBase("user config directory", platformConfig)
+		if err != nil {
+			return Roots{}, err
+		}
+		return Roots{Preferred: preferred}, nil
+	}
+}
+
+// validateBase rejects ambiguous roots before cleaning them. In particular,
+// relative and dot-component inputs are never normalized into an approved
+// absolute path.
+func validateBase(name, path string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("%s must not be empty", name)
+	}
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("%s must be absolute", name)
+	}
+	volume := filepath.VolumeName(path)
+	remainder := strings.TrimPrefix(path, volume)
+	for _, component := range strings.FieldsFunc(remainder, func(r rune) bool {
+		return r == '/' || r == '\\'
+	}) {
+		if component == "." || component == ".." {
+			return "", fmt.Errorf("%s must not contain dot path components", name)
+		}
+	}
+	clean := filepath.Clean(path)
+	if !filepath.IsAbs(clean) {
+		return "", errors.New("cleaned config root must remain absolute")
+	}
+	return clean, nil
 }
 
 // PreferredPath returns a named clai descendant below the preferred base.

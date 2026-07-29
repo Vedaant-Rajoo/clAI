@@ -275,6 +275,192 @@ func TestWidgetProviderPrecedenceUsesConfig(t *testing.T) {
 	}
 }
 
+// swapClipboardWrite swaps the clipboardWrite seam so tests observe copy
+// behavior without touching the system clipboard. The returned slice pointer
+// collects every write in order.
+func swapClipboardWrite(t *testing.T) *[]string {
+	t.Helper()
+	var writes []string
+	original := clipboardWrite
+	clipboardWrite = func(text string) error {
+		writes = append(writes, text)
+		return nil
+	}
+	t.Cleanup(func() { clipboardWrite = original })
+	return &writes
+}
+
+// acceptOutcome swaps the executeTUI seam to report the given command as
+// accepted, so cmd tests can exercise the post-TUI delivery block.
+func acceptOutcome(t *testing.T, command string) {
+	t.Helper()
+	original := executeTUI
+	executeTUI = func(provider.Provider, *capability.Cached, string, string) (app.Outcome, error) {
+		return app.Outcome{Command: command, Accepted: true}, nil
+	}
+	t.Cleanup(func() { executeTUI = original })
+}
+
+// TestDeliveryFromConfig locks the CONF-03 delivery matrix at the cmd level:
+// a config delivery value drives copy/print behavior when no delivery flag is
+// passed, an explicit --copy=false overrides config even though false equals
+// the flag default (explicit-set adjacency edge), and CLAI_DELIVERY sits
+// between flags and config.
+func TestDeliveryFromConfig(t *testing.T) {
+	t.Setenv("CLAI_PROVIDER", "")
+	t.Setenv("CLAI_MODEL", "")
+	const command = "go test ./..."
+
+	cases := []struct {
+		name       string
+		cfg        config.Config
+		env        string
+		args       []string
+		wantCopies int
+		wantStdout string
+	}{
+		{
+			name:       "config clipboard copies without printing",
+			cfg:        config.Config{Contract: config.ConfigContract, Delivery: "clipboard"},
+			wantCopies: 1,
+			wantStdout: "",
+		},
+		{
+			name:       "explicit copy=false beats config clipboard",
+			cfg:        config.Config{Contract: config.ConfigContract, Delivery: "clipboard"},
+			args:       []string{"--copy=false"},
+			wantCopies: 0,
+			wantStdout: "",
+		},
+		{
+			name:       "config stdout prints the accepted command",
+			cfg:        config.Config{Contract: config.ConfigContract, Delivery: "stdout"},
+			wantCopies: 0,
+			wantStdout: command + "\n",
+		},
+		{
+			name:       "env stdout beats config clipboard",
+			cfg:        config.Config{Contract: config.ConfigContract, Delivery: "clipboard"},
+			env:        "stdout",
+			wantCopies: 0,
+			wantStdout: command + "\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CLAI_DELIVERY", tc.env)
+			swapLoadConfig(t, tc.cfg, nil)
+			acceptOutcome(t, command)
+			writes := swapClipboardWrite(t)
+
+			c, out, errBuf := captureCLI()
+			if code := c.run(tc.args); code != exitOK {
+				t.Fatalf("run(%v) = %d, want %d; stderr: %s", tc.args, code, exitOK, errBuf.String())
+			}
+			if len(*writes) != tc.wantCopies {
+				t.Fatalf("clipboard writes = %v, want %d write(s)", *writes, tc.wantCopies)
+			}
+			if tc.wantCopies > 0 && (*writes)[0] != command {
+				t.Fatalf("clipboard write = %q, want %q", (*writes)[0], command)
+			}
+			if out.String() != tc.wantStdout {
+				t.Fatalf("stdout = %q, want %q", out.String(), tc.wantStdout)
+			}
+		})
+	}
+}
+
+// TestPrecedenceMatrix locks the model dimension of CONF-03 end-to-end: the
+// model reaching selectProvider resolves flag > CLAI_MODEL env > config.json,
+// and when nothing is set the resolved model stays empty so the provider's
+// own DefaultModel applies (the built-in must remain "").
+func TestPrecedenceMatrix(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "sk-or-test")
+	t.Setenv("CLAI_PROVIDER", "")
+	t.Setenv("CLAI_DELIVERY", "")
+
+	cases := []struct {
+		name      string
+		cfg       config.Config
+		envModel  string
+		args      []string
+		wantModel string
+	}{
+		{
+			name:      "config model when flag and env unset",
+			cfg:       config.Config{Contract: config.ConfigContract, Provider: "openrouter", Model: "anthropic/config-model"},
+			wantModel: "anthropic/config-model",
+		},
+		{
+			name:      "env beats config",
+			cfg:       config.Config{Contract: config.ConfigContract, Provider: "openrouter", Model: "anthropic/config-model"},
+			envModel:  "anthropic/env-model",
+			wantModel: "anthropic/env-model",
+		},
+		{
+			name:      "flag beats env and config",
+			cfg:       config.Config{Contract: config.ConfigContract, Provider: "openrouter", Model: "anthropic/config-model"},
+			envModel:  "anthropic/env-model",
+			args:      []string{"--model", "anthropic/flag-model"},
+			wantModel: "anthropic/flag-model",
+		},
+		{
+			name:      "nothing set leaves model empty for provider default",
+			cfg:       config.Config{Contract: config.ConfigContract, Provider: "openrouter"},
+			wantModel: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CLAI_MODEL", tc.envModel)
+			swapLoadConfig(t, tc.cfg, nil)
+			got := captureSelectedProvider(t)
+
+			c, _, errBuf := captureCLI()
+			if code := c.run(tc.args); code != exitOK {
+				t.Fatalf("run(%v) = %d, want %d; stderr: %s", tc.args, code, exitOK, errBuf.String())
+			}
+			orp, ok := (*got).(openrouter.Provider)
+			if !ok {
+				t.Fatalf("provider = %T, want openrouter.Provider", *got)
+			}
+			if orp.Model != tc.wantModel {
+				t.Fatalf("Model = %q, want %q", orp.Model, tc.wantModel)
+			}
+		})
+	}
+}
+
+// TestWidgetConfigPrecedence proves the widget path resolves the model
+// identically to the interactive path: a config model reaches selectProvider
+// with no flag or env naming it (delivery does not apply in widget mode — the
+// result-file transport is fixed).
+func TestWidgetConfigPrecedence(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "sk-or-test")
+	t.Setenv("CLAI_PROVIDER", "")
+	t.Setenv("CLAI_MODEL", "")
+	swapLoadConfig(t, config.Config{Contract: config.ConfigContract, Provider: "openrouter", Model: "anthropic/config-model"}, nil)
+	got := captureSelectedProvider(t)
+
+	path := filepath.Join(t.TempDir(), "result")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c, _, errBuf := captureCLI()
+	code := c.run([]string{"widget", "--shell", "fish", "--result-file", path})
+	if code != exitCancelled {
+		t.Fatalf("run(widget) = %d, want %d; stderr: %s", code, exitCancelled, errBuf.String())
+	}
+	orp, ok := (*got).(openrouter.Provider)
+	if !ok {
+		t.Fatalf("provider = %T, want openrouter.Provider from config", *got)
+	}
+	if orp.Model != "anthropic/config-model" {
+		t.Fatalf("Model = %q, want config model", orp.Model)
+	}
+}
+
 // TestCorruptConfigWarnsOnceAndContinues locks the CONF-05 cmd contract: any
 // non-nil Load error — corrupt file or plain I/O failure — produces exactly
 // one stderr warning, leaves stdout untouched, keeps the exit code identical

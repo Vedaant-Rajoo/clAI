@@ -10,8 +10,13 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
+	"strings"
 )
 
 // ConfigContract identifies the config-file schema version (CONF-01).
@@ -38,8 +43,61 @@ type Config struct {
 	InitCompleted bool   `json:"init_completed"`
 }
 
+// Path returns the config file location <UserConfigDir>/clai/config.json,
+// mirroring internal/auth's derivation so config.json and credentials.json
+// provably share a base directory (CONF-01).
+func Path() (string, error) {
+	dir, err := userConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("locate user config directory: %w", err)
+	}
+	if err := validateConfiguredBasePath(dir); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "clai", fileName), nil
+}
+
+// validateConfiguredBasePath rejects relative bases and dot path components,
+// duplicated verbatim from internal/auth (which this phase must not modify).
+func validateConfiguredBasePath(path string) error {
+	if !filepath.IsAbs(path) {
+		return errors.New("user config directory must be absolute")
+	}
+	volume := filepath.VolumeName(path)
+	remainder := strings.TrimPrefix(path, volume)
+	for _, component := range strings.FieldsFunc(remainder, func(r rune) bool {
+		return r == '/' || r == '\\'
+	}) {
+		if component == "." || component == ".." {
+			return errors.New("user config directory must not contain dot path components")
+		}
+	}
+	return nil
+}
+
 // Load reads config.json leniently. A missing file is a first-class "not
-// configured yet" outcome: (Config{}, nil) with no diagnostic.
+// configured yet" outcome: (Config{}, nil) with no diagnostic. Any readable
+// but unparseable content — including an empty file — classifies as
+// ErrCorrupt; other read failures wrap the underlying I/O error. The read
+// side holds no secrets, so a plain os.ReadFile works on every platform (the
+// hardened writer arrives with Save in a later plan).
 func Load() (Config, error) {
-	return Config{}, errors.New("config: Load not implemented")
+	path, err := Path()
+	if err != nil {
+		return Config{}, err
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return Config{}, nil
+	}
+	if err != nil {
+		return Config{}, fmt.Errorf("read config file %q: %w", path, err)
+	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		// The wrapped json error carries only offset/type detail, never raw
+		// file bytes — a user may have pasted a key into the file.
+		return Config{}, fmt.Errorf("parse config file %q: %w (%v)", path, ErrCorrupt, err)
+	}
+	return cfg, nil
 }

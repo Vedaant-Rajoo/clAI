@@ -20,7 +20,7 @@ func parseDevEndpoint(t *testing.T, args ...string) (string, error) {
 	if err := fs.Parse(args); err != nil {
 		return "", err
 	}
-	return f.devEndpointOption()
+	return f.devEndpointOption(resolvedProviderForTest(f))
 }
 
 type nopWriter struct{}
@@ -113,11 +113,11 @@ func TestDevEndpointDefaultsToLocalOnly(t *testing.T) {
 			if err := fs.Parse([]string{"--provider", name, "--dev-endpoint", "http://127.0.0.1:8747"}); err != nil {
 				t.Fatal(err)
 			}
-			devEndpoint, err := f.devEndpointOption()
+			devEndpoint, err := f.devEndpointOption(resolvedProviderForTest(f))
 			if err != nil {
 				t.Fatal(err)
 			}
-			policy, shared, err := f.contextOptions(devEndpoint)
+			policy, shared, err := f.contextOptions(devEndpoint, resolvedProviderForTest(f))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -135,7 +135,7 @@ func TestDevEndpointDefaultsToLocalOnly(t *testing.T) {
 	if err := fs.Parse([]string{"--provider", "anthropic"}); err != nil {
 		t.Fatal(err)
 	}
-	policy, _, err := f.contextOptions("")
+	policy, _, err := f.contextOptions("", resolvedProviderForTest(f))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestDevEndpointDefaultsToLocalOnly(t *testing.T) {
 	if err := fs.Parse([]string{"--provider", "anthropic", "--dev-endpoint", "http://127.0.0.1:8747", "--context-policy", "remote-minimal"}); err != nil {
 		t.Fatal(err)
 	}
-	policy, _, err = f.contextOptions("http://127.0.0.1:8747")
+	policy, _, err = f.contextOptions("http://127.0.0.1:8747", resolvedProviderForTest(f))
 	if err != nil {
 		t.Fatal(err)
 	}

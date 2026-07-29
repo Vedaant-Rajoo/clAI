@@ -30,9 +30,10 @@ import (
 )
 
 var (
-	version    = "dev"
-	executeTUI = runTUI
-	loadConfig = config.Load
+	version        = "dev"
+	executeTUI     = runTUI
+	loadConfig     = config.Load
+	clipboardWrite = clipboard.WriteAll
 )
 
 const (

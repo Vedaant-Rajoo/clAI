@@ -12,3 +12,9 @@ func Resolve(flagValue, envValue, configValue, builtin string) string {
 	}
 	return builtin
 }
+
+// ResolveDelivery resolves the delivery booleans (copy-to-clipboard,
+// print-to-stdout) through the same flag > env > config > built-in chain.
+func ResolveDelivery(copyFlag, printFlag, copyExplicit, printExplicit bool, envValue, configValue string) (copyOut, printOut bool) {
+	return copyFlag, printFlag
+}

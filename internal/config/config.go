@@ -75,10 +75,21 @@ func validateConfiguredBasePath(path string) error {
 	return nil
 }
 
-// Save persists cfg to config.json (stub — hardened writer lands with the
-// GREEN step of this plan).
+// Save atomically persists cfg to <UserConfigDir>/clai/config.json via the
+// platform writer (flock + temp + fsync + rename, 0600/0700 on unix;
+// fail-closed elsewhere). The config-file/v1 contract is stamped
+// unconditionally — every written file identifies its schema version even
+// when the caller passes a zero Config (CONF-01). init_completed persists as
+// a plain JSON field of the same file; no separate marker file exists
+// (CONF-02).
 func Save(cfg Config) error {
-	return errors.New("config save not implemented")
+	cfg.Contract = ConfigContract
+	out, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode config: %w", err)
+	}
+	out = append(out, '\n')
+	return writeConfigFile(out)
 }
 
 // Load reads config.json leniently. A missing file is a first-class "not

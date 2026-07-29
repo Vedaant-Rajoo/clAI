@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -286,6 +287,91 @@ func TestConcurrentSave(t *testing.T) {
 		t.Errorf("final config %+v does not equal any single writer's complete payload", got)
 	}
 	assertNoTempLitter(t, base)
+}
+
+// TestConfigMarshalContainsNoCredentialFields is the CONF-04 structural
+// tripwire: the marshaled form of a fully-populated Config must contain no
+// credential-shaped substring, and the type must have exactly the known five
+// fields — any future field addition fails here and forces a human re-check
+// that it cannot carry key material (T-01-05). Because the struct is the only
+// serialization source, this holds for every write path, including
+// interrupted ones.
+func TestConfigMarshalContainsNoCredentialFields(t *testing.T) {
+	out, err := json.Marshal(Config{
+		Contract: ConfigContract, Provider: "openrouter",
+		Model: "m", Delivery: "clipboard", InitCompleted: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, banned := range []string{"key", "token", "secret", "credential"} {
+		if strings.Contains(strings.ToLower(string(out)), banned) {
+			t.Fatalf("marshaled config contains credential-shaped field %q: %s", banned, out)
+		}
+	}
+	// Structural guarantee: the type itself has no string field beyond the known set.
+	if reflect.TypeOf(Config{}).NumField() != 5 {
+		t.Fatal("Config gained a field — re-verify it cannot carry key material")
+	}
+}
+
+// TestInitCompletedRoundTrip proves CONF-02: init_completed persists as a
+// JSON field inside config.json, round-trips through Save/Load, and no
+// separate marker file of any name is created — proven by exhaustive
+// directory listing, not by absence of one known name.
+func TestInitCompletedRoundTrip(t *testing.T) {
+	requireUnix(t)
+	base := swapUserConfigDir(t)
+
+	if err := Save(Config{InitCompleted: true}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.InitCompleted {
+		t.Error("InitCompleted = false after Save(Config{InitCompleted: true})")
+	}
+	if data := readConfigBytes(t, base); !bytes.Contains(data, []byte(`"init_completed"`)) {
+		t.Errorf("persisted bytes missing the init_completed JSON key:\n%s", data)
+	}
+	entries, err := os.ReadDir(filepath.Join(base, "clai"))
+	if err != nil {
+		t.Fatalf("list config directory: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.Name() != fileName {
+			t.Errorf("unexpected entry %q in config directory — init state must live inside config.json, never a marker file", entry.Name())
+		}
+	}
+}
+
+// TestSaveDropsUnknownFields is the executable record of the accepted A4
+// decision (RESEARCH Assumptions Log): reads are lenient so unknown fields
+// from a future config-file version never brick the CLI, but Save serializes
+// the known struct only — an older binary rewriting the file silently drops
+// fields it does not know. Accepted for a single-binary CLI; the contract
+// field plus lenient reads keep future versions loadable. Changing to
+// raw-field round-tripping later is additive.
+func TestSaveDropsUnknownFields(t *testing.T) {
+	requireUnix(t)
+	base := swapUserConfigDir(t)
+	writeRawConfig(t, base, []byte(`{"provider":"rules","future_field":true}`))
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load with unknown field: %v", err)
+	}
+	if cfg.Provider != "rules" {
+		t.Fatalf("Provider = %q, want rules (known fields must parse)", cfg.Provider)
+	}
+	if err := Save(cfg); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if data := readConfigBytes(t, base); bytes.Contains(data, []byte("future_field")) {
+		t.Errorf("rewritten config still contains the unknown field:\n%s", data)
+	}
 }
 
 // TestLoadUnreadableFileIsIOErrorNotCorrupt proves the classification

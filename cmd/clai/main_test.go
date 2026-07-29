@@ -11,6 +11,7 @@ import (
 	"github.com/Vedaant-Rajoo/clai/internal/app"
 	"github.com/Vedaant-Rajoo/clai/internal/applicability"
 	"github.com/Vedaant-Rajoo/clai/internal/capability"
+	"github.com/Vedaant-Rajoo/clai/internal/config"
 	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
 	"github.com/Vedaant-Rajoo/clai/internal/provider"
 	"github.com/Vedaant-Rajoo/clai/internal/provider/anthropic"
@@ -157,6 +158,118 @@ func TestSelectProviderAnthropicSharedFieldsForwarded(t *testing.T) {
 	ap := p.(anthropic.Provider)
 	if len(ap.SharedFields) != 1 || ap.SharedFields[0] != machinecontext.FieldWorkingDirectory {
 		t.Errorf("SharedFields = %v, want [working_directory]", ap.SharedFields)
+	}
+}
+
+// captureSelectedProvider swaps the executeTUI seam so tests can observe
+// exactly which provider the command constructed, without running a real TUI.
+// The returned pointer is filled in when the command reaches the TUI boundary.
+func captureSelectedProvider(t *testing.T) *provider.Provider {
+	t.Helper()
+	var got provider.Provider
+	original := executeTUI
+	executeTUI = func(p provider.Provider, _ *capability.Cached, _, _ string) (app.Outcome, error) {
+		got = p
+		return app.Outcome{}, nil
+	}
+	t.Cleanup(func() { executeTUI = original })
+	return &got
+}
+
+// swapLoadConfig swaps the loadConfig seam, mirroring the executeTUI pattern,
+// so cmd tests control exactly what config.Load appears to return.
+func swapLoadConfig(t *testing.T, cfg config.Config, err error) {
+	t.Helper()
+	original := loadConfig
+	loadConfig = func() (config.Config, error) { return cfg, err }
+	t.Cleanup(func() { loadConfig = original })
+}
+
+// TestProviderPrecedenceEndToEnd is the tracer proof for CONF-01/CONF-03: a
+// config.json provider value selects the constructed provider at the
+// selectProvider boundary, env overrides config, and an explicit flag
+// overrides both — in the interactive path.
+func TestProviderPrecedenceEndToEnd(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "sk-or-test")
+
+	cases := []struct {
+		name           string
+		cfg            config.Config
+		envProvider    string
+		args           []string
+		wantOpenRouter bool
+	}{
+		{
+			name:           "config selects provider when flag and env are unset",
+			cfg:            config.Config{Contract: config.ConfigContract, Provider: "openrouter"},
+			envProvider:    "",
+			wantOpenRouter: true,
+		},
+		{
+			name:           "env overrides config",
+			cfg:            config.Config{Contract: config.ConfigContract, Provider: "openrouter"},
+			envProvider:    "rules",
+			wantOpenRouter: false,
+		},
+		{
+			name:           "flag overrides env and config",
+			cfg:            config.Config{Contract: config.ConfigContract, Provider: "openrouter"},
+			envProvider:    "openrouter",
+			args:           []string{"--provider", "rules"},
+			wantOpenRouter: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CLAI_PROVIDER", tc.envProvider)
+			swapLoadConfig(t, tc.cfg, nil)
+			got := captureSelectedProvider(t)
+
+			c, _, errBuf := captureCLI()
+			if code := c.run(tc.args); code != exitOK {
+				t.Fatalf("run(%v) = %d, want %d; stderr: %s", tc.args, code, exitOK, errBuf.String())
+			}
+			if *got == nil {
+				t.Fatal("executeTUI was not reached")
+			}
+			_, isOpenRouter := (*got).(openrouter.Provider)
+			if isOpenRouter != tc.wantOpenRouter {
+				t.Fatalf("provider = %T, want openrouter=%v", *got, tc.wantOpenRouter)
+			}
+			if !tc.wantOpenRouter {
+				if _, isRules := (*got).(rules.Provider); !isRules {
+					t.Fatalf("provider = %T, want rules.Provider", *got)
+				}
+			}
+		})
+	}
+}
+
+// TestWidgetProviderPrecedenceUsesConfig proves the widget path performs the
+// identical resolution: a config-selected provider reaches selectProvider even
+// though no flag or env names it (Pitfall 3 — the widget path must not be
+// skipped by the rewiring).
+func TestWidgetProviderPrecedenceUsesConfig(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "sk-or-test")
+	t.Setenv("CLAI_PROVIDER", "")
+	swapLoadConfig(t, config.Config{Contract: config.ConfigContract, Provider: "openrouter"}, nil)
+	got := captureSelectedProvider(t)
+
+	path := filepath.Join(t.TempDir(), "result")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c, _, errBuf := captureCLI()
+	code := c.run([]string{"widget", "--shell", "fish", "--result-file", path})
+	if code != exitCancelled {
+		t.Fatalf("run(widget) = %d, want %d; stderr: %s", code, exitCancelled, errBuf.String())
+	}
+	if *got == nil {
+		t.Fatal("executeTUI was not reached")
+	}
+	if _, ok := (*got).(openrouter.Provider); !ok {
+		t.Fatalf("provider = %T, want openrouter.Provider from config", *got)
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 	"github.com/Vedaant-Rajoo/clai/internal/applicability"
 	"github.com/Vedaant-Rajoo/clai/internal/auth"
 	"github.com/Vedaant-Rajoo/clai/internal/capability"
+	"github.com/Vedaant-Rajoo/clai/internal/config"
 	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
 	"github.com/Vedaant-Rajoo/clai/internal/provider"
 	"github.com/Vedaant-Rajoo/clai/internal/provider/anthropic"
@@ -31,6 +32,7 @@ import (
 var (
 	version    = "dev"
 	executeTUI = runTUI
+	loadConfig = config.Load
 )
 
 const (

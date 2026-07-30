@@ -165,6 +165,14 @@ func (c cli) runInteractive(args []string) int {
 	explicit := map[string]bool{}
 	fs.Visit(func(fl *flag.Flag) { explicit[fl.Name] = true })
 
+	// A standalone version request consumes no configuration. Keep combinations
+	// with other explicit flags on the normal validation path so invocation-local
+	// usage errors still take precedence over the version shortcut.
+	if *f.showVersion && len(explicit) == 1 {
+		fmt.Fprintln(c.stdout, version)
+		return exitOK
+	}
+
 	// Settings resolve before any provider-dependent validation so that a
 	// config-selected provider validates --dev-endpoint and defaults the
 	// context policy exactly like a flag-selected one (CONF-03).
@@ -183,10 +191,6 @@ func (c cli) runInteractive(args []string) int {
 		return exitUsage
 	}
 
-	if *f.showVersion {
-		fmt.Fprintln(c.stdout, version)
-		return exitOK
-	}
 	p, err := selectProvider(resolvedProvider, resolvedModel, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai: %v\n", err)

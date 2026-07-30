@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/Vedaant-Rajoo/clai/internal/config"
 )
 
 // These tests lock the contract for which stream each command writes to:
@@ -106,6 +108,45 @@ func TestOutputStreamRouting(t *testing.T) {
 			}
 			assertStream(t, "stdout", out.String(), tc.wantStdout)
 			assertStream(t, "stderr", errBuf.String(), tc.wantStderr)
+		})
+	}
+}
+
+// TestRequestedOutputBypassesConfigLoad is the REQ-CONFIG-008 regression
+// oracle: version and help output do not consume configuration, so ambient
+// config diagnostics must not affect either requested-output path.
+func TestRequestedOutputBypassesConfigLoad(t *testing.T) {
+	original := loadConfig
+	calls := 0
+	loadConfig = func() (config.Config, error) {
+		calls++
+		return config.Config{}, nil
+	}
+	t.Cleanup(func() { loadConfig = original })
+
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "version flag", args: []string{"--version"}, want: version},
+		{name: "version command", args: []string{"version"}, want: version},
+		{name: "help command", args: []string{"help"}, want: "Usage:"},
+		{name: "help flag", args: []string{"--help"}, want: "Usage:"},
+		{name: "command help", args: []string{"help", "auth"}, want: "clai auth"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := calls
+			c, out, errBuf := captureCLI()
+			if code := c.run(tc.args); code != exitOK {
+				t.Fatalf("run(%v) = %d, want %d; stderr: %s", tc.args, code, exitOK, errBuf.String())
+			}
+			if calls != before {
+				t.Fatalf("run(%v) called loadConfig %d time(s), want zero", tc.args, calls-before)
+			}
+			assertStream(t, "stdout", out.String(), tc.want)
+			assertStream(t, "stderr", errBuf.String(), "")
 		})
 	}
 }

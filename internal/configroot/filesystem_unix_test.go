@@ -16,7 +16,10 @@ func TestCanonicalizeRootSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	target := filepath.Join(base, "real-config-root")
-	if err := os.Mkdir(target, 0o700); err != nil {
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(target, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	approved := filepath.Join(base, "approved-config-root")
@@ -30,6 +33,35 @@ func TestCanonicalizeRootSymlink(t *testing.T) {
 	}
 	if got != target {
 		t.Fatalf("Canonicalize = %q, want canonical target %q", got, target)
+	}
+}
+
+func TestCanonicalizeExistingSharedBaseMode0755(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := filepath.Join(base, "xdg-config-home")
+	if err := os.Mkdir(selected, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(selected, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := Canonicalize(selected, false)
+	if err != nil {
+		t.Fatalf("Canonicalize existing 0755 shared base: %v", err)
+	}
+	if got != selected {
+		t.Fatalf("Canonicalize = %q, want %q", got, selected)
+	}
+	info, err := os.Stat(selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o755 {
+		t.Fatalf("shared base mode = %o, want unchanged 755", perm)
 	}
 }
 

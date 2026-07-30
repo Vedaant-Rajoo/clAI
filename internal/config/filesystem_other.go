@@ -2,16 +2,33 @@
 
 package config
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+)
 
 var errSecureFallbackUnsupported = errors.New("secure config write is unsupported on this platform")
+
+func migrateConfigFile(configFileLocations) error {
+	return nil
+}
+
+func readConfigFile(locations configFileLocations) ([]byte, bool, error) {
+	data, err := os.ReadFile(locations.preferred)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("read config file %q: %w", locations.preferred, err)
+	}
+	return data, true, nil
+}
 
 // Non-Darwin/Linux builds fail closed instead of claiming descriptor-relative,
 // no-follow, cross-process-lock behavior that has not been implemented or
 // runtime-proven on those platforms, mirroring internal/auth's platform split.
-// Load remains a plain os.ReadFile everywhere, so the CLI still works with a
-// zero Config on these platforms — only persistence is unavailable (recorded
-// decision, RESEARCH Open Question 1).
-func writeConfigFile([]byte) error {
+func writeConfigFile(configFileLocations, []byte) error {
 	return errSecureFallbackUnsupported
 }

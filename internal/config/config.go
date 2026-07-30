@@ -13,8 +13,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
-	"os"
 
 	"github.com/Vedaant-Rajoo/clai/internal/configroot"
 )
@@ -42,7 +40,14 @@ type Config struct {
 	InitCompleted bool   `json:"init_completed"`
 }
 
-// Path returns config.json below the shared preferred clai root (CONF-01).
+type configFileLocations struct {
+	preferred string
+	legacy    string
+}
+
+// Path returns config.json below the selected preferred clai root (CONF-01).
+// Filesystem operations canonicalize that approved root internally, but Path
+// preserves the resolver's selected spelling for diagnostics and callers.
 func Path() (string, error) {
 	roots, err := resolveConfigRoots()
 	if err != nil {
@@ -51,41 +56,75 @@ func Path() (string, error) {
 	return roots.PreferredPath(fileName), nil
 }
 
+func resolveConfigFileLocations(createPreferred bool) (configFileLocations, error) {
+	roots, err := resolveConfigRoots()
+	if err != nil {
+		return configFileLocations{}, fmt.Errorf("resolve config roots: %w", err)
+	}
+	preferred, err := configroot.Canonicalize(roots.Preferred, createPreferred)
+	if err != nil {
+		return configFileLocations{}, fmt.Errorf("canonicalize preferred config root: %w", err)
+	}
+	legacy := ""
+	if roots.Legacy != "" {
+		legacy, err = configroot.Canonicalize(roots.Legacy, false)
+		if err != nil {
+			return configFileLocations{}, fmt.Errorf("canonicalize legacy config root: %w", err)
+		}
+	}
+	canonical := configroot.Roots{Preferred: preferred, Legacy: legacy}
+	return configFileLocations{
+		preferred: canonical.PreferredPath(fileName),
+		legacy:    canonical.LegacyPath(fileName),
+	}, nil
+}
+
 // Save atomically persists cfg to <preferred-base>/clai/config.json via the
-// platform writer (flock + temp + fsync + rename, 0600/0700 on unix;
-// fail-closed elsewhere). The config-file/v1 contract is stamped
-// unconditionally — every written file identifies its schema version even
-// when the caller passes a zero Config (CONF-01). init_completed persists as
-// a plain JSON field of the same file; no separate marker file exists
-// (CONF-02).
+// platform writer. Every write stamps config-file/v1 and reconciles any legacy
+// Darwin copy under the same ordered lock set (CONF-01, REQ-CONFIG-003).
 func Save(cfg Config) error {
+	locations, err := resolveConfigFileLocations(true)
+	if err != nil {
+		return err
+	}
+	out, err := marshalConfig(cfg)
+	if err != nil {
+		return err
+	}
+	return writeConfigFile(locations, out)
+}
+
+func marshalConfig(cfg Config) ([]byte, error) {
 	cfg.Contract = ConfigContract
 	out, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
-		return fmt.Errorf("encode config: %w", err)
+		return nil, fmt.Errorf("encode config: %w", err)
 	}
-	out = append(out, '\n')
-	return writeConfigFile(out)
+	return append(out, '\n'), nil
 }
 
-// Load reads config.json leniently. A missing file is a first-class "not
-// configured yet" outcome: (Config{}, nil) with no diagnostic. Any readable
-// but unparseable content — including an empty file — classifies as
-// ErrCorrupt; other read failures wrap the underlying I/O error. The read
-// side holds no secrets, so a plain os.ReadFile works on every platform (the
-// hardened writer arrives with Save in a later plan).
+// Load reconciles the Darwin legacy location before decoding the preferred
+// config. A preferred file is authoritative whenever it exists, including when
+// its bytes are corrupt, so stale legacy settings can never be revived.
 func Load() (Config, error) {
-	path, err := Path()
+	locations, err := resolveConfigFileLocations(true)
 	if err != nil {
 		return Config{}, err
 	}
-	data, err := os.ReadFile(path)
-	if errors.Is(err, fs.ErrNotExist) {
+	if err := migrateConfigFile(locations); err != nil {
+		return Config{}, err
+	}
+	data, exists, err := readConfigFile(locations)
+	if err != nil {
+		return Config{}, err
+	}
+	if !exists {
 		return Config{}, nil
 	}
-	if err != nil {
-		return Config{}, fmt.Errorf("read config file %q: %w", path, err)
-	}
+	return decodeConfig(locations.preferred, data)
+}
+
+func decodeConfig(path string, data []byte) (Config, error) {
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		// The wrapped json error carries only offset/type detail, never raw

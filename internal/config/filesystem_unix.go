@@ -1,13 +1,10 @@
 //go:build darwin || linux
 
-// Hardened atomic write path for config.json, mirroring the shape of
-// internal/auth/filesystem_unix.go (which this phase must not modify or
-// import) scoped down for a secretless file: cross-process flock on
-// .config.lock, O_NOFOLLOW descriptor-relative operations, random temp file,
-// write -> fsync -> renameat -> directory fsync, and 0600/0700 permission
-// discipline (CONF-01, threats T-01-06/T-01-07/T-01-08). The credential-grade
-// TOCTOU re-verification battery and erase-on-finalize logic are intentionally
-// omitted — config.json holds no key material by construction (CONF-04).
+// Hardened config.json storage keeps root selection in configroot while all
+// clai descendants remain descriptor-relative and no-follow. Migration and
+// ordinary writes acquire every participating .config.lock in ascending
+// canonical app-path order, install a verified 0600 preferred file atomically,
+// and only then retire the legacy Darwin copy.
 package config
 
 import (
@@ -15,8 +12,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -28,34 +28,533 @@ const (
 	configLockPoll    = 10 * time.Millisecond
 )
 
-// writeConfigFile atomically replaces <UserConfigDir>/clai/config.json with
-// data while holding the .config.lock flock. Readers never observe a partial
-// file: replacement is a single rename of a fully-synced temp file (CONF-02).
-func writeConfigFile(data []byte) (retErr error) {
-	path, err := Path()
-	if err != nil {
-		return err
-	}
-	dir, err := openConfigDirectory(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	defer func() { retErr = errors.Join(retErr, closeConfigDirectory(dir)) }()
+type configDirectory struct {
+	basePath string
+	appPath  string
+	base     *os.File
+	app      *os.File
+	baseInfo os.FileInfo
+	appInfo  os.FileInfo
+}
 
-	lock, err := acquireConfigLock(dir)
-	if err != nil {
-		return err
-	}
-	defer func() { retErr = errors.Join(retErr, releaseConfigLock(dir, lock)) }()
+type configLock struct {
+	directory *configDirectory
+	file      *os.File
+	info      os.FileInfo
+}
 
-	temp, tempName, err := createConfigTemp(dir)
+func migrateConfigFile(locations configFileLocations) (retErr error) {
+	directories, preferred, legacy, err := openConfigDirectories(locations)
 	if err != nil {
 		return err
 	}
-	renamed := false
+	defer func() { retErr = errors.Join(retErr, closeConfigDirectories(directories)) }()
+
+	locks, err := acquireOrderedConfigLocks(directories)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, releaseOrderedConfigLocks(locks)) }()
+
+	if err := verifyLockedConfigState(directories, locks); err != nil {
+		return err
+	}
+	preferredFile, _, preferredExists, err := openConfigFile(preferred.app)
+	if err != nil {
+		return err
+	}
+	if preferredExists {
+		if err := closeConfigFile(preferredFile); err != nil {
+			return err
+		}
+		if legacy == nil {
+			return nil
+		}
+		return removeConfigFileIfPresent(legacy, locks)
+	}
+	if legacy == nil {
+		return nil
+	}
+
+	legacyFile, legacyInfo, legacyExists, err := openConfigFile(legacy.app)
+	if err != nil || !legacyExists {
+		return err
+	}
+	if err := verifyLockedConfigState(directories, locks); err != nil {
+		return errors.Join(err, closeConfigFile(legacyFile))
+	}
+	if err := verifyNamedConfigFile(legacy.app, fileName, legacyInfo, false); err != nil {
+		return errors.Join(fmt.Errorf("legacy config file changed before read: %w", err), closeConfigFile(legacyFile))
+	}
+	data, readErr := io.ReadAll(legacyFile)
+	closeErr := closeConfigFile(legacyFile)
+	if readErr != nil {
+		return errors.Join(fmt.Errorf("read legacy config file: %w", readErr), closeErr)
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	cfg, err := decodeConfig(locations.legacy, data)
+	if err != nil {
+		return err
+	}
+	out, err := marshalConfig(cfg)
+	if err != nil {
+		return err
+	}
+	if err := installConfigFile(preferred, out, nil, false, locks); err != nil {
+		return err
+	}
+	return removeConfigFile(legacy, legacyInfo, locks)
+}
+
+func readConfigFile(locations configFileLocations) (data []byte, exists bool, retErr error) {
+	basePath := filepath.Dir(filepath.Dir(locations.preferred))
+	directory, err := openConfigDirectory(basePath, false)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { retErr = errors.Join(retErr, directory.close()) }()
+
+	lock, err := acquireConfigLock(directory)
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { retErr = errors.Join(retErr, releaseConfigLock(lock)) }()
+
+	file, info, found, err := openConfigFile(directory.app)
+	if err != nil || !found {
+		return nil, found, err
+	}
+	if err := directory.verify(); err != nil {
+		return nil, false, errors.Join(err, closeConfigFile(file))
+	}
+	if err := verifyConfigLock(lock); err != nil {
+		return nil, false, errors.Join(err, closeConfigFile(file))
+	}
+	if err := verifyNamedConfigFile(directory.app, fileName, info, false); err != nil {
+		return nil, false, errors.Join(fmt.Errorf("config file changed before read: %w", err), closeConfigFile(file))
+	}
+	data, readErr := io.ReadAll(file)
+	closeErr := closeConfigFile(file)
+	if readErr != nil {
+		return nil, false, fmt.Errorf("read config file %q: %w", locations.preferred, readErr)
+	}
+	if closeErr != nil {
+		return nil, false, closeErr
+	}
+	return data, true, nil
+}
+
+func writeConfigFile(locations configFileLocations, data []byte) (retErr error) {
+	directories, preferred, legacy, err := openConfigDirectories(locations)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, closeConfigDirectories(directories)) }()
+
+	locks, err := acquireOrderedConfigLocks(directories)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, releaseOrderedConfigLocks(locks)) }()
+
+	if err := verifyLockedConfigState(directories, locks); err != nil {
+		return err
+	}
+	current, currentInfo, currentExists, err := openConfigFile(preferred.app)
+	if err != nil {
+		return err
+	}
+	if currentExists {
+		if err := closeConfigFile(current); err != nil {
+			return err
+		}
+	}
+
+	var legacyInfo os.FileInfo
+	legacyExists := false
+	if legacy != nil {
+		legacyFile, info, exists, err := openConfigFile(legacy.app)
+		if err != nil {
+			return err
+		}
+		legacyInfo, legacyExists = info, exists
+		if exists {
+			if err := closeConfigFile(legacyFile); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := installConfigFile(preferred, data, currentInfo, currentExists, locks); err != nil {
+		return err
+	}
+	if legacyExists {
+		return removeConfigFile(legacy, legacyInfo, locks)
+	}
+	return nil
+}
+
+func openConfigDirectories(locations configFileLocations) ([]*configDirectory, *configDirectory, *configDirectory, error) {
+	preferredBase := filepath.Dir(filepath.Dir(locations.preferred))
+	preferred, err := openConfigDirectory(preferredBase, true)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	directories := []*configDirectory{preferred}
+
+	var legacy *configDirectory
+	if locations.legacy != "" {
+		legacyBase := filepath.Dir(filepath.Dir(locations.legacy))
+		legacyApp := filepath.Dir(locations.legacy)
+		if legacyApp != preferred.appPath {
+			legacy, err = openConfigDirectory(legacyBase, false)
+			if errors.Is(err, os.ErrNotExist) {
+				legacy = nil
+			} else if err != nil {
+				return nil, nil, nil, errors.Join(err, closeConfigDirectories(directories))
+			} else {
+				directories = append(directories, legacy)
+			}
+		}
+	}
+
+	sort.Slice(directories, func(i, j int) bool {
+		return directories[i].appPath < directories[j].appPath
+	})
+	return directories, preferred, legacy, nil
+}
+
+func openConfigDirectory(basePath string, create bool) (*configDirectory, error) {
+	base, baseInfo, err := openConfiguredDirectory(basePath)
+	if err != nil {
+		return nil, err
+	}
+	appPath := filepath.Join(basePath, "clai")
+	result := &configDirectory{
+		basePath: basePath,
+		appPath:  appPath,
+		base:     base,
+		baseInfo: baseInfo,
+	}
+
+	created := false
+	if create {
+		err := unix.Mkdirat(int(base.Fd()), "clai", 0o700)
+		if err == nil {
+			created = true
+		} else if !errors.Is(err, unix.EEXIST) {
+			return nil, errors.Join(fmt.Errorf("create config directory: %w", err), result.close())
+		}
+	}
+	fd, err := unix.Openat(int(base.Fd()), "clai", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return nil, errors.Join(os.ErrNotExist, result.close())
+	}
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("open config directory: %w", err), result.close())
+	}
+	result.app = os.NewFile(uintptr(fd), appPath)
+	if created {
+		if err := result.app.Chmod(0o700); err != nil {
+			return nil, errors.Join(fmt.Errorf("set config directory permissions: %w", err), result.close())
+		}
+	}
+	result.appInfo, err = result.app.Stat()
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("inspect config directory: %w", err), result.close())
+	}
+	if !result.appInfo.IsDir() || result.appInfo.Mode().Perm()&0o077 != 0 {
+		return nil, errors.Join(errors.New("config directory must be a private non-symlink directory"), result.close())
+	}
+	if err := result.verify(); err != nil {
+		return nil, errors.Join(err, result.close())
+	}
+	return result, nil
+}
+
+func openConfiguredDirectory(path string) (*os.File, os.FileInfo, error) {
+	clean := filepath.Clean(path)
+	if !filepath.IsAbs(clean) {
+		return nil, nil, errors.New("config root must be absolute")
+	}
+	root := string(filepath.Separator)
+	fd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open filesystem root: %w", err)
+	}
+	current := os.NewFile(uintptr(fd), root)
+	trimmed := strings.TrimPrefix(clean, root)
+	if trimmed != "" {
+		for _, component := range strings.Split(trimmed, string(filepath.Separator)) {
+			if component == "" {
+				continue
+			}
+			nextFD, openErr := unix.Openat(int(current.Fd()), component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+			if openErr != nil {
+				closeErr := current.Close()
+				if errors.Is(openErr, unix.ENOENT) {
+					return nil, nil, errors.Join(os.ErrNotExist, closeErr)
+				}
+				return nil, nil, errors.Join(fmt.Errorf("securely traverse config root: %w", openErr), closeErr)
+			}
+			next := os.NewFile(uintptr(nextFD), component)
+			if closeErr := current.Close(); closeErr != nil {
+				return nil, nil, errors.Join(fmt.Errorf("close traversed config root: %w", closeErr), next.Close())
+			}
+			current = next
+		}
+	}
+	info, err := current.Stat()
+	if err != nil {
+		return nil, nil, errors.Join(fmt.Errorf("inspect config root: %w", err), current.Close())
+	}
+	if !info.IsDir() {
+		return nil, nil, errors.Join(errors.New("config root must be a non-symlink directory"), current.Close())
+	}
+	return current, info, nil
+}
+
+func (directory *configDirectory) verify() error {
+	base, baseInfo, err := openConfiguredDirectory(directory.basePath)
+	if err != nil {
+		return fmt.Errorf("verify config root: %w", err)
+	}
+	if !os.SameFile(directory.baseInfo, baseInfo) {
+		return errors.Join(errors.New("config root path changed during operation"), base.Close())
+	}
+	fd, err := unix.Openat(int(base.Fd()), "clai", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	baseCloseErr := base.Close()
+	if err != nil {
+		return fmt.Errorf("verify config directory path: %w", errors.Join(err, baseCloseErr))
+	}
+	app := os.NewFile(uintptr(fd), directory.appPath)
+	info, statErr := app.Stat()
+	closeErr := app.Close()
+	if statErr != nil || closeErr != nil || baseCloseErr != nil {
+		return fmt.Errorf("verify config directory: %w", errors.Join(statErr, closeErr, baseCloseErr))
+	}
+	if !info.IsDir() || !os.SameFile(directory.appInfo, info) {
+		return errors.New("config directory path changed during operation")
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return errors.New("config directory permissions allow group or other access")
+	}
+	return nil
+}
+
+func (directory *configDirectory) close() error {
+	var appErr, baseErr error
+	if directory.app != nil {
+		if err := directory.app.Close(); err != nil {
+			appErr = fmt.Errorf("close config directory: %w", err)
+		}
+		directory.app = nil
+	}
+	if directory.base != nil {
+		if err := directory.base.Close(); err != nil {
+			baseErr = fmt.Errorf("close config root: %w", err)
+		}
+		directory.base = nil
+	}
+	return errors.Join(appErr, baseErr)
+}
+
+func closeConfigDirectories(directories []*configDirectory) error {
+	var result error
+	for i := len(directories) - 1; i >= 0; i-- {
+		result = errors.Join(result, directories[i].close())
+	}
+	return result
+}
+
+func acquireOrderedConfigLocks(directories []*configDirectory) ([]*configLock, error) {
+	locks := make([]*configLock, 0, len(directories))
+	for _, directory := range directories {
+		lock, err := acquireConfigLock(directory)
+		if err != nil {
+			return nil, errors.Join(err, releaseOrderedConfigLocks(locks))
+		}
+		locks = append(locks, lock)
+	}
+	return locks, nil
+}
+
+func acquireConfigLock(directory *configDirectory) (*configLock, error) {
+	deadline := time.Now().Add(configLockTimeout)
+	for {
+		fd, err := unix.Openat(int(directory.app.Fd()), lockName, unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+		if errors.Is(err, unix.ENOENT) {
+			if time.Now().After(deadline) {
+				return nil, errors.New("timed out acquiring config lock")
+			}
+			time.Sleep(configLockPoll)
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("open config lock: %w", err)
+		}
+		file := os.NewFile(uintptr(fd), lockName)
+		info, err := file.Stat()
+		if err != nil {
+			return nil, errors.Join(fmt.Errorf("inspect config lock: %w", err), file.Close())
+		}
+		if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+			return nil, errors.Join(errors.New("config lock must be a private regular non-symlink file"), file.Close())
+		}
+		err = unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
+		switch {
+		case err == nil:
+			current, verifyErr := lockEntryMatches(directory.app, info)
+			if verifyErr != nil {
+				return nil, errors.Join(verifyErr, file.Close())
+			}
+			if current {
+				lock := &configLock{directory: directory, file: file, info: info}
+				if err := verifyConfigLock(lock); err != nil {
+					return nil, errors.Join(err, unlockAndCloseConfigLock(file))
+				}
+				return lock, nil
+			}
+			if closeErr := file.Close(); closeErr != nil {
+				return nil, fmt.Errorf("close stale config lock: %w", closeErr)
+			}
+		case errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN):
+			if closeErr := file.Close(); closeErr != nil {
+				return nil, fmt.Errorf("close config lock: %w", closeErr)
+			}
+		default:
+			return nil, errors.Join(fmt.Errorf("lock config file: %w", err), file.Close())
+		}
+		if time.Now().After(deadline) {
+			return nil, errors.New("timed out acquiring config lock")
+		}
+		time.Sleep(configLockPoll)
+	}
+}
+
+func lockEntryMatches(dir *os.File, expected os.FileInfo) (bool, error) {
+	fd, err := unix.Openat(int(dir.Fd()), lockName, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("verify config lock: %w", err)
+	}
+	entry := os.NewFile(uintptr(fd), lockName)
+	info, statErr := entry.Stat()
+	closeErr := entry.Close()
+	if statErr != nil || closeErr != nil {
+		return false, fmt.Errorf("inspect config lock entry: %w", errors.Join(statErr, closeErr))
+	}
+	return os.SameFile(expected, info), nil
+}
+
+func verifyConfigLock(lock *configLock) error {
+	if err := lock.directory.verify(); err != nil {
+		return err
+	}
+	if err := verifyNamedConfigFile(lock.directory.app, lockName, lock.info, true); err != nil {
+		return fmt.Errorf("verify config lock: %w", err)
+	}
+	return nil
+}
+
+func verifyLockedConfigState(directories []*configDirectory, locks []*configLock) error {
+	for _, directory := range directories {
+		if err := directory.verify(); err != nil {
+			return err
+		}
+	}
+	for _, lock := range locks {
+		if err := verifyConfigLock(lock); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func releaseOrderedConfigLocks(locks []*configLock) error {
+	var result error
+	for i := len(locks) - 1; i >= 0; i-- {
+		result = errors.Join(result, releaseConfigLock(locks[i]))
+	}
+	return result
+}
+
+func releaseConfigLock(lock *configLock) error {
+	var verifyErr, unlinkErr, syncErr error
+	if err := verifyConfigLock(lock); err != nil {
+		verifyErr = err
+	} else {
+		if err := unix.Unlinkat(int(lock.directory.app.Fd()), lockName, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+			unlinkErr = fmt.Errorf("remove config lock: %w", err)
+		}
+		if unlinkErr == nil {
+			if err := unix.Fsync(int(lock.directory.app.Fd())); err != nil {
+				syncErr = fmt.Errorf("sync config directory after lock removal: %w", err)
+			}
+		}
+	}
+	return errors.Join(verifyErr, unlinkErr, syncErr, unlockAndCloseConfigLock(lock.file))
+}
+
+func unlockAndCloseConfigLock(file *os.File) error {
+	var unlockErr, closeErr error
+	if err := unix.Flock(int(file.Fd()), unix.LOCK_UN); err != nil {
+		unlockErr = fmt.Errorf("unlock config file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		closeErr = fmt.Errorf("close config lock: %w", err)
+	}
+	return errors.Join(unlockErr, closeErr)
+}
+
+func openConfigFile(dir *os.File) (*os.File, os.FileInfo, bool, error) {
+	fd, err := unix.Openat(int(dir.Fd()), fileName, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return nil, nil, false, nil
+	}
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("open config file: %w", err)
+	}
+	file := os.NewFile(uintptr(fd), fileName)
+	info, err := file.Stat()
+	if err != nil {
+		return nil, nil, false, errors.Join(fmt.Errorf("inspect config file: %w", err), file.Close())
+	}
+	if !info.Mode().IsRegular() {
+		return nil, nil, false, errors.Join(errors.New("config file must be a regular non-symlink file"), file.Close())
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return nil, nil, false, errors.Join(errors.New("config file permissions allow group or other access"), file.Close())
+	}
+	return file, info, true, nil
+}
+
+func closeConfigFile(file *os.File) error {
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close config file: %w", err)
+	}
+	return nil
+}
+
+func installConfigFile(directory *configDirectory, data []byte, expected os.FileInfo, existed bool, locks []*configLock) (retErr error) {
+	if err := verifyLockedConfigState([]*configDirectory{directory}, locks); err != nil {
+		return err
+	}
+	temp, tempName, tempInfo, err := createConfigTemp(directory.app)
+	if err != nil {
+		return err
+	}
+	tempExists := true
 	defer func() {
-		if !renamed {
-			if unlinkErr := unix.Unlinkat(int(dir.Fd()), tempName, 0); unlinkErr != nil {
+		if tempExists {
+			if unlinkErr := unix.Unlinkat(int(directory.app.Fd()), tempName, 0); unlinkErr != nil && !errors.Is(unlinkErr, unix.ENOENT) {
 				retErr = errors.Join(retErr, fmt.Errorf("remove config temporary file: %w", unlinkErr))
 			}
 		}
@@ -70,176 +569,93 @@ func writeConfigFile(data []byte) (retErr error) {
 	if err := temp.Sync(); err != nil {
 		return fmt.Errorf("sync config temporary file: %w", err)
 	}
-	if err := unix.Renameat(int(dir.Fd()), tempName, int(dir.Fd()), fileName); err != nil {
+	if err := verifyLockedConfigState([]*configDirectory{directory}, locks); err != nil {
+		return err
+	}
+	if existed {
+		if err := verifyNamedConfigFile(directory.app, fileName, expected, false); err != nil {
+			return fmt.Errorf("config file changed before replace: %w", err)
+		}
+	} else {
+		appeared, _, nowExists, err := openConfigFile(directory.app)
+		if err != nil {
+			return err
+		}
+		if nowExists {
+			return errors.Join(errors.New("config file appeared before replace"), closeConfigFile(appeared))
+		}
+	}
+	if err := unix.Renameat(int(directory.app.Fd()), tempName, int(directory.app.Fd()), fileName); err != nil {
 		return fmt.Errorf("replace config file: %w", err)
 	}
-	renamed = true
-	if err := unix.Fsync(int(dir.Fd())); err != nil {
+	tempExists = false
+	if err := verifyLockedConfigState([]*configDirectory{directory}, locks); err != nil {
+		return err
+	}
+	if err := verifyNamedConfigFile(directory.app, fileName, tempInfo, false); err != nil {
+		return fmt.Errorf("verify replaced config file: %w", err)
+	}
+	if err := unix.Fsync(int(directory.app.Fd())); err != nil {
 		return fmt.Errorf("sync config directory: %w", err)
 	}
 	return nil
 }
 
-// openConfigDirectory opens (creating if absent, mode 0700) the clai config
-// directory as a descriptor via O_NOFOLLOW so a symlink planted at the
-// directory name is rejected rather than followed (T-01-06). An existing
-// directory whose permissions grant group or other access is rejected.
-func openConfigDirectory(appPath string) (retFile *os.File, retErr error) {
-	basePath := filepath.Dir(appPath)
-	baseFd, err := unix.Open(basePath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, fmt.Errorf("open user config directory: %w", err)
+func removeConfigFileIfPresent(directory *configDirectory, locks []*configLock) error {
+	file, info, exists, err := openConfigFile(directory.app)
+	if err != nil || !exists {
+		return err
 	}
-	base := os.NewFile(uintptr(baseFd), basePath)
-	defer func() {
-		if closeErr := base.Close(); closeErr != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("close user config directory: %w", closeErr))
-		}
-	}()
-
-	created := false
-	if err := unix.Mkdirat(int(base.Fd()), filepath.Base(appPath), 0o700); err == nil {
-		created = true
-	} else if !errors.Is(err, unix.EEXIST) {
-		return nil, fmt.Errorf("create config directory: %w", err)
+	if err := closeConfigFile(file); err != nil {
+		return err
 	}
-	fd, err := unix.Openat(int(base.Fd()), filepath.Base(appPath), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return nil, fmt.Errorf("open config directory: %w", err)
-	}
-	dir := os.NewFile(uintptr(fd), appPath)
-	if created {
-		if err := dir.Chmod(0o700); err != nil {
-			return nil, errors.Join(fmt.Errorf("set config directory permissions: %w", err), dir.Close())
-		}
-	}
-	info, err := dir.Stat()
-	if err != nil {
-		return nil, errors.Join(fmt.Errorf("inspect config directory: %w", err), dir.Close())
-	}
-	if !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
-		return nil, errors.Join(errors.New("config directory must be a private non-symlink directory"), dir.Close())
-	}
-	return dir, nil
+	return removeConfigFile(directory, info, locks)
 }
 
-func closeConfigDirectory(dir *os.File) error {
-	if err := dir.Close(); err != nil {
-		return fmt.Errorf("close config directory: %w", err)
+func removeConfigFile(directory *configDirectory, expected os.FileInfo, locks []*configLock) error {
+	if err := verifyLockedConfigState([]*configDirectory{directory}, locks); err != nil {
+		return err
+	}
+	if err := verifyNamedConfigFile(directory.app, fileName, expected, false); err != nil {
+		return fmt.Errorf("config file changed before removal: %w", err)
+	}
+	if err := unix.Unlinkat(int(directory.app.Fd()), fileName, 0); err != nil {
+		return fmt.Errorf("remove legacy config file: %w", err)
+	}
+	if err := unix.Fsync(int(directory.app.Fd())); err != nil {
+		return fmt.Errorf("sync legacy config directory: %w", err)
 	}
 	return nil
 }
 
-// acquireConfigLock takes an exclusive flock on .config.lock inside dir,
-// polling every configLockPoll up to configLockTimeout. Because
-// releaseConfigLock unlinks the lock file, a successful flock is only valid
-// if the locked descriptor still matches the current directory entry — a
-// stale inode (unlinked by a finishing writer) is discarded and the acquire
-// retried on the fresh entry.
-func acquireConfigLock(dir *os.File) (*os.File, error) {
-	deadline := time.Now().Add(configLockTimeout)
-	for {
-		fd, err := unix.Openat(int(dir.Fd()), lockName, unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
-		if errors.Is(err, unix.ENOENT) {
-			// A finishing writer unlinked the entry mid-open (create vs.
-			// unlink race); retry on the next poll tick.
-			if time.Now().After(deadline) {
-				return nil, errors.New("timed out acquiring config lock")
-			}
-			time.Sleep(configLockPoll)
-			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("open config lock: %w", err)
-		}
-		lock := os.NewFile(uintptr(fd), lockName)
-		info, err := lock.Stat()
-		if err != nil {
-			return nil, errors.Join(fmt.Errorf("inspect config lock: %w", err), lock.Close())
-		}
-		if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
-			return nil, errors.Join(errors.New("config lock must be a private regular non-symlink file"), lock.Close())
-		}
-		err = unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
-		switch {
-		case err == nil:
-			current, verifyErr := lockEntryMatches(dir, info)
-			if verifyErr != nil {
-				return nil, errors.Join(verifyErr, lock.Close())
-			}
-			if current {
-				return lock, nil
-			}
-			// A finishing writer unlinked this inode after we opened it;
-			// close the stale descriptor and retry on the fresh entry.
-			if closeErr := lock.Close(); closeErr != nil {
-				return nil, fmt.Errorf("close stale config lock: %w", closeErr)
-			}
-		case errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN):
-			// Held by another writer; close so a holder's unlink+recreate is
-			// picked up on the next open.
-			if closeErr := lock.Close(); closeErr != nil {
-				return nil, fmt.Errorf("close config lock: %w", closeErr)
-			}
-		default:
-			return nil, errors.Join(fmt.Errorf("lock config file: %w", err), lock.Close())
-		}
-		if time.Now().After(deadline) {
-			return nil, errors.New("timed out acquiring config lock")
-		}
-		time.Sleep(configLockPoll)
-	}
-}
-
-// lockEntryMatches reports whether info (the locked descriptor's identity)
-// still names the current lockName entry in dir. A missing entry means the
-// lock file was already unlinked.
-func lockEntryMatches(dir *os.File, info os.FileInfo) (bool, error) {
-	fd, err := unix.Openat(int(dir.Fd()), lockName, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if errors.Is(err, unix.ENOENT) {
-		return false, nil
-	}
+func verifyNamedConfigFile(dir *os.File, name string, expected os.FileInfo, lock bool) (retErr error) {
+	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
-		return false, fmt.Errorf("verify config lock: %w", err)
+		return err
 	}
-	entry := os.NewFile(uintptr(fd), lockName)
-	entryInfo, err := entry.Stat()
-	closeErr := entry.Close()
+	file := os.NewFile(uintptr(fd), name)
+	defer func() { retErr = errors.Join(retErr, file.Close()) }()
+	info, err := file.Stat()
 	if err != nil {
-		return false, errors.Join(fmt.Errorf("inspect config lock entry: %w", err), closeErr)
+		return err
 	}
-	if closeErr != nil {
-		return false, fmt.Errorf("close config lock entry: %w", closeErr)
+	if !info.Mode().IsRegular() || !os.SameFile(expected, info) {
+		return errors.New("file identity changed")
 	}
-	return os.SameFile(info, entryInfo), nil
+	if info.Mode().Perm()&0o077 != 0 {
+		if lock {
+			return errors.New("lock permissions allow group or other access")
+		}
+		return errors.New("file permissions allow group or other access")
+	}
+	return nil
 }
 
-// releaseConfigLock unlinks the lock file while the flock is still held (so
-// the lock file is transient on disk), then unlocks and closes the
-// descriptor. Independent failures are joined.
-func releaseConfigLock(dir *os.File, lock *os.File) error {
-	var unlinkErr error
-	if err := unix.Unlinkat(int(dir.Fd()), lockName, 0); err != nil && !errors.Is(err, unix.ENOENT) {
-		unlinkErr = fmt.Errorf("remove config lock: %w", err)
-	}
-	var unlockErr error
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_UN); err != nil {
-		unlockErr = fmt.Errorf("unlock config file: %w", err)
-	}
-	var closeErr error
-	if err := lock.Close(); err != nil {
-		closeErr = fmt.Errorf("close config lock: %w", err)
-	}
-	return errors.Join(unlinkErr, unlockErr, closeErr)
-}
-
-// createConfigTemp creates a private random ".config-<hex>.tmp" file inside
-// dir via O_EXCL|O_NOFOLLOW, retrying on name collisions.
-func createConfigTemp(dir *os.File) (*os.File, string, error) {
+func createConfigTemp(dir *os.File) (*os.File, string, os.FileInfo, error) {
 	for range 32 {
 		var random [12]byte
 		if _, err := rand.Read(random[:]); err != nil {
-			return nil, "", fmt.Errorf("generate config temporary name: %w", err)
+			return nil, "", nil, fmt.Errorf("generate config temporary name: %w", err)
 		}
 		name := ".config-" + hex.EncodeToString(random[:]) + ".tmp"
 		fd, err := unix.Openat(int(dir.Fd()), name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
@@ -247,26 +663,29 @@ func createConfigTemp(dir *os.File) (*os.File, string, error) {
 			continue
 		}
 		if err != nil {
-			return nil, "", fmt.Errorf("create config temporary file: %w", err)
+			return nil, "", nil, fmt.Errorf("create config temporary file: %w", err)
 		}
 		file := os.NewFile(uintptr(fd), name)
 		if err := file.Chmod(0o600); err != nil {
-			return nil, "", errors.Join(fmt.Errorf("set config temporary permissions: %w", err), cleanupConfigTemp(file, dir, name))
+			return nil, "", nil, errors.Join(fmt.Errorf("set config temporary permissions: %w", err), cleanupConfigTemp(file, dir, name))
 		}
 		info, err := file.Stat()
 		if err != nil {
-			return nil, "", errors.Join(fmt.Errorf("inspect config temporary file: %w", err), cleanupConfigTemp(file, dir, name))
+			return nil, "", nil, errors.Join(fmt.Errorf("inspect config temporary file: %w", err), cleanupConfigTemp(file, dir, name))
 		}
 		if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
-			return nil, "", errors.Join(errors.New("created config temporary is not a private regular file"), cleanupConfigTemp(file, dir, name))
+			return nil, "", nil, errors.Join(errors.New("created config temporary is not a private regular file"), cleanupConfigTemp(file, dir, name))
 		}
-		return file, name, nil
+		return file, name, info, nil
 	}
-	return nil, "", errors.New("could not allocate config temporary file")
+	return nil, "", nil, errors.New("could not allocate config temporary file")
 }
 
 func cleanupConfigTemp(file *os.File, dir *os.File, name string) error {
 	closeErr := file.Close()
 	unlinkErr := unix.Unlinkat(int(dir.Fd()), name, 0)
+	if errors.Is(unlinkErr, unix.ENOENT) {
+		unlinkErr = nil
+	}
 	return errors.Join(closeErr, unlinkErr)
 }

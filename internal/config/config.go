@@ -13,6 +13,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 
 	"github.com/Vedaant-Rajoo/clai/internal/configroot"
 )
@@ -49,25 +52,42 @@ type configFileLocations struct {
 // Filesystem operations canonicalize that approved root internally, but Path
 // preserves the resolver's selected spelling for diagnostics and callers.
 func Path() (string, error) {
-	roots, err := resolveConfigRoots()
+	locations, err := selectedConfigFileLocations()
 	if err != nil {
-		return "", fmt.Errorf("resolve config roots: %w", err)
+		return "", err
 	}
-	return roots.PreferredPath(fileName), nil
+	return locations.preferred, nil
 }
 
-func resolveConfigFileLocations(createPreferred bool) (configFileLocations, error) {
+func selectedConfigFileLocations() (configFileLocations, error) {
 	roots, err := resolveConfigRoots()
 	if err != nil {
 		return configFileLocations{}, fmt.Errorf("resolve config roots: %w", err)
 	}
-	preferred, err := configroot.Canonicalize(roots.Preferred, createPreferred)
+	return configFileLocations{
+		preferred: roots.PreferredPath(fileName),
+		legacy:    roots.LegacyPath(fileName),
+	}, nil
+}
+
+func resolveConfigFileLocations(createPreferred bool) (configFileLocations, error) {
+	selected, err := selectedConfigFileLocations()
+	if err != nil {
+		return configFileLocations{}, err
+	}
+	return canonicalizeConfigFileLocations(selected, createPreferred)
+}
+
+func canonicalizeConfigFileLocations(selected configFileLocations, createPreferred bool) (configFileLocations, error) {
+	preferredRoot := filepathRoot(selected.preferred)
+	preferred, err := configroot.Canonicalize(preferredRoot, createPreferred)
 	if err != nil {
 		return configFileLocations{}, fmt.Errorf("canonicalize preferred config root: %w", err)
 	}
 	legacy := ""
-	if roots.Legacy != "" {
-		legacy, err = configroot.Canonicalize(roots.Legacy, false)
+	if selected.legacy != "" {
+		legacyRoot := filepathRoot(selected.legacy)
+		legacy, err = configroot.Canonicalize(legacyRoot, false)
 		if err != nil {
 			return configFileLocations{}, fmt.Errorf("canonicalize legacy config root: %w", err)
 		}
@@ -77,6 +97,10 @@ func resolveConfigFileLocations(createPreferred bool) (configFileLocations, erro
 		preferred: canonical.PreferredPath(fileName),
 		legacy:    canonical.LegacyPath(fileName),
 	}, nil
+}
+
+func filepathRoot(configPath string) string {
+	return filepath.Dir(filepath.Dir(configPath))
 }
 
 // Save atomically persists cfg to <preferred-base>/clai/config.json via the
@@ -107,7 +131,18 @@ func marshalConfig(cfg Config) ([]byte, error) {
 // config. A preferred file is authoritative whenever it exists, including when
 // its bytes are corrupt, so stale legacy settings can never be revived.
 func Load() (Config, error) {
-	locations, err := resolveConfigFileLocations(true)
+	selected, err := selectedConfigFileLocations()
+	if err != nil {
+		return Config{}, err
+	}
+	exists, err := configStateExists(selected)
+	if err != nil {
+		return Config{}, err
+	}
+	if !exists {
+		return Config{}, nil
+	}
+	locations, err := canonicalizeConfigFileLocations(selected, true)
 	if err != nil {
 		return Config{}, err
 	}
@@ -122,6 +157,20 @@ func Load() (Config, error) {
 		return Config{}, nil
 	}
 	return decodeConfig(locations.preferred, data)
+}
+
+func configStateExists(locations configFileLocations) (bool, error) {
+	for _, path := range []string{locations.preferred, locations.legacy} {
+		if path == "" {
+			continue
+		}
+		if _, err := os.Lstat(path); err == nil {
+			return true, nil
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return false, fmt.Errorf("inspect config file %q: %w", path, err)
+		}
+	}
+	return false, nil
 }
 
 func decodeConfig(path string, data []byte) (Config, error) {

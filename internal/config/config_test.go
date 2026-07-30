@@ -101,7 +101,7 @@ func TestLoadReadsHandWrittenConfigFile(t *testing.T) {
 // all means a zero Config and no error, so a fresh install behaves exactly
 // like today.
 func TestLoadMissingFileIsSilent(t *testing.T) {
-	swapConfigRoots(t)
+	base := swapConfigRoots(t)
 
 	cfg, err := Load()
 	if err != nil {
@@ -109,6 +109,9 @@ func TestLoadMissingFileIsSilent(t *testing.T) {
 	}
 	if cfg != (Config{}) {
 		t.Fatalf("cfg = %+v, want zero Config", cfg)
+	}
+	if _, err := os.Lstat(filepath.Join(base, "clai")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Load on missing config created storage state: %v", err)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -974,4 +975,268 @@ func TestWidgetApplicabilityBranchesAndEditedDerivationObservable(t *testing.T) 
 	if !found {
 		t.Fatalf("edited reasons = %v, want derived base name naming the missing executable", edited.Reasons)
 	}
+}
+
+type realConfigRootFixture struct {
+	home      string
+	xdg       string
+	preferred string
+	legacy    string
+}
+
+// TestRealConfigRootPrecedence restores the production config.Load seam and
+// proves provider, model, delivery, explicit-default, environment, and widget
+// resolution against real isolated config-file/v1 bytes (REQ-CONFIG-008).
+func TestRealConfigRootPrecedence(t *testing.T) {
+	t.Run("config layer drives provider model delivery and init state", func(t *testing.T) {
+		fixture := useRealConfigRoot(t)
+		writeRealConfigFixture(t, fixture.preferred, `{
+  "contract": "config-file/v1",
+  "provider": "openrouter",
+  "model": "config-model",
+  "delivery": "stdout",
+  "init_completed": true
+}
+`)
+		t.Setenv("OPENROUTER_API_KEY", "isolated-openrouter-key")
+		const command = "printf config-layer"
+		got := captureSelectedProviderWithOutcome(t, app.Outcome{Command: command, Accepted: true})
+		writes := swapClipboardWrite(t)
+
+		c, out, errBuf := captureCLI()
+		if code := c.run(nil); code != exitOK {
+			t.Fatalf("run = %d, want %d; stderr: %s", code, exitOK, errBuf.String())
+		}
+		selected, ok := (*got).(openrouter.Provider)
+		if !ok || selected.Model != "config-model" {
+			t.Fatalf("provider = %#v (%T), want openrouter model config-model", *got, *got)
+		}
+		if out.String() != command+"\n" || errBuf.String() != "" || len(*writes) != 0 {
+			t.Fatalf("delivery streams/writes = stdout %q stderr %q clipboard %v", out.String(), errBuf.String(), *writes)
+		}
+		loaded, err := config.Load()
+		if err != nil {
+			t.Fatalf("load real config: %v", err)
+		}
+		if loaded.Contract != config.ConfigContract || !loaded.InitCompleted {
+			t.Fatalf("loaded config = %+v, want config-file/v1 with init_completed", loaded)
+		}
+	})
+
+	t.Run("environment overrides real config", func(t *testing.T) {
+		fixture := useRealConfigRoot(t)
+		writeRealConfigFixture(t, fixture.preferred, `{
+  "contract": "config-file/v1",
+  "provider": "rules",
+  "model": "config-model",
+  "delivery": "clipboard",
+  "init_completed": true
+}
+`)
+		t.Setenv("CLAI_PROVIDER", "openrouter")
+		t.Setenv("CLAI_MODEL", "env-model")
+		t.Setenv("CLAI_DELIVERY", "stdout")
+		t.Setenv("OPENROUTER_API_KEY", "isolated-openrouter-key")
+		const command = "printf env-layer"
+		got := captureSelectedProviderWithOutcome(t, app.Outcome{Command: command, Accepted: true})
+		writes := swapClipboardWrite(t)
+
+		c, out, errBuf := captureCLI()
+		if code := c.run(nil); code != exitOK {
+			t.Fatalf("run = %d, want %d; stderr: %s", code, exitOK, errBuf.String())
+		}
+		selected, ok := (*got).(openrouter.Provider)
+		if !ok || selected.Model != "env-model" {
+			t.Fatalf("provider = %#v (%T), want environment-selected openrouter model env-model", *got, *got)
+		}
+		if out.String() != command+"\n" || errBuf.String() != "" || len(*writes) != 0 {
+			t.Fatalf("environment delivery = stdout %q stderr %q clipboard %v", out.String(), errBuf.String(), *writes)
+		}
+	})
+
+	t.Run("flag values equal to built-in defaults remain explicit", func(t *testing.T) {
+		fixture := useRealConfigRoot(t)
+		writeRealConfigFixture(t, fixture.preferred, `{
+  "contract": "config-file/v1",
+  "provider": "openrouter",
+  "model": "config-model",
+  "delivery": "clipboard",
+  "init_completed": true
+}
+`)
+		got := captureSelectedProviderWithOutcome(t, app.Outcome{Command: "printf explicit-default", Accepted: true})
+		writes := swapClipboardWrite(t)
+
+		c, out, errBuf := captureCLI()
+		if code := c.run([]string{"--provider", "rules", "--copy=false"}); code != exitOK {
+			t.Fatalf("run = %d, want %d; stderr: %s", code, exitOK, errBuf.String())
+		}
+		if _, ok := (*got).(rules.Provider); !ok {
+			t.Fatalf("provider = %T, want explicit rules value to beat real config", *got)
+		}
+		if out.String() != "" || errBuf.String() != "" || len(*writes) != 0 {
+			t.Fatalf("explicit defaults = stdout %q stderr %q clipboard %v, want no delivery", out.String(), errBuf.String(), *writes)
+		}
+	})
+
+	t.Run("model flag beats environment and real config", func(t *testing.T) {
+		fixture := useRealConfigRoot(t)
+		writeRealConfigFixture(t, fixture.preferred, `{
+  "contract": "config-file/v1",
+  "provider": "openrouter",
+  "model": "config-model",
+  "init_completed": true
+}
+`)
+		t.Setenv("CLAI_MODEL", "env-model")
+		t.Setenv("OPENROUTER_API_KEY", "isolated-openrouter-key")
+		got := captureSelectedProvider(t)
+
+		c, _, errBuf := captureCLI()
+		if code := c.run([]string{"--model", "flag-model"}); code != exitOK {
+			t.Fatalf("run = %d, want %d; stderr: %s", code, exitOK, errBuf.String())
+		}
+		selected, ok := (*got).(openrouter.Provider)
+		if !ok || selected.Model != "flag-model" {
+			t.Fatalf("provider = %#v (%T), want flag model", *got, *got)
+		}
+	})
+
+	t.Run("widget resolves model from the real preferred file", func(t *testing.T) {
+		fixture := useRealConfigRoot(t)
+		writeRealConfigFixture(t, fixture.preferred, `{
+  "contract": "config-file/v1",
+  "provider": "openrouter",
+  "model": "widget-config-model",
+  "delivery": "clipboard",
+  "init_completed": true
+}
+`)
+		t.Setenv("OPENROUTER_API_KEY", "isolated-openrouter-key")
+		got := captureSelectedProvider(t)
+		resultPath := filepath.Join(t.TempDir(), "result")
+		if err := os.WriteFile(resultPath, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		c, out, errBuf := captureCLI()
+		code := c.run([]string{"widget", "--shell", "fish", "--result-file", resultPath})
+		if code != exitCancelled {
+			t.Fatalf("widget exit = %d, want %d; stderr: %s", code, exitCancelled, errBuf.String())
+		}
+		selected, ok := (*got).(openrouter.Provider)
+		if !ok || selected.Model != "widget-config-model" {
+			t.Fatalf("widget provider = %#v (%T), want preferred model", *got, *got)
+		}
+		if out.String() != "" || errBuf.String() != "" {
+			t.Fatalf("widget streams = stdout %q stderr %q, want silent cancellation", out.String(), errBuf.String())
+		}
+	})
+}
+
+// TestRealConfigRootCorruptPreferredNeverFallsBack proves the no-seam cmd path
+// warns once, defaults to rules, retains corrupt preferred bytes, and never
+// exposes a valid legacy sentinel (REQ-CONFIG-003/008).
+func TestRealConfigRootCorruptPreferredNeverFallsBack(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skipf("Darwin Application Support legacy config is unavailable on %s", runtime.GOOS)
+	}
+	fixture := useRealConfigRoot(t)
+	corrupt := `{"provider":"preferred-broken"`
+	writeRealConfigFixture(t, fixture.preferred, corrupt)
+	writeRealConfigFixture(t, fixture.legacy, `{
+  "contract": "config-file/v1",
+  "provider": "legacy-provider-sentinel",
+  "model": "legacy-model-sentinel",
+  "delivery": "clipboard",
+  "init_completed": true
+}
+`)
+	got := captureSelectedProvider(t)
+
+	c, out, errBuf := captureCLI()
+	if code := c.run(nil); code != exitOK {
+		t.Fatalf("run = %d, want %d; stderr: %s", code, exitOK, errBuf.String())
+	}
+	if _, ok := (*got).(rules.Provider); !ok {
+		t.Fatalf("provider = %T, want built-in rules after corrupt preferred", *got)
+	}
+	if out.String() != "" {
+		t.Fatalf("stdout = %q, want empty", out.String())
+	}
+	if strings.Count(errBuf.String(), "clai: warning:") != 1 || !strings.Contains(errBuf.String(), "continuing with defaults") {
+		t.Fatalf("stderr = %q, want one completed corrupt-config warning", errBuf.String())
+	}
+	for _, forbidden := range []string{"legacy-provider-sentinel", "legacy-model-sentinel"} {
+		if strings.Contains(errBuf.String(), forbidden) {
+			t.Fatalf("stderr disclosed legacy sentinel %q: %q", forbidden, errBuf.String())
+		}
+	}
+	data, err := os.ReadFile(fixture.preferred)
+	if err != nil {
+		t.Fatalf("read corrupt preferred: %v", err)
+	}
+	if string(data) != corrupt {
+		t.Fatalf("corrupt preferred bytes changed: got %q want %q", data, corrupt)
+	}
+	if _, err := os.Lstat(fixture.legacy); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy config remains after preferred authority: %v", err)
+	}
+}
+
+func useRealConfigRoot(t *testing.T) realConfigRootFixture {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("canonicalize real-config test root: %v", err)
+	}
+	home := filepath.Join(root, "home")
+	xdg := filepath.Join(root, "xdg")
+	for _, path := range []string{home, xdg} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatalf("create isolated config root %q: %v", path, err)
+		}
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	for _, name := range []string{"CLAI_PROVIDER", "CLAI_MODEL", "CLAI_DELIVERY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"} {
+		t.Setenv(name, "")
+	}
+	original := loadConfig
+	loadConfig = config.Load
+	t.Cleanup(func() { loadConfig = original })
+	return realConfigRootFixture{
+		home:      home,
+		xdg:       xdg,
+		preferred: filepath.Join(xdg, "clai", "config.json"),
+		legacy:    filepath.Join(home, "Library", "Application Support", "clai", "config.json"),
+	}
+}
+
+func writeRealConfigFixture(t *testing.T, path, data string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("create config fixture directory: %v", err)
+	}
+	if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("set config fixture directory mode: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatalf("write config fixture: %v", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatalf("set config fixture mode: %v", err)
+	}
+}
+
+func captureSelectedProviderWithOutcome(t *testing.T, outcome app.Outcome) *provider.Provider {
+	t.Helper()
+	var got provider.Provider
+	original := executeTUI
+	executeTUI = func(p provider.Provider, _ *capability.Cached, _, _ string) (app.Outcome, error) {
+		got = p
+		return outcome, nil
+	}
+	t.Cleanup(func() { executeTUI = original })
+	return &got
 }

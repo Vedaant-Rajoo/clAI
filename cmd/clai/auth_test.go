@@ -9,10 +9,18 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Vedaant-Rajoo/clai/internal/app"
+	"github.com/Vedaant-Rajoo/clai/internal/capability"
+	"github.com/Vedaant-Rajoo/clai/internal/config"
+	"github.com/Vedaant-Rajoo/clai/internal/provider"
 )
 
 func TestParseAuthArgs(t *testing.T) {
@@ -812,4 +820,194 @@ func TestSourceWithErrorCallerBehavior(t *testing.T) {
 			t.Fatalf("stdout=%q stderr=%q", out.String(), errOut.String())
 		}
 	})
+}
+
+// TestAuthCommandsRemainNoninteractiveAfterRootMigration proves status and
+// logout stay bounded command paths that use only their injected auth
+// operations after config/credential state is co-located under the preferred
+// root (REQ-CONFIG-006/008, T-01-GC-26).
+func TestAuthCommandsRemainNoninteractiveAfterRootMigration(t *testing.T) {
+	const credentialSentinel = "auth-command-fixture-secret"
+	prepareMigratedAuthCommandRoot(t, credentialSentinel)
+
+	cases := []struct {
+		name             string
+		args             []string
+		wantCode         int
+		wantStdout       string
+		wantSourceCalls  int
+		wantDeleteCalls  int
+		configureCommand func(*cli, *int, *int)
+	}{
+		{
+			name:            "status uses only injected source inspection",
+			args:            []string{"auth", "status", "--provider", "openrouter"},
+			wantCode:        exitOK,
+			wantStdout:      "openrouter: authenticated (config file)\n",
+			wantSourceCalls: 1,
+			configureCommand: func(c *cli, sourceCalls, _ *int) {
+				c.authSourceWithError = func(providerName, explicit string) (string, error) {
+					*sourceCalls++
+					if providerName != "openrouter" || explicit != "" {
+						return "", errors.New("unexpected status arguments")
+					}
+					return "config file", nil
+				}
+			},
+		},
+		{
+			name:            "logout uses only injected delete",
+			args:            []string{"auth", "logout", "--provider", "openrouter"},
+			wantCode:        exitOK,
+			wantStdout:      "Removed stored openrouter credentials.\n",
+			wantDeleteCalls: 1,
+			configureCommand: func(c *cli, _, deleteCalls *int) {
+				c.authDelete = func(providerName string) error {
+					*deleteCalls++
+					if providerName != "openrouter" {
+						return errors.New("unexpected logout provider")
+					}
+					return nil
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var unexpected []string
+			recordUnexpected := func(name string) { unexpected = append(unexpected, name) }
+			sourceCalls, deleteCalls := 0, 0
+			c, out, errOut := captureCLI()
+			c.authReadLine = func() (string, error) {
+				recordUnexpected("stdin")
+				return "", errors.New("unexpected input")
+			}
+			c.authStore = func(string, string) error {
+				recordUnexpected("store")
+				return errors.New("unexpected store")
+			}
+			c.authSourceWithError = func(string, string) (string, error) {
+				recordUnexpected("real source fallback")
+				return "", errors.New("unexpected source fallback")
+			}
+			c.authDelete = func(string) error {
+				recordUnexpected("real delete fallback")
+				return errors.New("unexpected delete fallback")
+			}
+			c.authRuntime.listen = func(string, string) (net.Listener, error) {
+				recordUnexpected("listener")
+				return nil, errors.New("unexpected listener")
+			}
+			c.authRuntime.server = func(http.Handler) authHTTPServer {
+				recordUnexpected("server")
+				return nil
+			}
+			c.authRuntime.launchBrowser = func(string) error {
+				recordUnexpected("browser")
+				return errors.New("unexpected browser")
+			}
+			c.authRuntime.newTimer = func(time.Duration) authTimer {
+				recordUnexpected("timer")
+				return &fakeTimer{ch: make(chan time.Time)}
+			}
+			c.authRuntime.withTimeout = func(parent context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
+				recordUnexpected("timeout")
+				return context.WithCancel(parent)
+			}
+			c.authRuntime.httpClient = doerFunc(func(*http.Request) (*http.Response, error) {
+				recordUnexpected("network")
+				return nil, errors.New("unexpected network")
+			})
+			tc.configureCommand(&c, &sourceCalls, &deleteCalls)
+
+			originalTUI := executeTUI
+			executeTUI = func(provider.Provider, *capability.Cached, string, string) (app.Outcome, error) {
+				recordUnexpected("TUI")
+				return app.Outcome{}, errors.New("unexpected TUI")
+			}
+			t.Cleanup(func() { executeTUI = originalTUI })
+
+			done := make(chan int, 1)
+			go func() { done <- c.run(tc.args) }()
+			var code int
+			select {
+			case code = <-done:
+			case <-time.After(time.Second):
+				t.Fatal("noninteractive auth command blocked past its deadline")
+			}
+			if code != tc.wantCode {
+				t.Fatalf("exit = %d, want %d; stdout=%q stderr=%q", code, tc.wantCode, out.String(), errOut.String())
+			}
+			if out.String() != tc.wantStdout || errOut.String() != "" {
+				t.Fatalf("streams = stdout %q stderr %q, want stdout %q and empty stderr", out.String(), errOut.String(), tc.wantStdout)
+			}
+			if sourceCalls != tc.wantSourceCalls || deleteCalls != tc.wantDeleteCalls {
+				t.Fatalf("injected calls = source:%d delete:%d, want %d/%d", sourceCalls, deleteCalls, tc.wantSourceCalls, tc.wantDeleteCalls)
+			}
+			if len(unexpected) != 0 {
+				t.Fatalf("noninteractive auth command reached forbidden paths: %v", unexpected)
+			}
+			if strings.Contains(out.String(), credentialSentinel) || strings.Contains(errOut.String(), credentialSentinel) {
+				t.Fatal("auth command disclosed the file credential fixture")
+			}
+		})
+	}
+}
+
+func prepareMigratedAuthCommandRoot(t *testing.T, credential string) {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("canonicalize auth-command root: %v", err)
+	}
+	home := filepath.Join(root, "home")
+	xdg := filepath.Join(root, "xdg")
+	for _, path := range []string{home, xdg} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatalf("create isolated auth-command root: %v", err)
+		}
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	for _, name := range []string{"OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"} {
+		t.Setenv(name, "")
+	}
+
+	legacyConfig := filepath.Join(home, "Library", "Application Support", "clai", "config.json")
+	if runtime.GOOS == "darwin" {
+		if err := os.MkdirAll(filepath.Dir(legacyConfig), 0o700); err != nil {
+			t.Fatalf("create legacy config directory: %v", err)
+		}
+		if err := os.WriteFile(legacyConfig, []byte(`{"contract":"legacy","provider":"rules","init_completed":true}`), 0o600); err != nil {
+			t.Fatalf("write legacy config fixture: %v", err)
+		}
+		if _, err := config.Load(); err != nil {
+			t.Fatalf("migrate config before auth commands: %v", err)
+		}
+		if _, err := os.Lstat(legacyConfig); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("legacy config remains before auth command proof: %v", err)
+		}
+	} else if err := config.Save(config.Config{Provider: "rules", InitCompleted: true}); err != nil {
+		t.Fatalf("seed preferred config before auth commands: %v", err)
+	}
+
+	preferredApp := filepath.Join(xdg, "clai")
+	preferredConfig := filepath.Join(preferredApp, "config.json")
+	preferredCredentials := filepath.Join(preferredApp, "credentials.json")
+	if _, err := os.Stat(preferredConfig); err != nil {
+		t.Fatalf("preferred config missing before auth commands: %v", err)
+	}
+	if err := os.WriteFile(preferredCredentials, []byte(`{"openrouter":"`+credential+`"}`), 0o600); err != nil {
+		t.Fatalf("write preferred credential fixture: %v", err)
+	}
+	for _, path := range []string{preferredConfig, preferredCredentials} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("inspect preferred storage %q: %v", path, err)
+		}
+		if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+			t.Fatalf("preferred storage %q mode/type = %v, want regular 0600", path, info.Mode())
+		}
+	}
 }

@@ -13,8 +13,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
-	"os"
 	"path/filepath"
 
 	"github.com/Vedaant-Rajoo/clai/internal/configroot"
@@ -135,16 +133,12 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	exists, err := configStateExists(selected)
+	locations, exists, err := prepareConfigFileLoad(selected)
 	if err != nil {
 		return Config{}, err
 	}
 	if !exists {
 		return Config{}, nil
-	}
-	locations, err := canonicalizeConfigFileLocations(selected, true)
-	if err != nil {
-		return Config{}, err
 	}
 	if err := migrateConfigFile(locations); err != nil {
 		return Config{}, err
@@ -157,20 +151,6 @@ func Load() (Config, error) {
 		return Config{}, nil
 	}
 	return decodeConfig(locations.preferred, data)
-}
-
-func configStateExists(locations configFileLocations) (bool, error) {
-	for _, path := range []string{locations.preferred, locations.legacy} {
-		if path == "" {
-			continue
-		}
-		if _, err := os.Lstat(path); err == nil {
-			return true, nil
-		} else if !errors.Is(err, fs.ErrNotExist) {
-			return false, fmt.Errorf("inspect config file %q: %w", path, err)
-		}
-	}
-	return false, nil
 }
 
 func decodeConfig(path string, data []byte) (Config, error) {

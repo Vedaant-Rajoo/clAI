@@ -366,6 +366,123 @@ func TestConfigMigrationInterruptedRecovery(t *testing.T) {
 	assertNoConfigLitter(t, preferred, legacy)
 }
 
+func TestConfigMigrationInterruptedRecoveryProcessKill(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	preferred := filepath.Join(root, "preferred")
+	legacy := filepath.Join(root, "legacy")
+	for _, path := range []string{preferred, legacy} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeConfigFixture(t, legacy, []byte(`{"provider":"openrouter","model":"killed-process-model","init_completed":true}`))
+	signal := filepath.Join(root, "crash-signal")
+	neverRelease := filepath.Join(root, "never-release")
+	order := filepath.Join(root, "crash-order.json")
+	helper := startConfigMigrationHelper(t, preferred, legacy, "", signal, neverRelease, order, "load")
+	waitForConfigTestPath(t, signal, 5*time.Second)
+	if err := helper.cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill config migration helper: %v", err)
+	}
+	select {
+	case err := <-helper.done:
+		if err == nil {
+			t.Fatal("killed config migration helper exited successfully")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for killed config migration helper")
+	}
+	if !hasConfigTransientEntry(t, preferred) && !hasConfigTransientEntry(t, legacy) {
+		t.Fatal("killed helper left no observable lock or temporary artifact; interruption checkpoint was too early")
+	}
+
+	old := resolveConfigRoots
+	resolveConfigRoots = func() (configroot.Roots, error) {
+		return configroot.Roots{Preferred: preferred, Legacy: legacy}, nil
+	}
+	t.Cleanup(func() { resolveConfigRoots = old })
+	got, err := Load()
+	if err != nil {
+		t.Fatalf("Load after killed migration: %v", err)
+	}
+	want := Config{Contract: ConfigContract, Provider: "openrouter", Model: "killed-process-model", InitCompleted: true}
+	if got != want {
+		t.Fatalf("Load after killed migration = %+v, want %+v", got, want)
+	}
+	assertNoConfigLitter(t, preferred, legacy)
+}
+
+func TestConfigMigrationInterruptedRecoveryInitialSaveKill(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	preferred := filepath.Join(root, "preferred")
+	legacy := filepath.Join(root, "legacy")
+	for _, path := range []string{preferred, legacy} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	signal := filepath.Join(root, "save-crash-signal")
+	neverRelease := filepath.Join(root, "save-never-release")
+	order := filepath.Join(root, "save-crash-order.json")
+	helper := startConfigMigrationHelper(t, preferred, legacy, "", signal, neverRelease, order, "save")
+	waitForConfigTestPath(t, signal, 5*time.Second)
+	if err := helper.cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill config save helper: %v", err)
+	}
+	select {
+	case err := <-helper.done:
+		if err == nil {
+			t.Fatal("killed config save helper exited successfully")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for killed config save helper")
+	}
+	if !hasConfigTransientEntry(t, preferred) {
+		t.Fatal("killed initial Save left no lock or temporary artifact")
+	}
+
+	old := resolveConfigRoots
+	resolveConfigRoots = func() (configroot.Roots, error) {
+		return configroot.Roots{Preferred: preferred, Legacy: legacy}, nil
+	}
+	t.Cleanup(func() { resolveConfigRoots = old })
+	got, err := Load()
+	if err != nil {
+		t.Fatalf("Load after killed initial Save: %v", err)
+	}
+	if got != (Config{}) {
+		t.Fatalf("Load after killed initial Save = %+v, want zero Config", got)
+	}
+	if hasConfigTransientEntry(t, preferred) || hasConfigTransientEntry(t, legacy) {
+		t.Fatal("Load did not clean interrupted initial Save artifacts")
+	}
+	assertPathMissing(t, configPathAt(preferred))
+	assertPathMissing(t, configPathAt(legacy))
+}
+
+func hasConfigTransientEntry(t *testing.T, root string) bool {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(root, "clai"))
+	if errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	if err != nil {
+		t.Fatalf("list interrupted config directory: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.Name() == lockName || isConfigTransientName(entry.Name()) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestConfigMigrationConcurrent(t *testing.T) {
 	t.Run("same process", func(t *testing.T) {
 		preferred, legacy := useMigrationRoots(t)
@@ -425,9 +542,9 @@ func TestConfigMigrationConcurrent(t *testing.T) {
 		orderA := filepath.Join(root, "order-a.json")
 		orderB := filepath.Join(root, "order-b.json")
 
-		first := startConfigMigrationHelper(t, preferred, legacy, "", signalA, release, orderA)
+		first := startConfigMigrationHelper(t, preferred, legacy, "", signalA, release, orderA, "load")
 		waitForConfigTestPath(t, signalA, 5*time.Second)
-		second := startConfigMigrationHelper(t, preferred, legacy, startedB, signalB, release, orderB)
+		second := startConfigMigrationHelper(t, preferred, legacy, startedB, signalB, release, orderB, "load")
 		waitForConfigTestPath(t, startedB, 5*time.Second)
 		select {
 		case err := <-second.done:
@@ -476,7 +593,7 @@ type configMigrationHelper struct {
 	done   chan error
 }
 
-func startConfigMigrationHelper(t *testing.T, preferred, legacy, started, signal, release, order string) *configMigrationHelper {
+func startConfigMigrationHelper(t *testing.T, preferred, legacy, started, signal, release, order, action string) *configMigrationHelper {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	helper := &configMigrationHelper{cancel: cancel, done: make(chan error, 1)}
@@ -488,6 +605,7 @@ func startConfigMigrationHelper(t *testing.T, preferred, legacy, started, signal
 		"CLAI_CONFIG_HELPER_SIGNAL="+signal,
 		"CLAI_CONFIG_HELPER_RELEASE="+release,
 		"CLAI_CONFIG_HELPER_ORDER="+order,
+		"CLAI_CONFIG_HELPER_ACTION="+action,
 	)
 	helper.cmd.Stdout = &helper.output
 	helper.cmd.Stderr = &helper.output
@@ -551,7 +669,13 @@ func TestConfigMigrationProcessHelper(t *testing.T) {
 		}
 		return nil
 	}
-	if _, err := Load(); err != nil {
+	var err error
+	if os.Getenv("CLAI_CONFIG_HELPER_ACTION") == "save" {
+		err = Save(Config{Provider: "rules", Model: "helper-save-model", InitCompleted: true})
+	} else {
+		_, err = Load()
+	}
+	if err != nil {
 		t.Fatal(err)
 	}
 }
@@ -755,6 +879,9 @@ func TestConfigRootSubstitutionFailsClosed(t *testing.T) {
 			return configroot.Roots{Preferred: preferred, Legacy: legacy}, nil
 		}
 		t.Cleanup(func() { resolveConfigRoots = old })
+		if _, loadErr := Load(); loadErr == nil {
+			t.Fatal("Load unexpectedly accepted a symlinked clai directory")
+		}
 		err = Save(newConfig)
 		assertConfigSubstitutionFailure(t, err, sentinel)
 	})

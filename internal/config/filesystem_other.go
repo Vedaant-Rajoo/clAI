@@ -11,6 +11,24 @@ import (
 
 var errSecureFallbackUnsupported = errors.New("secure config write is unsupported on this platform")
 
+func prepareConfigFileLoad(selected configFileLocations) (configFileLocations, bool, error) {
+	locations, err := canonicalizeConfigFileLocations(selected, false)
+	if err != nil {
+		return configFileLocations{}, false, err
+	}
+	for _, path := range []string{locations.preferred, locations.legacy} {
+		if path == "" {
+			continue
+		}
+		if _, err := os.Lstat(path); err == nil {
+			return locations, true, nil
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return configFileLocations{}, false, fmt.Errorf("inspect config file %q: %w", path, err)
+		}
+	}
+	return locations, false, nil
+}
+
 func migrateConfigFile(configFileLocations) error {
 	return nil
 }

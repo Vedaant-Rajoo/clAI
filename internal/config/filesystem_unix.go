@@ -580,10 +580,10 @@ func releaseOrderedConfigLocks(locks []*configLock) error {
 }
 
 func releaseConfigLock(lock *configLock) error {
-	var verifyErr, unlinkErr, syncErr error
-	if err := verifyConfigLock(lock); err != nil {
-		verifyErr = err
-	} else {
+	pathErr := lock.directory.verify()
+	entryErr := verifyNamedConfigFile(lock.directory.app, lockName, lock.info, true)
+	var unlinkErr, syncErr error
+	if entryErr == nil {
 		if err := unix.Unlinkat(int(lock.directory.app.Fd()), lockName, 0); err != nil && !errors.Is(err, unix.ENOENT) {
 			unlinkErr = fmt.Errorf("remove config lock: %w", err)
 		}
@@ -592,8 +592,10 @@ func releaseConfigLock(lock *configLock) error {
 				syncErr = fmt.Errorf("sync config directory after lock removal: %w", err)
 			}
 		}
+	} else {
+		entryErr = fmt.Errorf("verify config lock before release: %w", entryErr)
 	}
-	return errors.Join(verifyErr, unlinkErr, syncErr, unlockAndCloseConfigLock(lock.file))
+	return errors.Join(pathErr, entryErr, unlinkErr, syncErr, unlockAndCloseConfigLock(lock.file))
 }
 
 func unlockAndCloseConfigLock(file *os.File) error {

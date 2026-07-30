@@ -651,6 +651,7 @@ func TestConfigRootSubstitutionFailsClosed(t *testing.T) {
 		err := Save(newConfig)
 		assertConfigSubstitutionFailure(t, err, sentinel)
 		assertFileBytes(t, filepath.Join(moved, "clai", fileName), original)
+		assertPathMissing(t, filepath.Join(moved, "clai", lockName))
 	})
 
 	t.Run("app directory replacement", func(t *testing.T) {
@@ -669,6 +670,7 @@ func TestConfigRootSubstitutionFailsClosed(t *testing.T) {
 		err := Save(newConfig)
 		assertConfigSubstitutionFailure(t, err, sentinel)
 		assertFileBytes(t, filepath.Join(moved, fileName), original)
+		assertPathMissing(t, filepath.Join(moved, lockName))
 	})
 
 	t.Run("lock replacement", func(t *testing.T) {
@@ -813,6 +815,13 @@ func assertFileBytes(t *testing.T, path string, want []byte) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("file %q changed:\n got: %q\nwant: %q", path, got, want)
+	}
+}
+
+func assertPathMissing(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unexpected storage artifact %q remains: %v", path, err)
 	}
 }
 

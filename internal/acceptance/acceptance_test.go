@@ -523,6 +523,14 @@ func TestProviderBoundaryArtifactsRegistered(t *testing.T) {
 		"schema: candidate-applicability/v1",
 		"name: capability-conditioned-fixtures",
 		"schema: capability-fixtures/v1",
+		"name: specification-predecessor-1541",
+		"path: .local/revisions/SPECIFICATION-1541a84cbe057e42.md",
+		"name: specification-semantic-diff-1541-to-phase-b-xdg-config-r7",
+		"path: .local/revisions/SPECIFICATION-1541-to-phase-b-xdg-config-r7.diff",
+		"name: config-root-policy",
+		"name: config-file-contract-v1",
+		"schema: config-file/v1",
+		"name: credential-file-storage-contract",
 		"REQ-ANTHROPIC-011",
 		"REQ-ANTHROPIC-010",
 		"REQ-CONTEXT-031",
@@ -573,18 +581,31 @@ func TestProviderBoundaryArtifactsRegistered(t *testing.T) {
 	}
 
 	contentHashes := map[string]string{
-		".local/revisions/CANDIDATEJSON-d4ebadb8f0d525bc.go": "d4ebadb8f0d525bcaef836114f5c2ebf7906be59c8268a2a05747205e5903ecb",
-		"internal/provider/candidatejson/candidatejson.go":   "7ff6307b4c4a3319fb7019b0e04cd15399c9cfa2499358f5d9fa701b00cfea9b",
-		"internal/provider/receipt.go":                       "16024cc7e6f6234c4ccfab0813a5dec768351a799f0c61e71823dc4c2bcfeaa0",
-		"internal/capability/capability.go":                  "0151856bf5a6611a40fb74e6b580d0603587af5ef1a81fad711c384ad51a2930",
-		"internal/capability/allowlist.go":                   "278085169c7b742713b6c5b0b7067ecc4635d1c06747de01038fafb2e9ace18a",
-		"internal/capability/collect.go":                     "5c14ac99a0be51895075ec867ed692292224aa98763b2d855aa1c6fcf50c92a1",
-		"internal/context/privacy.go":                        "ace41ad7edd1f18e5866053f97cd85e7f367811bd500f305e43fbf27cb4eb8d9",
-		"internal/applicability/applicability.go":            "6d004826ee2d9b20a06ba328994d648358a4fe7c9e4b46884e7ce1c49c2d1318",
-		"internal/applicability/edit.go":                     "563651d2da8c3e416a09867d1aacb61a7f3d72994a763dd8cf41e9023717e0a4",
-		"integration/testdata/capability-fixtures.json":      "8435bb0ff4ca545e700fffe476adfdc6833ad5fa0258471ecddccd15474b0806",
-		"internal/provider/rules/rules_test.go":              "57963925307cc017b10e28c58e540ff6190e8fa0c8cedffd20d89b5b205afd45",
-		"integration/capability_fixture_test.go":             "63c4a25a9839aa7909be331bde76ea51bbebb9e71fe5bef66aa0c5843a549063",
+		".local/SPECIFICATION.md":                                           "27fcdfd464be41ff581d81889f2bffd1123b9eeb2f1431214f02393ee0401fc5",
+		".local/acceptance-manifest.yaml":                                   "54d9bbcaae6bab48a512459542ad7cea3f87859d0c38de6fa5d87b51fb148781",
+		".local/revisions/SPECIFICATION-1541a84cbe057e42.md":                "1541a84cbe057e422d2fa83421e8f7a4241c85e93c50ed702fd4a9ed15a1512f",
+		".local/revisions/SPECIFICATION-1541-to-phase-b-xdg-config-r7.diff": "d2668a3d07d2edd1e79be95c261dcfc168140b464022b62dfd98a90976153217",
+		"internal/configroot/configroot.go":                                 "ef45539acc6b4803aafde39dd58755c2bde1592d38345a18752acb23343d26ad",
+		"internal/configroot/filesystem_unix.go":                            "637eb181794152a1639bc44fc856703cd462523896bf5514e7d5a93dff31eb1a",
+		"internal/configroot/filesystem_other.go":                           "fa2f39d13dea9d496dcb90a41883c1c616792c667a4322ca8519f4420517f712",
+		"internal/config/config.go":                                         "cb0eee1219efe41b9c62c5fb986cec369f24fe114833e9f32d172a2d4c8a7382",
+		"internal/config/filesystem_unix.go":                                "f40e7598b0704e358b931ccc997e14e64bb8d9c1cd666af2fe5768a185bcb18a",
+		"internal/config/filesystem_other.go":                               "5e8fc77c90cb010b66ebb7fb6627745a693f8402227d0d69c5dbc2bb8ea19c5e",
+		"internal/auth/auth.go":                                             "79bb211d63ffeecf3143a303a89912a58d44f0f0335d35245f88083232cd93e5",
+		"internal/auth/filesystem_unix.go":                                  "29b846261f18625b5cbe549dd37802c5421928d54db8f69c956bfb6bd760e172",
+		"internal/auth/filesystem_other.go":                                 "1617a7b64e905c6afbb4280801c13c46614334af8553f3350f83c8de4da042ea",
+		".local/revisions/CANDIDATEJSON-d4ebadb8f0d525bc.go":                "d4ebadb8f0d525bcaef836114f5c2ebf7906be59c8268a2a05747205e5903ecb",
+		"internal/provider/candidatejson/candidatejson.go":                  "7ff6307b4c4a3319fb7019b0e04cd15399c9cfa2499358f5d9fa701b00cfea9b",
+		"internal/provider/receipt.go":                                      "16024cc7e6f6234c4ccfab0813a5dec768351a799f0c61e71823dc4c2bcfeaa0",
+		"internal/capability/capability.go":                                 "0151856bf5a6611a40fb74e6b580d0603587af5ef1a81fad711c384ad51a2930",
+		"internal/capability/allowlist.go":                                  "278085169c7b742713b6c5b0b7067ecc4635d1c06747de01038fafb2e9ace18a",
+		"internal/capability/collect.go":                                    "5c14ac99a0be51895075ec867ed692292224aa98763b2d855aa1c6fcf50c92a1",
+		"internal/context/privacy.go":                                       "ace41ad7edd1f18e5866053f97cd85e7f367811bd500f305e43fbf27cb4eb8d9",
+		"internal/applicability/applicability.go":                           "6d004826ee2d9b20a06ba328994d648358a4fe7c9e4b46884e7ce1c49c2d1318",
+		"internal/applicability/edit.go":                                    "563651d2da8c3e416a09867d1aacb61a7f3d72994a763dd8cf41e9023717e0a4",
+		"integration/testdata/capability-fixtures.json":                     "8435bb0ff4ca545e700fffe476adfdc6833ad5fa0258471ecddccd15474b0806",
+		"internal/provider/rules/rules_test.go":                             "57963925307cc017b10e28c58e540ff6190e8fa0c8cedffd20d89b5b205afd45",
+		"integration/capability_fixture_test.go":                            "63c4a25a9839aa7909be331bde76ea51bbebb9e71fe5bef66aa0c5843a549063",
 	}
 	for path, want := range contentHashes {
 		content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(path)))
@@ -606,6 +627,9 @@ func TestProviderBoundaryArtifactsRegistered(t *testing.T) {
 		{[]string{"internal/capability/capability.go", "internal/capability/allowlist.go", "internal/capability/collect.go"}, "f3981779d5940213ab1aa5fcbea18c698f9c94118fa7acd53c202b86a645c2b7"},
 		{[]string{"internal/applicability/applicability.go", "internal/applicability/edit.go"}, "b4d7f837f42ba3f59908cbe80b1ae5b1a994894e31a2d1e86f5db582cff576b5"},
 		{[]string{"integration/testdata/capability-fixtures.json", "internal/provider/rules/rules_test.go", "integration/capability_fixture_test.go"}, "0c47b2728ef6a8029b7ba7721ae87e6c84981cc8e82da06e2a78c98eab649c55"},
+		{[]string{"internal/configroot/configroot.go", "internal/configroot/filesystem_unix.go", "internal/configroot/filesystem_other.go"}, "11c1c5eb56439702763ac184ca57d3083e20796c022243b0f53c0f84a802d158"},
+		{[]string{"internal/config/config.go", "internal/config/filesystem_unix.go", "internal/config/filesystem_other.go"}, "7fde34731b9e2a83fc9f4d5426459e0ab8c7eddc9c257bf06daefdfbcdb37cec"},
+		{[]string{"internal/auth/auth.go", "internal/auth/filesystem_unix.go", "internal/auth/filesystem_other.go"}, "27470fa9422d731c7bd1b306ebc27fc35470c6e417737e217a47ebb85d811db8"},
 	}
 	for _, bundle := range bundleHashes {
 		hash := sha256.New()
@@ -648,6 +672,7 @@ func TestCheckedInRevisionEvidence(t *testing.T) {
 	phaseBR3 := read(".local", "revisions", "SPECIFICATION-514f7d5c2881b0d1.md")
 	phaseBR4 := read(".local", "revisions", "SPECIFICATION-f8816bbf262963ab.md")
 	phaseBR5 := read(".local", "revisions", "SPECIFICATION-4a9ec1befd556a23.md")
+	phaseBR6 := read(".local", "revisions", "SPECIFICATION-1541a84cbe057e42.md")
 	current := read(".local", "SPECIFICATION.md")
 	migrationDiff := read(".local", "revisions", "SPECIFICATION-28ac-to-5dc.diff")
 	remediationDiff := read(".local", "revisions", "SPECIFICATION-28ac-to-phase-0-remediation-r1.diff")
@@ -658,6 +683,7 @@ func TestCheckedInRevisionEvidence(t *testing.T) {
 	phaseBR4Diff := read(".local", "revisions", "SPECIFICATION-514f-to-phase-b-applicability-r4.diff")
 	phaseBR5Diff := read(".local", "revisions", "SPECIFICATION-f881-to-phase-b-applicability-r5.diff")
 	phaseBR6Diff := read(".local", "revisions", "SPECIFICATION-4a9e-to-phase-b-devendpoint-r6.diff")
+	phaseBR7Diff := read(".local", "revisions", "SPECIFICATION-1541-to-phase-b-xdg-config-r7.diff")
 	checks := map[string]string{
 		sha256Hex(initial):         "28ac242a7c7f4f15bdcc8ad052f504251380580f0749e9f4d257209eb9c61add",
 		sha256Hex(registered):      "5dc63862dfe786a6e45cf9155dc56a8ed3cae3769ff80dd135487e35958d5f5d",
@@ -668,7 +694,8 @@ func TestCheckedInRevisionEvidence(t *testing.T) {
 		sha256Hex(phaseBR3):        "514f7d5c2881b0d18cc18e87584324dafd1bd07a484195e78342599cba372d5e",
 		sha256Hex(phaseBR4):        "f8816bbf262963ab38b484eecb5ec17283f57de5aaa540c08608cf2f41a85616",
 		sha256Hex(phaseBR5):        "4a9ec1befd556a231489d6a4e4b549d08ce6810df1f49782913e71ed6eca0481",
-		sha256Hex(current):         "1541a84cbe057e422d2fa83421e8f7a4241c85e93c50ed702fd4a9ed15a1512f",
+		sha256Hex(phaseBR6):        "1541a84cbe057e422d2fa83421e8f7a4241c85e93c50ed702fd4a9ed15a1512f",
+		sha256Hex(current):         "27fcdfd464be41ff581d81889f2bffd1123b9eeb2f1431214f02393ee0401fc5",
 		sha256Hex(migrationDiff):   "27a46e185cc9cf12b10b48c72c7a5e59ba30790527091809b811580f0416a47a",
 		sha256Hex(remediationDiff): "f31e3de8e608e4261d6fb10251b67fb56595e9cd6541946196caef730954c82f",
 		sha256Hex(anthropicDiff):   "dae1358bbac67a249050a46767dea16a4406a262889a6d83a454c68a3d2d6601",
@@ -678,6 +705,7 @@ func TestCheckedInRevisionEvidence(t *testing.T) {
 		sha256Hex(phaseBR4Diff):    "b97413cc9387c63d108ed366a62a418c951921f71ea84f6f47839b1957eed201",
 		sha256Hex(phaseBR5Diff):    "0c5cc7de643aa4eba438d9cc828e02a98c4320d8313b305c0a59de4b6b744bac",
 		sha256Hex(phaseBR6Diff):    "c6db712309d375431713d31aa7a389224bc28c82678fb974ddf6ecbe3293b7c5",
+		sha256Hex(phaseBR7Diff):    "d2668a3d07d2edd1e79be95c261dcfc168140b464022b62dfd98a90976153217",
 	}
 	for got, want := range checks {
 		if got != want {
@@ -692,9 +720,9 @@ func TestCheckedInRevisionEvidence(t *testing.T) {
 	// after stripping requirement-ID markers and controlled workflow-hardening
 	// additions. Phase A deliberately diverges from that baseline by adding the
 	// direct Anthropic provider tranche. The immutable Phase A snapshot and every
-	// Phase B r1..r5 predecessor is therefore bound to the next revision by the
-	// registered semantic diffs pinned above; the current r6 bytes are
-	// additionally bound to their label by TestRevisionLabelBinding.
+	// Phase B r1..r6 predecessor is therefore bound to the next revision by the
+	// registered semantic diffs pinned above; TestRevisionLabelBinding additionally
+	// binds the current r7 bytes to the r7 label.
 	if normalizeSpecificationRevision(predecessor, true) != string(initial) {
 		t.Fatal("registered phase-0-remediation-r2 predecessor contains semantic changes outside stable IDs and specification-workflow hardening")
 	}
@@ -753,8 +781,8 @@ func TestRevisionLabelBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const boundLabel = "phase-b-devendpoint-r6"
-	const boundSpecHash = "1541a84cbe057e422d2fa83421e8f7a4241c85e93c50ed702fd4a9ed15a1512f"
+	const boundLabel = "phase-b-xdg-config-r7"
+	const boundSpecHash = "27fcdfd464be41ff581d81889f2bffd1123b9eeb2f1431214f02393ee0401fc5"
 	if manifest.RevisionLabel != boundLabel || manifest.SpecificationSHA256 != boundSpecHash {
 		t.Fatalf("revision binding = (%q, %q), want (%q, %q): a specification change or relabel must update both constants together and consciously choose the revision label",
 			manifest.RevisionLabel, manifest.SpecificationSHA256, boundLabel, boundSpecHash)

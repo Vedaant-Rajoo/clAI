@@ -773,16 +773,31 @@ func normalizeSpecificationRevision(data []byte, remediation bool) string {
 func TestRevisionLabelBinding(t *testing.T) {
 	t.Parallel()
 	root := requireLocalScaffolding(t)
-	_, manifest, err := Load(
-		filepath.Join(root, ".local", "SPECIFICATION.md"),
-		filepath.Join(root, ".local", "acceptance-manifest.yaml"),
-		filepath.Join(root, ".local", "artifacts.yaml"),
-	)
+	const boundLabel = "phase-b-xdg-config-r7"
+	const boundSpecHash = "27fcdfd464be41ff581d81889f2bffd1123b9eeb2f1431214f02393ee0401fc5"
+
+	spec, err := os.ReadFile(filepath.Join(root, ".local", "SPECIFICATION.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	const boundLabel = "phase-b-xdg-config-r7"
-	const boundSpecHash = "27fcdfd464be41ff581d81889f2bffd1123b9eeb2f1431214f02393ee0401fc5"
+	if got := sha256Hex(spec); got != boundSpecHash {
+		t.Fatalf("specification hash = %s, want %s", got, boundSpecHash)
+	}
+	manifestData, err := os.ReadFile(filepath.Join(root, ".local", "acceptance-manifest.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := decodeManifest(manifestData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifactData, err := os.ReadFile(filepath.Join(root, ".local", "artifacts.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateArtifactRegistry(artifactData, manifestData, spec, manifest); err != nil {
+		t.Fatal(err)
+	}
 	if manifest.RevisionLabel != boundLabel || manifest.SpecificationSHA256 != boundSpecHash {
 		t.Fatalf("revision binding = (%q, %q), want (%q, %q): a specification change or relabel must update both constants together and consciously choose the revision label",
 			manifest.RevisionLabel, manifest.SpecificationSHA256, boundLabel, boundSpecHash)

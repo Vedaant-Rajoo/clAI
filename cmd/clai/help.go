@@ -35,6 +35,14 @@ Flags:
   --provider name    provider: openrouter (default) | anthropic | openai
   --api-key key      API key override (status only)
 
+Storage:
+  On macOS and Linux, file-backed credentials use
+  $XDG_CONFIG_HOME/clai/credentials.json when XDG_CONFIG_HOME is absolute,
+  otherwise $HOME/.config/clai/credentials.json. A relative value is invalid.
+  Windows keeps its platform user configuration directory; OS keychain entries do not move;
+  old-only macOS Application Support state migrates one way on Darwin. Preferred
+  files win and mixed-version use after migration is unsupported.
+
 Examples:
   clai auth login --provider openrouter
   clai auth status --provider openrouter
@@ -152,8 +160,13 @@ Environment:
   CLAI_MODEL         default model for LLM providers
   CLAI_DELIVERY      default delivery: clipboard | stdout | insert
 
-Flags override environment variables; both override the config file at
-<UserConfigDir>/clai/config.json (the platform user configuration directory).
+Flags override environment variables; both override config.json.
+On macOS and Linux, a non-empty $XDG_CONFIG_HOME selects
+$XDG_CONFIG_HOME/clai/config.json and XDG_CONFIG_HOME must be absolute.
+Otherwise clai uses $HOME/.config/clai/config.json. A relative XDG_CONFIG_HOME is invalid.
+Windows keeps its platform user configuration directory.
+On Darwin, old-only macOS Application Support state migrates one way; preferred
+files win. Mixed-version downgrade after migration is unsupported.
 
 Use "clai help <command>" or "clai <command> help" for more information.
 `)

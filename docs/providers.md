@@ -97,19 +97,60 @@ their SHA-256 hash. Provider redirects are not followed, so the receipt endpoint
 is always the only target clai allows for that request. Receipts are not persisted
 or exposed through the current UI.
 
+## Configuration and credential storage
+
+On macOS and Linux, clai uses one preferred configuration base for both
+behavioral settings and file-backed credentials:
+
+- A non-empty, absolute `XDG_CONFIG_HOME` selects
+  `$XDG_CONFIG_HOME/clai/config.json` and
+  `$XDG_CONFIG_HOME/clai/credentials.json`.
+- When `XDG_CONFIG_HOME` is unset or empty, clai uses
+  `$HOME/.config/clai/config.json` and
+  `$HOME/.config/clai/credentials.json`.
+- Relative XDG_CONFIG_HOME values are invalid; clai neither resolves them against
+  the working directory nor silently falls back to `$HOME/.config`.
+- Windows keeps its existing platform user configuration directory and storage
+  behavior. OS keychain service and user identities do not move on any platform.
+
+The selected base may be a conventional shared configuration container. clai
+creates any missing selected-base suffix and its own `clai` directory with
+`0700` permissions, then stores `config.json`, `credentials.json`, locks, and
+temporary files as private objects; both data files use `0600` permissions.
+
+## One-way macOS migration
+
+On Darwin, when state exists only under
+`$HOME/Library/Application Support/clai`, clai migrates it one way to the
+preferred root. A preferred file is authoritative whenever it exists: legacy
+state is retired without merging, and a corrupt preferred config.json keeps the
+existing warning-and-default behavior instead of falling back to stale legacy
+settings. Config migration preserves only the five `config-file/v1` fields and
+never copies credential-shaped fields into `config.json`.
+
+Credential Resolve, Store, Delete, and successful keyring cleanup reconcile both file locations,
+preserve unrelated preferred providers, and retire stale legacy copies so a
+removed secret cannot reappear. Existing selected bases may keep conventional
+permissions such as `0755`; newly created suffixes and `clai` remain `0700`, and
+data files remain `0600`. The selected base root itself may be a symlink that is
+canonicalized once, but `clai` and all descendants are opened without following symlinks,
+with descriptor-relative identity checks that fail closed on substitution.
+
+Mixed-version downgrade and concurrent use with a pre-migration binary are
+unsupported after migration. Upgrade every clai binary that shares these roots
+before continuing to modify settings or credentials.
+
 ## Credentials
 
-Resolution precedence: `--api-key` flag > environment variable > OS keyring >
-the private `clai/credentials.json` file below Go's platform-specific
-`os.UserConfigDir()`. Typical locations are `$XDG_CONFIG_HOME/clai/credentials.json`
-(or `~/.config/clai/credentials.json`) on Linux and
-`~/Library/Application Support/clai/credentials.json` on macOS. On Darwin and
-Linux, the fallback fails closed: the `clai` credential directory, lock, and
-credential file must be non-symlink, private objects, and pre-existing
-group/other-accessible paths are rejected.
-Parent paths are traversed without following symlinks, but clai does not claim
-that every ancestor is private. On other platforms, the secure file fallback is
-unsupported and fails closed rather than approximating Unix guarantees.
+Resolution precedence remains `--api-key` flag > environment variable > OS
+keyring > the preferred private `credentials.json` file described above. The
+root migration does not rename or move keychain entries. On Darwin and Linux,
+the file fallback fails closed when the `clai` directory, lock, temporary file,
+or credential file is a symlink, non-private, non-regular, or substituted while
+open. Parent paths are traversed without following symlinks, but clai does not
+claim every existing ancestor is private. On other platforms, keychain and
+secure file-fallback behavior remain unchanged; unsupported secure fallback
+fails closed rather than approximating Unix guarantees.
 Environment variables per provider:
 
 - `OPENROUTER_API_KEY`

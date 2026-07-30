@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -13,6 +15,10 @@ import (
 // a future refactor silently swapping the streams.
 
 func TestOutputStreamRouting(t *testing.T) {
+	original := loadConfig
+	loadConfig = func() (config.Config, error) { return config.Config{}, nil }
+	t.Cleanup(func() { loadConfig = original })
+
 	cases := []struct {
 		name       string
 		args       []string
@@ -112,25 +118,31 @@ func TestOutputStreamRouting(t *testing.T) {
 	}
 }
 
-// TestRequestedOutputBypassesConfigLoad is the REQ-CONFIG-008 regression
-// oracle: version and help output do not consume configuration, so ambient
-// config diagnostics must not affect either requested-output path.
-func TestRequestedOutputBypassesConfigLoad(t *testing.T) {
+// TestRequestedOutputConfigMigrationContract is the REQ-CONFIG-003/008
+// regression oracle: Darwin version paths make one best-effort migration call,
+// while help still bypasses config and every requested-output path stays exact
+// even when migration reports an error.
+func TestRequestedOutputConfigMigrationContract(t *testing.T) {
 	original := loadConfig
 	calls := 0
 	loadConfig = func() (config.Config, error) {
 		calls++
-		return config.Config{}, nil
+		return config.Config{}, errors.New("ignored migration failure")
 	}
 	t.Cleanup(func() { loadConfig = original })
 
+	versionCalls := 0
+	if runtime.GOOS == "darwin" {
+		versionCalls = 1
+	}
 	cases := []struct {
-		name string
-		args []string
-		want string
+		name      string
+		args      []string
+		want      string
+		wantCalls int
 	}{
-		{name: "version flag", args: []string{"--version"}, want: version},
-		{name: "version command", args: []string{"version"}, want: version},
+		{name: "version flag", args: []string{"--version"}, want: version, wantCalls: versionCalls},
+		{name: "version command", args: []string{"version"}, want: version, wantCalls: versionCalls},
 		{name: "help command", args: []string{"help"}, want: "Usage:"},
 		{name: "help flag", args: []string{"--help"}, want: "Usage:"},
 		{name: "command help", args: []string{"help", "auth"}, want: "clai auth"},
@@ -142,8 +154,8 @@ func TestRequestedOutputBypassesConfigLoad(t *testing.T) {
 			if code := c.run(tc.args); code != exitOK {
 				t.Fatalf("run(%v) = %d, want %d; stderr: %s", tc.args, code, exitOK, errBuf.String())
 			}
-			if calls != before {
-				t.Fatalf("run(%v) called loadConfig %d time(s), want zero", tc.args, calls-before)
+			if got := calls - before; got != tc.wantCalls {
+				t.Fatalf("run(%v) called loadConfig %d time(s), want %d", tc.args, got, tc.wantCalls)
 			}
 			assertStream(t, "stdout", out.String(), tc.want)
 			assertStream(t, "stderr", errBuf.String(), "")

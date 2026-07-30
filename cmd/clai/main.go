@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/Vedaant-Rajoo/clai/internal/app"
@@ -107,8 +108,21 @@ func (c cli) runVersion(args []string) int {
 		fmt.Fprintf(c.stderr, "clai version: unknown argument %q\nRun 'clai version help' for usage.\n", args[0])
 		return exitUsage
 	}
+	migrateLegacyConfigForRequestedOutput()
 	fmt.Fprintln(c.stdout, version)
 	return exitOK
+}
+
+// migrateLegacyConfigForRequestedOutput completes a pending one-way Darwin
+// config migration without changing the version command's requested-output
+// contract. Errors stay silent here because version historically ignores
+// configuration failures; an interactive invocation will still report the
+// existing warning if the preferred file is corrupt or inaccessible.
+func migrateLegacyConfigForRequestedOutput() {
+	if runtime.GOOS != "darwin" {
+		return
+	}
+	_, _ = loadConfig()
 }
 
 func (c cli) runInit(args []string) int {
@@ -169,6 +183,7 @@ func (c cli) runInteractive(args []string) int {
 	// with other explicit flags on the normal validation path so invocation-local
 	// usage errors still take precedence over the version shortcut.
 	if *f.showVersion && len(explicit) == 1 {
+		migrateLegacyConfigForRequestedOutput()
 		fmt.Fprintln(c.stdout, version)
 		return exitOK
 	}

@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -110,4 +112,95 @@ func TestLookupCommand(t *testing.T) {
 	if _, ok := lookupCommand("bogus"); ok {
 		t.Error("lookupCommand(\"bogus\") unexpectedly found")
 	}
+}
+
+func TestMainHelpConfigRoot(t *testing.T) {
+	var buf bytes.Buffer
+	printMainHelp(&buf)
+	help := buf.String()
+
+	for _, want := range []string{
+		"$XDG_CONFIG_HOME/clai/config.json",
+		"$HOME/.config/clai/config.json",
+		"XDG_CONFIG_HOME must be absolute",
+		"A relative XDG_CONFIG_HOME is invalid",
+		"Windows keeps its platform user configuration directory",
+		"old-only macOS Application Support state migrates one way",
+		"Mixed-version downgrade",
+	} {
+		if !strings.Contains(help, want) {
+			t.Errorf("main help missing config-root contract %q", want)
+		}
+	}
+	if strings.Contains(help, "<UserConfigDir>") {
+		t.Fatal("main help retained the generic UserConfigDir active path")
+	}
+}
+
+func TestAuthHelpConfigRoot(t *testing.T) {
+	authHelp := commandLong("auth")
+	for _, want := range []string{
+		"$XDG_CONFIG_HOME/clai/credentials.json",
+		"$HOME/.config/clai/credentials.json",
+		"OS keychain entries do not move",
+		"Windows keeps its platform user configuration directory",
+		"old-only macOS Application Support state migrates one way",
+	} {
+		if !strings.Contains(authHelp, want) {
+			t.Errorf("auth help missing config-root contract %q", want)
+		}
+	}
+
+	docsPath := filepath.Join("..", "..", "docs", "providers.md")
+	data, err := os.ReadFile(docsPath)
+	if err != nil {
+		t.Fatalf("read provider documentation: %v", err)
+	}
+	docs := string(data)
+	for _, want := range []string{
+		"$XDG_CONFIG_HOME/clai/config.json",
+		"$HOME/.config/clai/config.json",
+		"$XDG_CONFIG_HOME/clai/credentials.json",
+		"$HOME/.config/clai/credentials.json",
+		"Relative XDG_CONFIG_HOME values are invalid",
+		"Windows keeps its existing platform user configuration directory",
+		"OS keychain service and user identities do not move",
+		"preferred file is authoritative",
+		"corrupt preferred config.json",
+		"Store, Delete, and successful keyring cleanup reconcile both file locations",
+		"`0600`",
+		"`0700`",
+		"selected base root itself may be a symlink",
+		"descendants are opened without following symlinks",
+		"Mixed-version downgrade",
+		"unsupported",
+	} {
+		if !strings.Contains(docs, want) {
+			t.Errorf("provider documentation missing storage contract %q", want)
+		}
+	}
+
+	const legacyPath = "$HOME/Library/Application Support/clai"
+	if count := strings.Count(docs, legacyPath); count != 1 {
+		t.Fatalf("legacy macOS path occurs %d times, want exactly once inside migration guidance", count)
+	}
+	migration := markdownSection(docs, "## One-way macOS migration")
+	if migration == "" || !strings.Contains(migration, legacyPath) {
+		t.Fatal("legacy macOS path is not confined to the one-way migration section")
+	}
+	if strings.Contains(strings.Replace(docs, migration, "", 1), legacyPath) {
+		t.Fatal("legacy macOS path appears outside the one-way migration section")
+	}
+}
+
+func markdownSection(markdown, heading string) string {
+	start := strings.Index(markdown, heading)
+	if start < 0 {
+		return ""
+	}
+	rest := markdown[start+len(heading):]
+	if next := strings.Index(rest, "\n## "); next >= 0 {
+		return markdown[start : start+len(heading)+next]
+	}
+	return markdown[start:]
 }

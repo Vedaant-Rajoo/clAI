@@ -815,6 +815,36 @@ func TestConfigRootSubstitutionFailsClosed(t *testing.T) {
 		assertFileBytes(t, path, original)
 	})
 
+	t.Run("absent config appearance", func(t *testing.T) {
+		preferred, _ := useMigrationRoots(t)
+		substitute := []byte(`{"provider":"appeared-attacker"}`)
+		useConfigFilesystemTestHooks(t, configFilesystemHooks{
+			afterOrderedLocksAcquired: func(checkpoint configFilesystemCheckpoint) error {
+				return os.WriteFile(checkpoint.PreferredPath, substitute, 0o600)
+			},
+		})
+		err := Save(newConfig)
+		assertConfigSubstitutionFailure(t, err, sentinel)
+		assertFileBytes(t, configPathAt(preferred), substitute)
+	})
+
+	t.Run("config unlink and recreate", func(t *testing.T) {
+		preferred, _ := useMigrationRoots(t)
+		path := writeConfigFixture(t, preferred, original)
+		substitute := []byte(`{"provider":"recreated-attacker"}`)
+		useConfigFilesystemTestHooks(t, configFilesystemHooks{
+			afterOrderedLocksAcquired: func(configFilesystemCheckpoint) error {
+				if err := os.Remove(path); err != nil {
+					return err
+				}
+				return os.WriteFile(path, substitute, 0o600)
+			},
+		})
+		err := Save(newConfig)
+		assertConfigSubstitutionFailure(t, err, sentinel)
+		assertFileBytes(t, path, substitute)
+	})
+
 	t.Run("config replacement", func(t *testing.T) {
 		preferred, _ := useMigrationRoots(t)
 		path := writeConfigFixture(t, preferred, original)
@@ -830,6 +860,7 @@ func TestConfigRootSubstitutionFailsClosed(t *testing.T) {
 		err := Save(newConfig)
 		assertConfigSubstitutionFailure(t, err, sentinel)
 		assertFileBytes(t, moved, original)
+		assertFileBytes(t, path, []byte(`{"provider":"attacker"}`))
 	})
 
 	t.Run("temporary symlink replacement", func(t *testing.T) {
@@ -902,6 +933,48 @@ func TestConfigRootSubstitutionFailsClosed(t *testing.T) {
 		err := Save(newConfig)
 		assertConfigSubstitutionFailure(t, err, sentinel)
 		assertFileBytes(t, target, original)
+	})
+
+	t.Run("legacy retirement replacement", func(t *testing.T) {
+		_, legacy := useMigrationRoots(t)
+		writeConfigFixture(t, legacy, original)
+		legacyPath := configPathAt(legacy)
+		substitute := []byte(`{"provider":"legacy-retirement-attacker"}`)
+		useConfigFilesystemTestHooks(t, configFilesystemHooks{
+			beforeNamedRetirement: func(dir, name string) error {
+				if dir != filepath.Dir(legacyPath) || name != fileName {
+					return nil
+				}
+				if err := os.Remove(legacyPath); err != nil {
+					return err
+				}
+				return os.WriteFile(legacyPath, substitute, 0o600)
+			},
+		})
+		_, err := Load()
+		assertConfigSubstitutionFailure(t, err, sentinel)
+		assertFileBytes(t, legacyPath, substitute)
+	})
+
+	t.Run("lock retirement replacement", func(t *testing.T) {
+		preferred, _ := useMigrationRoots(t)
+		writeConfigFixture(t, preferred, original)
+		lockPath := filepath.Join(preferred, "clai", lockName)
+		marker := []byte("replacement-lock-marker")
+		useConfigFilesystemTestHooks(t, configFilesystemHooks{
+			beforeNamedRetirement: func(dir, name string) error {
+				if dir != filepath.Dir(lockPath) || name != lockName {
+					return nil
+				}
+				if err := os.Remove(lockPath); err != nil {
+					return err
+				}
+				return os.WriteFile(lockPath, marker, 0o600)
+			},
+		})
+		err := Save(newConfig)
+		assertConfigSubstitutionFailure(t, err, sentinel)
+		assertFileBytes(t, lockPath, marker)
 	})
 
 	t.Run("legacy config symlink", func(t *testing.T) {

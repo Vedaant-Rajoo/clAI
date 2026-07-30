@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/Vedaant-Rajoo/clai/internal/configroot"
 	"github.com/zalando/go-keyring"
@@ -254,13 +255,13 @@ func resolveCredentialFileLocations(createPreferred bool) (credentialFileLocatio
 	if err != nil {
 		return credentialFileLocations{}, fmt.Errorf("resolve config roots: %w", err)
 	}
-	preferred, err := configroot.Canonicalize(roots.Preferred, createPreferred)
+	preferred, err := canonicalizeCredentialRoot(roots.Preferred, createPreferred)
 	if err != nil {
 		return credentialFileLocations{}, fmt.Errorf("canonicalize preferred credential root: %w", err)
 	}
 	legacy := ""
 	if roots.Legacy != "" {
-		legacy, err = configroot.Canonicalize(roots.Legacy, false)
+		legacy, err = canonicalizeCredentialRoot(roots.Legacy, false)
 		if err != nil {
 			return credentialFileLocations{}, fmt.Errorf("canonicalize legacy credential root: %w", err)
 		}
@@ -274,14 +275,14 @@ func resolveCredentialFileLocations(createPreferred bool) (credentialFileLocatio
 
 func canonicalizeCredentialFileLocations(selected credentialFileLocations, createPreferred bool) (credentialFileLocations, error) {
 	preferredRoot := credentialRoot(selected.preferred)
-	preferred, err := configroot.Canonicalize(preferredRoot, createPreferred)
+	preferred, err := canonicalizeCredentialRoot(preferredRoot, createPreferred)
 	if err != nil {
 		return credentialFileLocations{}, fmt.Errorf("canonicalize preferred credential root: %w", err)
 	}
 	legacy := ""
 	if selected.legacy != "" {
 		legacyRoot := credentialRoot(selected.legacy)
-		legacy, err = configroot.Canonicalize(legacyRoot, false)
+		legacy, err = canonicalizeCredentialRoot(legacyRoot, false)
 		if err != nil {
 			return credentialFileLocations{}, fmt.Errorf("canonicalize legacy credential root: %w", err)
 		}
@@ -291,6 +292,50 @@ func canonicalizeCredentialFileLocations(selected credentialFileLocations, creat
 		preferred: canonical.PreferredPath(fileName),
 		legacy:    canonical.LegacyPath(fileName),
 	}, nil
+}
+
+// canonicalizeCredentialRoot permits a symlink only at the selected root
+// itself. Parent components remain outside that one-time authority grant so an
+// intermediate link cannot silently redirect credential storage.
+func canonicalizeCredentialRoot(path string, create bool) (string, error) {
+	if err := validateCredentialRootParents(path); err != nil {
+		return "", err
+	}
+	return configroot.Canonicalize(path, create)
+}
+
+func validateCredentialRootParents(path string) error {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		return nil
+	}
+	clean := filepath.Clean(path)
+	if !filepath.IsAbs(clean) {
+		// configroot.Canonicalize owns the syntax diagnostic for relative roots.
+		return nil
+	}
+
+	current := filepath.Dir(clean)
+	for {
+		_, err := os.Lstat(current)
+		if err == nil {
+			canonical, err := filepath.EvalSymlinks(current)
+			if err != nil {
+				return fmt.Errorf("securely traverse credential root parent: %w", err)
+			}
+			if filepath.Clean(canonical) != current {
+				return errors.New("securely traverse credential root parent: intermediate symlinks are not allowed")
+			}
+			return nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("securely traverse credential root parent: %w", err)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil
+		}
+		current = parent
+	}
 }
 
 func credentialRoot(path string) string {

@@ -145,6 +145,77 @@ func isCredentialTransientName(name string) bool {
 	return err == nil
 }
 
+// removeStaleCredentialTemps retires interrupted secret-bearing temporary files
+// only after every participating root lock is held. Unsafe names fail closed;
+// verified regular files are erased before unlink so an unlink/fsync failure
+// cannot leave credential bytes behind.
+func removeStaleCredentialTemps(directories []*credentialDirectory, locks []*credentialLock) error {
+	for _, directory := range directories {
+		if err := verifyLockedCredentialState([]*credentialDirectory{directory}, locks); err != nil {
+			return err
+		}
+		names, err := readCredentialDirectoryNames(directory.app)
+		if err != nil {
+			return err
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if !isCredentialTransientName(name) {
+				continue
+			}
+			if err := removeStaleCredentialTemp(directory, locks, name); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func removeStaleCredentialTemp(directory *credentialDirectory, locks []*credentialLock, name string) (retErr error) {
+	if err := verifyLockedCredentialState([]*credentialDirectory{directory}, locks); err != nil {
+		return err
+	}
+	fd, err := unix.Openat(int(directory.app.Fd()), name, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("open stale credential temporary file: %w", err)
+	}
+	file := os.NewFile(uintptr(fd), name)
+	defer func() {
+		if file != nil {
+			retErr = errors.Join(retErr, closeTempFile(file))
+		}
+	}()
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("inspect stale credential temporary file: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		return errors.New("stale credential temporary file must be a private regular non-symlink file")
+	}
+	if err := verifyCredentialLinkCount(file, 1); err != nil {
+		return fmt.Errorf("stale credential temporary link count is unsafe: %w", err)
+	}
+	if err := verifyNamedFile(directory.app, name, info, false); err != nil {
+		return fmt.Errorf("verify stale credential temporary file: %w", err)
+	}
+	if err := eraseCredentialFile(file); err != nil {
+		return fmt.Errorf("erase stale credential temporary file: %w", err)
+	}
+	if err := verifyNamedFile(directory.app, name, info, false); err != nil {
+		return fmt.Errorf("stale credential temporary file changed before removal: %w", err)
+	}
+	if err := unix.Unlinkat(int(directory.app.Fd()), name, 0); err != nil {
+		return fmt.Errorf("remove stale credential temporary file: %w", err)
+	}
+	if err := verifyCredentialLinkCount(file, 0); err != nil {
+		return fmt.Errorf("verify stale credential temporary removal: %w", err)
+	}
+	if err := syncCredentialDirectory(int(directory.app.Fd())); err != nil {
+		return fmt.Errorf("sync stale credential temporary removal: %w", err)
+	}
+	return nil
+}
+
 func secureCredentialFileOperation(
 	locations credentialFileLocations,
 	create bool,
@@ -174,6 +245,9 @@ func secureCredentialFileOperation(
 		return nil, err
 	}
 	if err := verifyLockedCredentialState(operation.directories, operation.locks); err != nil {
+		return nil, err
+	}
+	if err := removeStaleCredentialTemps(operation.directories, operation.locks); err != nil {
 		return nil, err
 	}
 
@@ -617,9 +691,12 @@ func (operation *credentialOperation) finalize(bodyErr error) error {
 		return errors.Join(bodyErr, cleanupErr)
 	}
 	if operation.tempExists {
+		// The temporary name may have been substituted after creation. Erase the
+		// held inode unconditionally before unlinking the directory entry so a
+		// moved or hard-linked original cannot retain credential bytes.
+		cleanupErr = errors.Join(cleanupErr, eraseCredentialFile(operation.temp))
 		if err := unlinkTempFile(int(operation.tempDirectory.app.Fd()), operation.tempName); err != nil {
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove credential temporary file: %w", err))
-			cleanupErr = errors.Join(cleanupErr, eraseCredentialFile(operation.temp))
 		}
 		cleanupErr = errors.Join(cleanupErr, closeTempFile(operation.temp))
 		operation.temp = nil

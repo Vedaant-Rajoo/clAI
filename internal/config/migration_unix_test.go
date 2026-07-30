@@ -448,16 +448,25 @@ func TestConfigMigrationConcurrent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read acquisition order: %v", err)
 		}
-		var order []string
+		var order configLockOrderEvidence
 		if err := json.Unmarshal(orderData, &order); err != nil {
-			t.Fatalf("decode acquisition order: %v", err)
+			t.Fatalf("decode lock order evidence: %v", err)
 		}
-		wantOrder := []string{filepath.Join(legacy, "clai"), filepath.Join(preferred, "clai")}
-		if !sort.StringsAreSorted(order) || !equalStrings(order, wantOrder) {
-			t.Fatalf("lock acquisition order = %v, want ascending canonical paths %v", order, wantOrder)
+		wantAcquire := []string{filepath.Join(legacy, "clai"), filepath.Join(preferred, "clai")}
+		wantRelease := []string{filepath.Join(preferred, "clai"), filepath.Join(legacy, "clai")}
+		if !sort.StringsAreSorted(order.Acquire) || !equalStrings(order.Acquire, wantAcquire) {
+			t.Fatalf("lock acquisition order = %v, want ascending canonical paths %v", order.Acquire, wantAcquire)
+		}
+		if !equalStrings(order.Release, wantRelease) {
+			t.Fatalf("lock release order = %v, want reverse acquisition order %v", order.Release, wantRelease)
 		}
 		assertNoConfigLitter(t, preferred, legacy)
 	})
+}
+
+type configLockOrderEvidence struct {
+	Acquire []string `json:"acquire"`
+	Release []string `json:"release"`
 }
 
 type configMigrationHelper struct {
@@ -521,7 +530,10 @@ func TestConfigMigrationProcessHelper(t *testing.T) {
 	}
 	configHooks.afterOrderedLocksAcquired = func(checkpoint configFilesystemCheckpoint) error {
 		if order := os.Getenv("CLAI_CONFIG_HELPER_ORDER"); order != "" {
-			data, err := json.Marshal(checkpoint.AppPaths)
+			data, err := json.Marshal(configLockOrderEvidence{
+				Acquire: checkpoint.AppPaths,
+				Release: checkpoint.ReleasePaths,
+			})
 			if err != nil {
 				return err
 			}

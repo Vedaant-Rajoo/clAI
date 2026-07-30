@@ -43,6 +43,21 @@ type configLock struct {
 	info      os.FileInfo
 }
 
+type configFilesystemCheckpoint struct {
+	AppPaths      []string
+	ReleasePaths  []string
+	PreferredPath string
+	LegacyPath    string
+	TempName      string
+}
+
+type configFilesystemHooks struct {
+	afterOrderedLocksAcquired               func(configFilesystemCheckpoint) error
+	afterPreferredInstallBeforeLegacyUnlink func(configFileLocations) error
+}
+
+var configHooks configFilesystemHooks
+
 func migrateConfigFile(locations configFileLocations) (retErr error) {
 	directories, preferred, legacy, err := openConfigDirectories(locations)
 	if err != nil {
@@ -59,7 +74,7 @@ func migrateConfigFile(locations configFileLocations) (retErr error) {
 	if err := verifyLockedConfigState(directories, locks); err != nil {
 		return err
 	}
-	preferredFile, _, preferredExists, err := openConfigFile(preferred.app)
+	preferredFile, preferredInfo, preferredExists, err := openConfigFile(preferred.app)
 	if err != nil {
 		return err
 	}
@@ -67,18 +82,43 @@ func migrateConfigFile(locations configFileLocations) (retErr error) {
 		if err := closeConfigFile(preferredFile); err != nil {
 			return err
 		}
-		if legacy == nil {
+		legacyInfo, legacyExists, err := inspectConfigFile(legacy)
+		if err != nil {
+			return err
+		}
+		if err := runOrderedLockCheckpoint(locks, locations, ""); err != nil {
+			return err
+		}
+		if err := verifyLockedConfigState(directories, locks); err != nil {
+			return err
+		}
+		if err := verifyNamedConfigFile(preferred.app, fileName, preferredInfo, false); err != nil {
+			return fmt.Errorf("preferred config file changed during reconciliation: %w", err)
+		}
+		if !legacyExists {
 			return nil
 		}
-		return removeConfigFileIfPresent(legacy, locks)
-	}
-	if legacy == nil {
-		return nil
+		return removeConfigFile(legacy, legacyInfo, locks)
 	}
 
+	if legacy == nil {
+		if err := runOrderedLockCheckpoint(locks, locations, ""); err != nil {
+			return err
+		}
+		return ensureConfigFileAbsent(preferred.app)
+	}
 	legacyFile, legacyInfo, legacyExists, err := openConfigFile(legacy.app)
-	if err != nil || !legacyExists {
+	if err != nil {
 		return err
+	}
+	if !legacyExists {
+		if err := runOrderedLockCheckpoint(locks, locations, ""); err != nil {
+			return err
+		}
+		if err := verifyLockedConfigState(directories, locks); err != nil {
+			return err
+		}
+		return ensureConfigFileAbsent(preferred.app)
 	}
 	if err := verifyLockedConfigState(directories, locks); err != nil {
 		return errors.Join(err, closeConfigFile(legacyFile))
@@ -102,8 +142,25 @@ func migrateConfigFile(locations configFileLocations) (retErr error) {
 	if err != nil {
 		return err
 	}
-	if err := installConfigFile(preferred, out, nil, false, locks); err != nil {
+	if err := runOrderedLockCheckpoint(locks, locations, ""); err != nil {
 		return err
+	}
+	if err := verifyLockedConfigState(directories, locks); err != nil {
+		return err
+	}
+	if err := ensureConfigFileAbsent(preferred.app); err != nil {
+		return err
+	}
+	if err := verifyNamedConfigFile(legacy.app, fileName, legacyInfo, false); err != nil {
+		return fmt.Errorf("legacy config file changed before migration: %w", err)
+	}
+	if err := installConfigFile(preferred, out, nil, false, locks, locations, false, nil); err != nil {
+		return err
+	}
+	if hook := configHooks.afterPreferredInstallBeforeLegacyUnlink; hook != nil {
+		if err := hook(locations); err != nil {
+			return fmt.Errorf("run post-install config checkpoint: %w", err)
+		}
 	}
 	return removeConfigFile(legacy, legacyInfo, locks)
 }
@@ -165,38 +222,42 @@ func writeConfigFile(locations configFileLocations, data []byte) (retErr error) 
 	if err := verifyLockedConfigState(directories, locks); err != nil {
 		return err
 	}
-	current, currentInfo, currentExists, err := openConfigFile(preferred.app)
+	currentInfo, currentExists, err := inspectConfigFile(preferred)
 	if err != nil {
 		return err
 	}
-	if currentExists {
-		if err := closeConfigFile(current); err != nil {
-			return err
-		}
-	}
-
-	var legacyInfo os.FileInfo
-	legacyExists := false
-	if legacy != nil {
-		legacyFile, info, exists, err := openConfigFile(legacy.app)
-		if err != nil {
-			return err
-		}
-		legacyInfo, legacyExists = info, exists
-		if exists {
-			if err := closeConfigFile(legacyFile); err != nil {
-				return err
-			}
-		}
-	}
-
-	if err := installConfigFile(preferred, data, currentInfo, currentExists, locks); err != nil {
+	legacyInfo, legacyExists, err := inspectConfigFile(legacy)
+	if err != nil {
 		return err
 	}
-	if legacyExists {
-		return removeConfigFile(legacy, legacyInfo, locks)
+	verifyCapturedState := func() error {
+		if err := verifyLockedConfigState(directories, locks); err != nil {
+			return err
+		}
+		if legacyExists {
+			if err := verifyNamedConfigFile(legacy.app, fileName, legacyInfo, false); err != nil {
+				return fmt.Errorf("legacy config file changed before preferred replace: %w", err)
+			}
+		} else if legacy != nil {
+			if err := ensureConfigFileAbsent(legacy.app); err != nil {
+				return fmt.Errorf("legacy config file appeared before preferred replace: %w", err)
+			}
+		}
+		return nil
 	}
-	return nil
+
+	if err := installConfigFile(preferred, data, currentInfo, currentExists, locks, locations, true, verifyCapturedState); err != nil {
+		return err
+	}
+	if !legacyExists {
+		return nil
+	}
+	if hook := configHooks.afterPreferredInstallBeforeLegacyUnlink; hook != nil {
+		if err := hook(locations); err != nil {
+			return fmt.Errorf("run post-install config checkpoint: %w", err)
+		}
+	}
+	return removeConfigFile(legacy, legacyInfo, locks)
 }
 
 func openConfigDirectories(locations configFileLocations) ([]*configDirectory, *configDirectory, *configDirectory, error) {
@@ -384,6 +445,30 @@ func acquireOrderedConfigLocks(directories []*configDirectory) ([]*configLock, e
 	return locks, nil
 }
 
+func runOrderedLockCheckpoint(locks []*configLock, locations configFileLocations, tempName string) error {
+	hook := configHooks.afterOrderedLocksAcquired
+	if hook == nil {
+		return nil
+	}
+	checkpoint := configFilesystemCheckpoint{
+		AppPaths:      make([]string, 0, len(locks)),
+		ReleasePaths:  make([]string, 0, len(locks)),
+		PreferredPath: locations.preferred,
+		LegacyPath:    locations.legacy,
+		TempName:      tempName,
+	}
+	for _, lock := range locks {
+		checkpoint.AppPaths = append(checkpoint.AppPaths, lock.directory.appPath)
+	}
+	for _, lock := range configLocksInReleaseOrder(locks) {
+		checkpoint.ReleasePaths = append(checkpoint.ReleasePaths, lock.directory.appPath)
+	}
+	if err := hook(checkpoint); err != nil {
+		return fmt.Errorf("run ordered config lock checkpoint: %w", err)
+	}
+	return nil
+}
+
 func acquireConfigLock(directory *configDirectory) (*configLock, error) {
 	deadline := time.Now().Add(configLockTimeout)
 	for {
@@ -478,10 +563,18 @@ func verifyLockedConfigState(directories []*configDirectory, locks []*configLock
 	return nil
 }
 
+func configLocksInReleaseOrder(locks []*configLock) []*configLock {
+	reversed := make([]*configLock, len(locks))
+	for i := range locks {
+		reversed[i] = locks[len(locks)-1-i]
+	}
+	return reversed
+}
+
 func releaseOrderedConfigLocks(locks []*configLock) error {
 	var result error
-	for i := len(locks) - 1; i >= 0; i-- {
-		result = errors.Join(result, releaseConfigLock(locks[i]))
+	for _, lock := range configLocksInReleaseOrder(locks) {
+		result = errors.Join(result, releaseConfigLock(lock))
 	}
 	return result
 }
@@ -543,7 +636,16 @@ func closeConfigFile(file *os.File) error {
 	return nil
 }
 
-func installConfigFile(directory *configDirectory, data []byte, expected os.FileInfo, existed bool, locks []*configLock) (retErr error) {
+func installConfigFile(
+	directory *configDirectory,
+	data []byte,
+	expected os.FileInfo,
+	existed bool,
+	locks []*configLock,
+	locations configFileLocations,
+	runCheckpoint bool,
+	verifyAdditional func() error,
+) (retErr error) {
 	if err := verifyLockedConfigState([]*configDirectory{directory}, locks); err != nil {
 		return err
 	}
@@ -563,27 +665,22 @@ func installConfigFile(directory *configDirectory, data []byte, expected os.File
 		}
 	}()
 
+	if runCheckpoint {
+		if err := runOrderedLockCheckpoint(locks, locations, tempName); err != nil {
+			return err
+		}
+	}
+	if err := verifyConfigInstallState(directory, tempName, tempInfo, expected, existed, locks, verifyAdditional); err != nil {
+		return err
+	}
 	if _, err := temp.Write(data); err != nil {
 		return fmt.Errorf("write config temporary file: %w", err)
 	}
 	if err := temp.Sync(); err != nil {
 		return fmt.Errorf("sync config temporary file: %w", err)
 	}
-	if err := verifyLockedConfigState([]*configDirectory{directory}, locks); err != nil {
+	if err := verifyConfigInstallState(directory, tempName, tempInfo, expected, existed, locks, verifyAdditional); err != nil {
 		return err
-	}
-	if existed {
-		if err := verifyNamedConfigFile(directory.app, fileName, expected, false); err != nil {
-			return fmt.Errorf("config file changed before replace: %w", err)
-		}
-	} else {
-		appeared, _, nowExists, err := openConfigFile(directory.app)
-		if err != nil {
-			return err
-		}
-		if nowExists {
-			return errors.Join(errors.New("config file appeared before replace"), closeConfigFile(appeared))
-		}
 	}
 	if err := unix.Renameat(int(directory.app.Fd()), tempName, int(directory.app.Fd()), fileName); err != nil {
 		return fmt.Errorf("replace config file: %w", err)
@@ -599,6 +696,61 @@ func installConfigFile(directory *configDirectory, data []byte, expected os.File
 		return fmt.Errorf("sync config directory: %w", err)
 	}
 	return nil
+}
+
+func verifyConfigInstallState(
+	directory *configDirectory,
+	tempName string,
+	tempInfo os.FileInfo,
+	expected os.FileInfo,
+	existed bool,
+	locks []*configLock,
+	verifyAdditional func() error,
+) error {
+	if err := verifyLockedConfigState([]*configDirectory{directory}, locks); err != nil {
+		return err
+	}
+	if err := verifyNamedConfigFile(directory.app, tempName, tempInfo, false); err != nil {
+		return fmt.Errorf("config temporary file changed before replace: %w", err)
+	}
+	if existed {
+		if err := verifyNamedConfigFile(directory.app, fileName, expected, false); err != nil {
+			return fmt.Errorf("config file changed before replace: %w", err)
+		}
+	} else if err := ensureConfigFileAbsent(directory.app); err != nil {
+		return err
+	}
+	if verifyAdditional != nil {
+		if err := verifyAdditional(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func inspectConfigFile(directory *configDirectory) (os.FileInfo, bool, error) {
+	if directory == nil {
+		return nil, false, nil
+	}
+	file, info, exists, err := openConfigFile(directory.app)
+	if err != nil || !exists {
+		return info, exists, err
+	}
+	if err := closeConfigFile(file); err != nil {
+		return nil, false, err
+	}
+	return info, true, nil
+}
+
+func ensureConfigFileAbsent(dir *os.File) error {
+	file, _, exists, err := openConfigFile(dir)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	return errors.Join(errors.New("config file appeared during operation"), closeConfigFile(file))
 }
 
 func removeConfigFileIfPresent(directory *configDirectory, locks []*configLock) error {

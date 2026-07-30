@@ -313,13 +313,24 @@ func TestCredentialLockTimeoutIsBoundedAndReleasesDescriptors(t *testing.T) {
 
 func TestRepeatedCredentialOperationsDoNotLeakFileDescriptors(t *testing.T) {
 	before := countOpenFileDescriptors()
-	kr := &fakeKeyring{setErr: errors.New("unavailable"), getErr: keyring.ErrNotFound}
-	useTestBackends(t, kr)
+	kr := &fakeKeyring{
+		setErr:    errors.New("unavailable"),
+		getErr:    keyring.ErrNotFound,
+		deleteErr: keyring.ErrNotFound,
+	}
+	preferred, legacy := useCredentialMigrationRoots(t, kr)
+	writeCredentialMapFixture(t, legacy, map[string]string{
+		"openrouter": "legacy-secret",
+		"anthropic":  "preserved-secret",
+	})
 	for i := 0; i < 100; i++ {
+		if _, err := Resolve("openrouter", ""); err != nil {
+			t.Fatal(err)
+		}
 		if err := Store("openrouter", "secret-value"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := Resolve("openrouter", ""); err != nil {
+		if err := Delete("openrouter"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -327,6 +338,13 @@ func TestRepeatedCredentialOperationsDoNotLeakFileDescriptors(t *testing.T) {
 	if delta := after - before; delta > 2 {
 		t.Fatalf("file descriptor count grew by %d", delta)
 	}
+	credentials := readCredentialMapFixture(t, preferred)
+	if len(credentials) != 1 || credentials["anthropic"] != "preserved-secret" {
+		t.Fatalf("repeated migration lifecycle left unexpected map: %#v", credentials)
+	}
+	assertLegacyCredentialRemoved(t, legacy)
+	assertNoCredentialTemps(t, preferred)
+	assertNoCredentialTemps(t, legacy)
 }
 
 func countOpenFileDescriptors() int {

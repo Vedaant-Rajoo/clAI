@@ -6,9 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Vedaant-Rajoo/clai/internal/configroot"
 	"github.com/zalando/go-keyring"
@@ -334,4 +339,331 @@ func TestCredentialErrorsContainNoSecrets(t *testing.T) {
 		}
 		assertLegacyCredentialRemoved(t, legacy)
 	})
+}
+
+func TestCredentialMigrationIdempotent(t *testing.T) {
+	preferred, legacy := useCredentialMigrationRoots(t, &fakeKeyring{
+		getErr:    keyring.ErrNotFound,
+		setErr:    errors.New("keyring unavailable"),
+		deleteErr: keyring.ErrNotFound,
+	})
+	writeCredentialMapFixture(t, legacy, map[string]string{
+		"openrouter": "legacy-target-secret",
+		"anthropic":  "preserved-secret",
+	})
+	staleTemp := filepath.Join(legacy, "clai", ".credentials-00112233445566778899aabb.tmp")
+	if err := os.WriteFile(staleTemp, []byte("stale-secret-temp"), 0o600); err != nil {
+		t.Fatalf("write stale migration temp: %v", err)
+	}
+
+	if key, err := Resolve("openrouter", ""); err != nil || key != "legacy-target-secret" {
+		t.Fatalf("Resolve initial migration = %q, %v", key, err)
+	}
+	for range 3 {
+		if err := Store("openrouter", "updated-target-secret"); err != nil {
+			t.Fatalf("Store repeated migration: %v", err)
+		}
+		if key, err := Resolve("openrouter", ""); err != nil || key != "updated-target-secret" {
+			t.Fatalf("Resolve repeated Store = %q, %v", key, err)
+		}
+		if err := Delete("openrouter"); err != nil {
+			t.Fatalf("Delete repeated migration: %v", err)
+		}
+		if key, err := Resolve("openrouter", ""); err != nil || key != "" {
+			t.Fatalf("Resolve repeated Delete = %q, %v", key, err)
+		}
+	}
+
+	credentials := readCredentialMapFixture(t, preferred)
+	if len(credentials) != 1 || credentials["anthropic"] != "preserved-secret" {
+		t.Fatalf("repeated lifecycle left unexpected preferred map: %#v", credentials)
+	}
+	assertLegacyCredentialRemoved(t, legacy)
+	assertNoCredentialTemps(t, preferred)
+	assertNoCredentialTemps(t, legacy)
+	for _, root := range []string{preferred, legacy} {
+		lock := filepath.Join(root, "clai", lockName)
+		info, err := os.Lstat(lock)
+		if err != nil {
+			t.Fatalf("inspect persistent lock %q: %v", lock, err)
+		}
+		if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+			t.Fatalf("persistent lock %q mode = %v, want private regular file", lock, info.Mode())
+		}
+		data, err := os.ReadFile(lock)
+		if err != nil {
+			t.Fatalf("read persistent lock %q: %v", lock, err)
+		}
+		if len(data) != 0 {
+			t.Fatalf("persistent lock %q contains data", lock)
+		}
+	}
+}
+
+func TestCredentialMigrationInterruptedRecovery(t *testing.T) {
+	preferred, legacy := useCredentialMigrationRoots(t, &fakeKeyring{getErr: keyring.ErrNotFound})
+	original := map[string]string{
+		"openrouter": "original-openrouter-secret",
+		"anthropic":  "original-anthropic-secret",
+	}
+	writeCredentialMapFixture(t, legacy, original)
+	interrupted := errors.New("injected post-install interruption")
+	var calls atomic.Int32
+	useFilesystemHooks(t, filesystemHooks{
+		afterPreferredInstallBeforeLegacyUnlink: func(credentialFileLocations) error {
+			if calls.Add(1) == 1 {
+				return interrupted
+			}
+			return nil
+		},
+	})
+
+	if _, err := Resolve("openrouter", ""); !errors.Is(err, interrupted) {
+		t.Fatalf("Resolve interrupted migration error = %v, want injected interruption", err)
+	}
+	if got := readCredentialMapFixture(t, preferred); len(got) != 2 || got["openrouter"] != original["openrouter"] || got["anthropic"] != original["anthropic"] {
+		t.Fatalf("interrupted migration installed partial preferred map: %#v", got)
+	}
+	if _, err := os.Stat(credentialFileAt(legacy)); err != nil {
+		t.Fatalf("interrupted migration did not retain recoverable legacy source: %v", err)
+	}
+	assertNoCredentialTemps(t, preferred)
+	assertNoCredentialTemps(t, legacy)
+
+	writeCredentialMapFixture(t, legacy, map[string]string{
+		"openrouter": "stale-openrouter-secret",
+		"openai":     "stale-only-secret",
+	})
+	key, err := Resolve("openrouter", "")
+	if err != nil {
+		t.Fatalf("Resolve interrupted migration retry: %v", err)
+	}
+	if key != original["openrouter"] {
+		t.Fatalf("retry returned %q, want installed preferred authority", key)
+	}
+	if got := readCredentialMapFixture(t, preferred); len(got) != 2 || got["openrouter"] != original["openrouter"] || got["anthropic"] != original["anthropic"] {
+		t.Fatalf("retry merged stale legacy values: %#v", got)
+	}
+	assertLegacyCredentialRemoved(t, legacy)
+	assertNoCredentialTemps(t, preferred)
+	assertNoCredentialTemps(t, legacy)
+}
+
+func TestCredentialMigrationConcurrent(t *testing.T) {
+	t.Run("goroutines acquire canonical order", func(t *testing.T) {
+		root, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		firstRoot := filepath.Join(root, "z-preferred")
+		secondRoot := filepath.Join(root, "a-legacy")
+		for _, path := range []string{firstRoot, secondRoot} {
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		writeCredentialMapFixture(t, secondRoot, map[string]string{"openrouter": "seed-secret"})
+		firstLocations := credentialFileLocations{preferred: credentialFileAt(firstRoot), legacy: credentialFileAt(secondRoot)}
+		secondLocations := credentialFileLocations{preferred: credentialFileAt(secondRoot), legacy: credentialFileAt(firstRoot)}
+		wantAcquire := []string{filepath.Join(secondRoot, "clai"), filepath.Join(firstRoot, "clai")}
+		wantRelease := []string{filepath.Join(firstRoot, "clai"), filepath.Join(secondRoot, "clai")}
+
+		firstEntered := make(chan struct{})
+		releaseFirst := make(chan struct{})
+		var checkpoints atomic.Int32
+		var ordersMu sync.Mutex
+		var acquireOrders, releaseOrders [][]string
+		useFilesystemHooks(t, filesystemHooks{
+			afterOrderedLocksAcquired: func(checkpoint credentialFilesystemCheckpoint) error {
+				if checkpoint.TempName != "" {
+					return nil
+				}
+				ordersMu.Lock()
+				acquireOrders = append(acquireOrders, append([]string(nil), checkpoint.AppPaths...))
+				releaseOrders = append(releaseOrders, append([]string(nil), checkpoint.ReleasePaths...))
+				ordersMu.Unlock()
+				if checkpoints.Add(1) == 1 {
+					close(firstEntered)
+					<-releaseFirst
+				}
+				return nil
+			},
+		})
+
+		firstDone := make(chan error, 1)
+		go func() {
+			firstDone <- secureMutateCredentialFiles(firstLocations, true, func(credentials map[string]string) bool {
+				credentials["anthropic"] = "first-secret"
+				return true
+			})
+		}()
+		select {
+		case <-firstEntered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for first ordered-lock checkpoint")
+		}
+		secondDone := make(chan error, 1)
+		go func() {
+			secondDone <- secureMutateCredentialFiles(secondLocations, true, func(credentials map[string]string) bool {
+				credentials["openai"] = "second-secret"
+				return true
+			})
+		}()
+		select {
+		case err := <-secondDone:
+			t.Fatalf("opposite-order mutation passed held ordered locks: %v", err)
+		case <-time.After(200 * time.Millisecond):
+		}
+		close(releaseFirst)
+		for name, done := range map[string]<-chan error{"first": firstDone, "second": secondDone} {
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("%s mutation: %v", name, err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("timed out waiting for %s mutation", name)
+			}
+		}
+		ordersMu.Lock()
+		defer ordersMu.Unlock()
+		if len(acquireOrders) != 2 || len(releaseOrders) != 2 {
+			t.Fatalf("ordered-lock checkpoints = %d/%d, want 2/2", len(acquireOrders), len(releaseOrders))
+		}
+		for i := range acquireOrders {
+			if !slices.Equal(acquireOrders[i], wantAcquire) || !slices.Equal(releaseOrders[i], wantRelease) {
+				t.Fatalf("checkpoint %d order = acquire %#v release %#v, want %#v/%#v", i, acquireOrders[i], releaseOrders[i], wantAcquire, wantRelease)
+			}
+		}
+		credentials := readCredentialMapFixture(t, secondRoot)
+		if len(credentials) != 3 || credentials["openrouter"] != "seed-secret" || credentials["anthropic"] != "first-secret" || credentials["openai"] != "second-secret" {
+			t.Fatalf("concurrent migration lost serialized updates: %#v", credentials)
+		}
+		assertLegacyCredentialRemoved(t, firstRoot)
+		assertNoCredentialTemps(t, firstRoot)
+		assertNoCredentialTemps(t, secondRoot)
+	})
+
+	t.Run("child processes acquire canonical order", func(t *testing.T) {
+		root, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		firstRoot := filepath.Join(root, "z-preferred")
+		secondRoot := filepath.Join(root, "a-legacy")
+		for _, path := range []string{firstRoot, secondRoot} {
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		writeCredentialMapFixture(t, secondRoot, map[string]string{"openrouter": "seed-secret"})
+		firstSignal := filepath.Join(root, "first-locked")
+		secondSignal := filepath.Join(root, "second-locked")
+		release := filepath.Join(root, "release-first")
+
+		first := credentialMigrationHelperCommand(firstRoot, secondRoot, "anthropic", "first-secret", firstSignal, release)
+		if err := first.Start(); err != nil {
+			t.Fatal(err)
+		}
+		firstDone := make(chan error, 1)
+		go func() { firstDone <- first.Wait() }()
+		waitForTestPath(t, firstSignal, 5*time.Second)
+
+		second := credentialMigrationHelperCommand(secondRoot, firstRoot, "openai", "second-secret", secondSignal, "")
+		if err := second.Start(); err != nil {
+			t.Fatal(err)
+		}
+		secondDone := make(chan error, 1)
+		go func() { secondDone <- second.Wait() }()
+		select {
+		case err := <-secondDone:
+			t.Fatalf("opposite-order child passed held ordered locks: %v", err)
+		case <-time.After(200 * time.Millisecond):
+		}
+		if _, err := os.Stat(secondSignal); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("second child reached ordered-lock checkpoint early: %v", err)
+		}
+		if err := os.WriteFile(release, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for name, done := range map[string]<-chan error{"first": firstDone, "second": secondDone} {
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("%s migration helper: %v", name, err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("timed out waiting for %s migration helper", name)
+			}
+		}
+		waitForTestPath(t, secondSignal, time.Second)
+		credentials := readCredentialMapFixture(t, secondRoot)
+		if len(credentials) != 3 || credentials["openrouter"] != "seed-secret" || credentials["anthropic"] != "first-secret" || credentials["openai"] != "second-secret" {
+			t.Fatalf("cross-process migration lost serialized updates: %#v", credentials)
+		}
+		assertLegacyCredentialRemoved(t, firstRoot)
+		assertNoCredentialTemps(t, firstRoot)
+		assertNoCredentialTemps(t, secondRoot)
+	})
+}
+
+func credentialMigrationHelperCommand(preferred, legacy, provider, secret, signal, release string) *exec.Cmd {
+	command := exec.Command(os.Args[0], "-test.run=^TestCredentialMigrationProcessHelper$")
+	command.Env = append(os.Environ(),
+		"CLAI_AUTH_MIGRATION_HELPER_PREFERRED="+preferred,
+		"CLAI_AUTH_MIGRATION_HELPER_LEGACY="+legacy,
+		"CLAI_AUTH_MIGRATION_HELPER_PROVIDER="+provider,
+		"CLAI_AUTH_MIGRATION_HELPER_SECRET="+secret,
+		"CLAI_AUTH_MIGRATION_HELPER_SIGNAL="+signal,
+		"CLAI_AUTH_MIGRATION_HELPER_RELEASE="+release,
+	)
+	return command
+}
+
+func TestCredentialMigrationProcessHelper(t *testing.T) {
+	preferred := os.Getenv("CLAI_AUTH_MIGRATION_HELPER_PREFERRED")
+	if preferred == "" {
+		return
+	}
+	legacy := os.Getenv("CLAI_AUTH_MIGRATION_HELPER_LEGACY")
+	credentialKeyring = &fakeKeyring{setErr: errors.New("keyring unavailable")}
+	resolveConfigRoots = func() (configroot.Roots, error) {
+		return configroot.Roots{Preferred: preferred, Legacy: legacy}, nil
+	}
+	signal := os.Getenv("CLAI_AUTH_MIGRATION_HELPER_SIGNAL")
+	release := os.Getenv("CLAI_AUTH_MIGRATION_HELPER_RELEASE")
+	credentialFilesystemHooks.afterOrderedLocksAcquired = func(checkpoint credentialFilesystemCheckpoint) error {
+		if checkpoint.TempName != "" {
+			return nil
+		}
+		if !slices.IsSorted(checkpoint.AppPaths) {
+			return errors.New("credential locks were not acquired in canonical order")
+		}
+		wantRelease := append([]string(nil), checkpoint.AppPaths...)
+		slices.Reverse(wantRelease)
+		if !slices.Equal(checkpoint.ReleasePaths, wantRelease) {
+			return errors.New("credential locks were not released in reverse order")
+		}
+		if err := os.WriteFile(signal, nil, 0o600); err != nil {
+			return err
+		}
+		if release == "" {
+			return nil
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, err := os.Stat(release); err == nil {
+				return nil
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			if time.Now().After(deadline) {
+				return errors.New("timed out waiting for migration helper release")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if err := Store(os.Getenv("CLAI_AUTH_MIGRATION_HELPER_PROVIDER"), os.Getenv("CLAI_AUTH_MIGRATION_HELPER_SECRET")); err != nil {
+		t.Fatal(err)
+	}
 }

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Vedaant-Rajoo/clai/internal/configroot"
 	"github.com/zalando/go-keyring"
 )
 
@@ -63,12 +64,14 @@ func useTestBackends(t *testing.T, kr *fakeKeyring) string {
 func useTestBackendsAt(t *testing.T, kr *fakeKeyring, base string) {
 	t.Helper()
 	oldKeyring := credentialKeyring
-	oldConfigDir := userConfigDir
+	oldRoots := resolveConfigRoots
 	credentialKeyring = kr
-	userConfigDir = func() (string, error) { return base, nil }
+	resolveConfigRoots = func() (configroot.Roots, error) {
+		return configroot.Roots{Preferred: base}, nil
+	}
 	t.Cleanup(func() {
 		credentialKeyring = oldKeyring
-		userConfigDir = oldConfigDir
+		resolveConfigRoots = oldRoots
 	})
 }
 

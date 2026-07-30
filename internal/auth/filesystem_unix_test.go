@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Vedaant-Rajoo/clai/internal/configroot"
 	"github.com/zalando/go-keyring"
 	"golang.org/x/sys/unix"
 )
@@ -229,10 +230,12 @@ func TestCrossProcessFallbackStoresPreserveBothEntries(t *testing.T) {
 	}
 
 	kr := &fakeKeyring{}
-	oldKeyring, oldConfig := credentialKeyring, userConfigDir
+	oldKeyring, oldRoots := credentialKeyring, resolveConfigRoots
 	credentialKeyring = kr
-	userConfigDir = func() (string, error) { return base, nil }
-	t.Cleanup(func() { credentialKeyring, userConfigDir = oldKeyring, oldConfig })
+	resolveConfigRoots = func() (configroot.Roots, error) {
+		return configroot.Roots{Preferred: base}, nil
+	}
+	t.Cleanup(func() { credentialKeyring, resolveConfigRoots = oldKeyring, oldRoots })
 	for provider, want := range map[string]string{"openrouter": "one", "anthropic": "two"} {
 		got, err := readFile(provider)
 		if err != nil || got != want {
@@ -247,7 +250,9 @@ func TestCredentialProcessHelper(t *testing.T) {
 		return
 	}
 	credentialKeyring = &fakeKeyring{setErr: errors.New("unavailable")}
-	userConfigDir = func() (string, error) { return base, nil }
+	resolveConfigRoots = func() (configroot.Roots, error) {
+		return configroot.Roots{Preferred: base}, nil
+	}
 	if preLock := os.Getenv("CLAI_AUTH_HELPER_PRELOCK_SIGNAL"); preLock != "" {
 		credentialFilesystemHooks.beforeLockAcquire = func(string, string) error {
 			return os.WriteFile(preLock, nil, 0o600)

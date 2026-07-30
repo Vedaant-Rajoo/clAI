@@ -1,7 +1,9 @@
 // Package auth resolves and stores LLM provider credentials.
 //
 // Resolution precedence: explicit value (flag) > environment variable >
-// OS keyring > config file fallback.
+// OS keyring > preferred private credential file. On Darwin, an old-only
+// Application Support file is migrated under the shared config-root contract;
+// an existing preferred file is globally authoritative.
 package auth
 
 import (
@@ -10,8 +12,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
+	"github.com/Vedaant-Rajoo/clai/internal/configroot"
 	"github.com/zalando/go-keyring"
 )
 
@@ -39,32 +41,66 @@ func (systemKeyring) Delete(service, user string) error {
 	return keyring.Delete(service, user)
 }
 
+type credentialFilesystemCheckpoint struct {
+	AppPaths      []string
+	ReleasePaths  []string
+	PreferredPath string
+	LegacyPath    string
+	TempName      string
+}
+
 // filesystemHooks are deterministic test checkpoints. Production leaves every
-// hook nil. Hooks run while the cross-process credential lock is held.
+// hook nil. Hooks run while the participating cross-process credential locks
+// are held.
 type filesystemHooks struct {
-	afterBaseValidationBeforeAppOpen func(base, app string) error
-	beforeLockAcquire                func(dir, path string) error
-	afterLockAcquired                func(dir, path string) error
-	afterFileValidationBeforeRead    func(dir, path string) error
-	afterCredentialReadWhileLocked   func(dir, path string) error
-	beforeTempCreation               func(dir, path string) error
-	afterTempCreation                func(dir, path, tempName string) error
-	afterRenameBeforeVerification    func(dir, path string) error
-	unlinkTemp                       func(dirfd int, name string) error
-	unlockLock                       func(fd int) error
-	closeLock                        func(file *os.File) error
-	closeCredential                  func(file *os.File) error
-	closeTemp                        func(file *os.File) error
-	closeAppDirectory                func(file *os.File) error
-	closeBaseDirectory               func(file *os.File) error
-	syncDirectory                    func(fd int) error
+	afterBaseValidationBeforeAppOpen        func(base, app string) error
+	beforeLockAcquire                       func(dir, path string) error
+	afterLockAcquired                       func(dir, path string) error
+	afterOrderedLocksAcquired               func(credentialFilesystemCheckpoint) error
+	afterFileValidationBeforeRead           func(dir, path string) error
+	afterCredentialReadWhileLocked          func(dir, path string) error
+	beforeTempCreation                      func(dir, path string) error
+	afterTempCreation                       func(dir, path, tempName string) error
+	afterRenameBeforeVerification           func(dir, path string) error
+	afterPreferredInstallBeforeLegacyUnlink func(credentialFileLocations) error
+	unlinkTemp                              func(dirfd int, name string) error
+	unlockLock                              func(fd int) error
+	closeLock                               func(file *os.File) error
+	closeCredential                         func(file *os.File) error
+	closeTemp                               func(file *os.File) error
+	closeAppDirectory                       func(file *os.File) error
+	closeBaseDirectory                      func(file *os.File) error
+	syncDirectory                           func(fd int) error
 }
 
 var (
 	credentialKeyring         keyringStore = systemKeyring{}
-	userConfigDir                          = os.UserConfigDir
+	resolveConfigRoots                     = configroot.Resolve
 	credentialFilesystemHooks filesystemHooks
 )
+
+type credentialFileLocations struct {
+	preferred string
+	legacy    string
+}
+
+// backendError keeps backend failures classifiable with errors.Is while
+// preventing an untrusted keyring implementation from reflecting credential
+// material through its error string.
+type backendError struct {
+	operation string
+	cause     error
+}
+
+func (e backendError) Error() string { return e.operation }
+func (e backendError) Unwrap() error { return e.cause }
+
+func secretFreeBackendError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return backendError{operation: operation, cause: err}
+}
 
 // EnvVarFor returns the conventional environment variable for a provider.
 func EnvVarFor(provider string) string {
@@ -81,8 +117,8 @@ func EnvVarFor(provider string) string {
 }
 
 // Resolve returns the API key for a provider using the precedence chain:
-// explicit (flag) > env var > keyring > config file. Returns "" with nil
-// error when no credential is configured anywhere.
+// explicit (flag) > env var > keyring > preferred config file. Returns "" with
+// nil error when no credential is configured anywhere.
 func Resolve(provider, explicit string) (string, error) {
 	if explicit != "" {
 		return explicit, nil
@@ -107,7 +143,7 @@ func Resolve(provider, explicit string) (string, error) {
 			return "", fileErr
 		}
 		return "", errors.Join(
-			fmt.Errorf("read credential from keyring: %w", keyringErr),
+			secretFreeBackendError("read credential from keyring", keyringErr),
 			fmt.Errorf("read credential from config file: %w", fileErr),
 		)
 	}
@@ -115,13 +151,14 @@ func Resolve(provider, explicit string) (string, error) {
 		return key, nil
 	}
 	if !errors.Is(keyringErr, keyring.ErrNotFound) {
-		return "", fmt.Errorf("read credential from keyring: %w", keyringErr)
+		return "", secretFreeBackendError("read credential from keyring", keyringErr)
 	}
 	return "", nil
 }
 
 // Store persists an API key, preferring the OS keyring and falling back to a
-// private config file when the keyring is unavailable.
+// private config file when the keyring is unavailable. A successful keyring
+// store removes the provider from both file locations before returning.
 func Store(provider, key string) error {
 	if err := credentialKeyring.Set(serviceName, provider, key); err == nil {
 		if err := deleteFileEntry(provider); err != nil {
@@ -135,15 +172,15 @@ func Store(provider, key string) error {
 	return nil
 }
 
-// Delete removes the stored key from both keyring and file. A missing keyring
-// entry is not an error, but operational errors are returned after config-file
-// cleanup is attempted.
+// Delete removes the stored key from both keyring and reconciled file storage.
+// A missing keyring entry is not an error, but operational errors are returned
+// after file cleanup is attempted independently.
 func Delete(provider string) error {
 	keyringErr := credentialKeyring.Delete(serviceName, provider)
 	if errors.Is(keyringErr, keyring.ErrNotFound) {
 		keyringErr = nil
 	} else if keyringErr != nil {
-		keyringErr = fmt.Errorf("delete credential from keyring: %w", keyringErr)
+		keyringErr = secretFreeBackendError("delete credential from keyring", keyringErr)
 	}
 	fileErr := deleteFileEntry(provider)
 	if fileErr != nil {
@@ -165,7 +202,7 @@ func Source(provider, explicit string) string {
 }
 
 // SourceWithError reports where the resolved credential came from while
-// preserving storage validation and keyring errors.
+// preserving storage validation and classifiable keyring errors.
 func SourceWithError(provider, explicit string) (string, error) {
 	if explicit != "" {
 		return "flag", nil
@@ -188,7 +225,7 @@ func SourceWithError(provider, explicit string) (string, error) {
 			return "", fileErr
 		}
 		return "", errors.Join(
-			fmt.Errorf("inspect credential keyring: %w", keyringErr),
+			secretFreeBackendError("inspect credential keyring", keyringErr),
 			fmt.Errorf("inspect credential config file: %w", fileErr),
 		)
 	}
@@ -196,71 +233,105 @@ func SourceWithError(provider, explicit string) (string, error) {
 		return "config file", nil
 	}
 	if !errors.Is(keyringErr, keyring.ErrNotFound) {
-		return "", fmt.Errorf("inspect credential keyring: %w", keyringErr)
+		return "", secretFreeBackendError("inspect credential keyring", keyringErr)
 	}
 	return "none", nil
 }
 
-func configPath() (string, error) {
-	dir, err := userConfigDir()
+func selectedCredentialFileLocations() (credentialFileLocations, error) {
+	roots, err := resolveConfigRoots()
 	if err != nil {
-		return "", fmt.Errorf("locate user config directory: %w", err)
+		return credentialFileLocations{}, fmt.Errorf("resolve config roots: %w", err)
 	}
-	if err := validateConfiguredBasePath(dir); err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "clai", fileName), nil
+	return credentialFileLocations{
+		preferred: roots.PreferredPath(fileName),
+		legacy:    roots.LegacyPath(fileName),
+	}, nil
 }
 
-func validateConfiguredBasePath(path string) error {
-	if !filepath.IsAbs(path) {
-		return errors.New("user config directory must be absolute")
+func resolveCredentialFileLocations(createPreferred bool) (credentialFileLocations, error) {
+	roots, err := resolveConfigRoots()
+	if err != nil {
+		return credentialFileLocations{}, fmt.Errorf("resolve config roots: %w", err)
 	}
-	volume := filepath.VolumeName(path)
-	remainder := strings.TrimPrefix(path, volume)
-	for _, component := range strings.FieldsFunc(remainder, func(r rune) bool {
-		return r == '/' || r == '\\'
-	}) {
-		if component == "." || component == ".." {
-			return errors.New("user config directory must not contain dot path components")
+	preferred, err := configroot.Canonicalize(roots.Preferred, createPreferred)
+	if err != nil {
+		return credentialFileLocations{}, fmt.Errorf("canonicalize preferred credential root: %w", err)
+	}
+	legacy := ""
+	if roots.Legacy != "" {
+		legacy, err = configroot.Canonicalize(roots.Legacy, false)
+		if err != nil {
+			return credentialFileLocations{}, fmt.Errorf("canonicalize legacy credential root: %w", err)
 		}
 	}
-	return nil
+	canonical := configroot.Roots{Preferred: preferred, Legacy: legacy}
+	return credentialFileLocations{
+		preferred: canonical.PreferredPath(fileName),
+		legacy:    canonical.LegacyPath(fileName),
+	}, nil
+}
+
+func canonicalizeCredentialFileLocations(selected credentialFileLocations, createPreferred bool) (credentialFileLocations, error) {
+	preferredRoot := credentialRoot(selected.preferred)
+	preferred, err := configroot.Canonicalize(preferredRoot, createPreferred)
+	if err != nil {
+		return credentialFileLocations{}, fmt.Errorf("canonicalize preferred credential root: %w", err)
+	}
+	legacy := ""
+	if selected.legacy != "" {
+		legacyRoot := credentialRoot(selected.legacy)
+		legacy, err = configroot.Canonicalize(legacyRoot, false)
+		if err != nil {
+			return credentialFileLocations{}, fmt.Errorf("canonicalize legacy credential root: %w", err)
+		}
+	}
+	canonical := configroot.Roots{Preferred: preferred, Legacy: legacy}
+	return credentialFileLocations{
+		preferred: canonical.PreferredPath(fileName),
+		legacy:    canonical.LegacyPath(fileName),
+	}, nil
+}
+
+func credentialRoot(path string) string {
+	return filepath.Dir(filepath.Dir(path))
+}
+
+// configPath remains as a focused compatibility helper for tests and callers
+// inside this package. Production reads and mutations resolve both locations.
+func configPath() (string, error) {
+	locations, err := selectedCredentialFileLocations()
+	if err != nil {
+		return "", err
+	}
+	return locations.preferred, nil
 }
 
 func readFile(provider string) (string, error) {
-	path, err := configPath()
+	locations, err := resolveCredentialFileLocations(false)
 	if err != nil {
 		return "", err
 	}
-	data, exists, err := secureReadCredentialFile(path)
-	if err != nil || !exists {
-		return "", err
-	}
-	creds, err := decodeCredentials(path, data)
-	if err != nil {
-		return "", err
-	}
-	return creds[provider], nil
+	return secureReadCredentialFiles(locations, provider)
 }
 
 func writeFile(provider, key string) error {
-	path, err := configPath()
+	locations, err := resolveCredentialFileLocations(true)
 	if err != nil {
 		return err
 	}
-	return secureMutateCredentialFile(path, true, func(creds map[string]string) bool {
+	return secureMutateCredentialFiles(locations, true, func(creds map[string]string) bool {
 		creds[provider] = key
 		return true
 	})
 }
 
 func deleteFileEntry(provider string) error {
-	path, err := configPath()
+	locations, err := resolveCredentialFileLocations(false)
 	if err != nil {
 		return err
 	}
-	return secureMutateCredentialFile(path, false, func(creds map[string]string) bool {
+	return secureMutateCredentialFiles(locations, false, func(creds map[string]string) bool {
 		if _, ok := creds[provider]; !ok {
 			return false
 		}

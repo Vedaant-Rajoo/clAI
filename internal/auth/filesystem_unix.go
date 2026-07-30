@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -31,209 +32,484 @@ type credentialDirectory struct {
 	appInfo  os.FileInfo
 }
 
-func secureReadCredentialFile(path string) (data []byte, exists bool, retErr error) {
-	directory, err := openCredentialDirectory(filepath.Dir(path), false)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, false, nil
-	}
-	if err != nil {
-		return nil, false, err
-	}
-	defer func() { retErr = errors.Join(retErr, directory.close()) }()
-
-	if hook := credentialFilesystemHooks.beforeLockAcquire; hook != nil {
-		if err := hook(directory.appPath, path); err != nil {
-			return nil, false, err
-		}
-	}
-	lock, lockInfo, err := acquireCredentialLock(directory.app)
-	if err != nil {
-		return nil, false, err
-	}
-	defer func() { retErr = errors.Join(retErr, releaseCredentialLock(lock)) }()
-	if hook := credentialFilesystemHooks.afterLockAcquired; hook != nil {
-		if err := hook(directory.appPath, path); err != nil {
-			return nil, false, err
-		}
-	}
-	if err := directory.verify(); err != nil {
-		return nil, false, err
-	}
-	if err := verifyNamedFile(directory.app, lockName, lockInfo, true); err != nil {
-		return nil, false, fmt.Errorf("verify credential lock: %w", err)
-	}
-
-	file, info, found, err := openCredentialFile(directory.app)
-	if err != nil || !found {
-		return nil, found, err
-	}
-	if hook := credentialFilesystemHooks.afterFileValidationBeforeRead; hook != nil {
-		if err := hook(directory.appPath, path); err != nil {
-			return nil, false, errors.Join(err, closeCredentialFile(file))
-		}
-	}
-	if err := directory.verify(); err != nil {
-		return nil, false, errors.Join(err, closeCredentialFile(file))
-	}
-	if err := verifyNamedFile(directory.app, fileName, info, false); err != nil {
-		return nil, false, errors.Join(fmt.Errorf("credential file changed before read: %w", err), closeCredentialFile(file))
-	}
-	data, readErr := io.ReadAll(file)
-	closeErr := closeCredentialFile(file)
-	if readErr != nil {
-		return nil, false, fmt.Errorf("read credential file: %w", readErr)
-	}
-	if closeErr != nil {
-		return nil, false, fmt.Errorf("close credential file: %w", closeErr)
-	}
-	return data, true, nil
+type credentialLock struct {
+	directory *credentialDirectory
+	file      *os.File
+	info      os.FileInfo
 }
 
-func secureMutateCredentialFile(path string, create bool, mutate func(map[string]string) bool) (retErr error) {
-	var directory *credentialDirectory
-	var lock *os.File
-	var temp *os.File
-	var tempName string
-	tempExists := false
-	renamed := false
-	defer func() {
-		retErr = finalizeCredentialMutation(retErr, directory, lock, temp, tempName, tempExists, renamed)
-	}()
+type credentialFileSnapshot struct {
+	directory *credentialDirectory
+	path      string
+	file      *os.File
+	info      os.FileInfo
+	exists    bool
+}
 
-	var err error
-	directory, err = openCredentialDirectory(filepath.Dir(path), create)
-	if !create && errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+type credentialOperation struct {
+	directories                  []*credentialDirectory
+	locks                        []*credentialLock
+	snapshots                    []*credentialFileSnapshot
+	tempDirectory                *credentialDirectory
+	temp                         *os.File
+	tempName                     string
+	tempExists                   bool
+	installed                    bool
+	preserveInstalledOnBodyError bool
+}
+
+func secureReadCredentialFiles(locations credentialFileLocations, provider string) (string, error) {
+	credentials, err := secureCredentialFileOperation(locations, false, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
+	return credentials[provider], nil
+}
 
-	if hook := credentialFilesystemHooks.beforeLockAcquire; hook != nil {
-		if err := hook(directory.appPath, path); err != nil {
-			return err
+func secureMutateCredentialFiles(locations credentialFileLocations, create bool, mutate func(map[string]string) bool) error {
+	_, err := secureCredentialFileOperation(locations, create, mutate)
+	return err
+}
+
+func prepareCredentialFileOperation(locations credentialFileLocations, create bool) (credentialFileLocations, bool, error) {
+	if create {
+		canonical, err := canonicalizeCredentialFileLocations(locations, true)
+		return canonical, err == nil, err
+	}
+	exists, err := credentialStorageStateExists(locations)
+	if err != nil || !exists {
+		return locations, exists, err
+	}
+	canonical, err := canonicalizeCredentialFileLocations(locations, true)
+	if err != nil {
+		return credentialFileLocations{}, false, err
+	}
+	return canonical, true, nil
+}
+
+func credentialStorageStateExists(locations credentialFileLocations) (bool, error) {
+	seen := map[string]bool{}
+	for _, path := range []string{locations.preferred, locations.legacy} {
+		if path == "" {
+			continue
 		}
-	}
-	var lockInfo os.FileInfo
-	lock, lockInfo, err = acquireCredentialLock(directory.app)
-	if err != nil {
-		return err
-	}
-	if hook := credentialFilesystemHooks.afterLockAcquired; hook != nil {
-		if err := hook(directory.appPath, path); err != nil {
-			return err
+		appPath := filepath.Dir(path)
+		if seen[appPath] {
+			continue
 		}
-	}
-	if err := directory.verify(); err != nil {
-		return err
-	}
-	if err := verifyNamedFile(directory.app, lockName, lockInfo, true); err != nil {
-		return fmt.Errorf("verify credential lock: %w", err)
-	}
-
-	creds := map[string]string{}
-	current, currentInfo, exists, err := openCredentialFile(directory.app)
-	if err != nil {
-		return err
-	}
-	if exists {
-		if hook := credentialFilesystemHooks.afterFileValidationBeforeRead; hook != nil {
-			if err := hook(directory.appPath, path); err != nil {
-				return errors.Join(err, closeCredentialFile(current))
+		seen[appPath] = true
+		directory, err := openCredentialDirectory(appPath, false)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		names, listErr := readCredentialDirectoryNames(directory.app)
+		closeErr := directory.close()
+		if listErr != nil || closeErr != nil {
+			return false, errors.Join(listErr, closeErr)
+		}
+		for _, name := range names {
+			if name == fileName || isCredentialTransientName(name) {
+				return true, nil
 			}
 		}
-		if err := directory.verify(); err != nil {
-			return errors.Join(err, closeCredentialFile(current))
+	}
+	return false, nil
+}
+
+func readCredentialDirectoryNames(dir *os.File) ([]string, error) {
+	fd, err := unix.Dup(int(dir.Fd()))
+	if err != nil {
+		return nil, fmt.Errorf("duplicate credential directory descriptor: %w", err)
+	}
+	duplicate := os.NewFile(uintptr(fd), "credential-directory-listing")
+	names, readErr := duplicate.Readdirnames(-1)
+	closeErr := duplicate.Close()
+	if readErr != nil || closeErr != nil {
+		return nil, fmt.Errorf("list credential directory: %w", errors.Join(readErr, closeErr))
+	}
+	return names, nil
+}
+
+func isCredentialTransientName(name string) bool {
+	if !strings.HasPrefix(name, ".credentials-") || !strings.HasSuffix(name, ".tmp") {
+		return false
+	}
+	hexPart := strings.TrimSuffix(strings.TrimPrefix(name, ".credentials-"), ".tmp")
+	if len(hexPart) != 24 {
+		return false
+	}
+	_, err := hex.DecodeString(hexPart)
+	return err == nil
+}
+
+func secureCredentialFileOperation(
+	locations credentialFileLocations,
+	create bool,
+	mutate func(map[string]string) bool,
+) (credentials map[string]string, retErr error) {
+	locations, active, err := prepareCredentialFileOperation(locations, create)
+	if err != nil {
+		return nil, err
+	}
+	if !active {
+		return map[string]string{}, nil
+	}
+
+	operation := &credentialOperation{}
+	defer func() { retErr = operation.finalize(retErr) }()
+
+	var preferred, legacy *credentialDirectory
+	operation.directories, preferred, legacy, err = openCredentialDirectories(locations)
+	if err != nil {
+		return nil, err
+	}
+	operation.locks, err = acquireOrderedCredentialLocks(operation.directories)
+	if err != nil {
+		return nil, err
+	}
+	if err := runOrderedCredentialLockCheckpoint(operation.locks, locations, ""); err != nil {
+		return nil, err
+	}
+	if err := verifyLockedCredentialState(operation.directories, operation.locks); err != nil {
+		return nil, err
+	}
+
+	preferredSnapshot, err := operation.snapshotCredentialFile(preferred, locations.preferred)
+	if err != nil {
+		return nil, err
+	}
+	legacySnapshot, err := operation.snapshotCredentialFile(legacy, locations.legacy)
+	if err != nil {
+		return nil, err
+	}
+
+	if preferredSnapshot.exists {
+		if legacySnapshot.exists {
+			if err := removeCredentialSnapshot(legacySnapshot, operation.locks); err != nil {
+				return nil, err
+			}
+		} else if legacy != nil {
+			if err := ensureCredentialFileAbsent(legacy.app); err != nil {
+				return nil, err
+			}
 		}
-		if err := verifyNamedFile(directory.app, fileName, currentInfo, false); err != nil {
-			return errors.Join(fmt.Errorf("credential file changed before read: %w", err), closeCredentialFile(current))
-		}
-		content, readErr := io.ReadAll(current)
-		closeErr := closeCredentialFile(current)
-		if readErr != nil {
-			return fmt.Errorf("read credential file: %w", readErr)
-		}
-		if closeErr != nil {
-			return fmt.Errorf("close credential file: %w", closeErr)
-		}
-		creds, err = decodeCredentials(path, content)
+		credentials, err = readCredentialSnapshot(preferredSnapshot, operation.directories, operation.locks)
 		if err != nil {
-			return err
+			return nil, err
+		}
+		if err := runCredentialReadCheckpoint(preferredSnapshot); err != nil {
+			return nil, err
+		}
+		if mutate == nil || !mutate(credentials) {
+			return credentials, nil
+		}
+		if err := installCredentialFile(operation, preferred, locations, credentials, preferredSnapshot.info, true, legacySnapshot); err != nil {
+			return nil, err
+		}
+		return credentials, nil
+	}
+
+	credentials = map[string]string{}
+	if legacySnapshot.exists {
+		credentials, err = readCredentialSnapshot(legacySnapshot, operation.directories, operation.locks)
+		if err != nil {
+			return nil, err
 		}
 	}
-	if hook := credentialFilesystemHooks.afterCredentialReadWhileLocked; hook != nil {
-		if err := hook(directory.appPath, path); err != nil {
-			return err
+	checkpointSnapshot := legacySnapshot
+	if !legacySnapshot.exists {
+		checkpointSnapshot = preferredSnapshot
+	}
+	if err := runCredentialReadCheckpoint(checkpointSnapshot); err != nil {
+		return nil, err
+	}
+	changed := false
+	if mutate != nil {
+		changed = mutate(credentials)
+	}
+	if !legacySnapshot.exists && !changed {
+		return credentials, nil
+	}
+	if err := installCredentialFile(operation, preferred, locations, credentials, nil, false, legacySnapshot); err != nil {
+		return nil, err
+	}
+	if !legacySnapshot.exists {
+		return credentials, nil
+	}
+
+	// At this point the preferred inode has been verified and its directory
+	// synced. A deterministic interruption now leaves a valid preferred file and
+	// the legacy source; retry observes preferred authority and finishes cleanup.
+	operation.preserveInstalledOnBodyError = true
+	if hook := credentialFilesystemHooks.afterPreferredInstallBeforeLegacyUnlink; hook != nil {
+		if err := hook(locations); err != nil {
+			return nil, fmt.Errorf("run post-install credential checkpoint: %w", err)
 		}
 	}
-	if !mutate(creds) {
+	if err := removeCredentialSnapshot(legacySnapshot, operation.locks); err != nil {
+		return nil, err
+	}
+	return credentials, nil
+}
+
+func openCredentialDirectories(locations credentialFileLocations) ([]*credentialDirectory, *credentialDirectory, *credentialDirectory, error) {
+	preferred, err := openCredentialDirectory(filepath.Dir(locations.preferred), true)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	directories := []*credentialDirectory{preferred}
+
+	var legacy *credentialDirectory
+	if locations.legacy != "" {
+		legacyApp := filepath.Dir(locations.legacy)
+		if legacyApp != preferred.appPath {
+			legacy, err = openCredentialDirectory(legacyApp, false)
+			if errors.Is(err, os.ErrNotExist) {
+				legacy = nil
+			} else if err != nil {
+				return nil, nil, nil, errors.Join(err, closeCredentialDirectories(directories))
+			} else {
+				directories = append(directories, legacy)
+			}
+		}
+	}
+
+	sort.Slice(directories, func(i, j int) bool {
+		return directories[i].appPath < directories[j].appPath
+	})
+	return directories, preferred, legacy, nil
+}
+
+func closeCredentialDirectories(directories []*credentialDirectory) error {
+	var result error
+	for i := len(directories) - 1; i >= 0; i-- {
+		result = errors.Join(result, directories[i].close())
+	}
+	return result
+}
+
+func acquireOrderedCredentialLocks(directories []*credentialDirectory) ([]*credentialLock, error) {
+	locks := make([]*credentialLock, 0, len(directories))
+	for _, directory := range directories {
+		path := filepath.Join(directory.appPath, fileName)
+		if hook := credentialFilesystemHooks.beforeLockAcquire; hook != nil {
+			if err := hook(directory.appPath, path); err != nil {
+				return nil, errors.Join(err, releaseOrderedCredentialLocks(locks))
+			}
+		}
+		file, info, err := acquireCredentialLock(directory.app)
+		if err != nil {
+			return nil, errors.Join(err, releaseOrderedCredentialLocks(locks))
+		}
+		lock := &credentialLock{directory: directory, file: file, info: info}
+		locks = append(locks, lock)
+		if hook := credentialFilesystemHooks.afterLockAcquired; hook != nil {
+			if err := hook(directory.appPath, path); err != nil {
+				return nil, errors.Join(err, releaseOrderedCredentialLocks(locks))
+			}
+		}
+		if err := verifyCredentialLock(lock); err != nil {
+			return nil, errors.Join(err, releaseOrderedCredentialLocks(locks))
+		}
+	}
+	return locks, nil
+}
+
+func releaseOrderedCredentialLocks(locks []*credentialLock) error {
+	var result error
+	for i := len(locks) - 1; i >= 0; i-- {
+		if locks[i].file != nil {
+			result = errors.Join(result, releaseCredentialLock(locks[i].file))
+			locks[i].file = nil
+		}
+	}
+	return result
+}
+
+func runOrderedCredentialLockCheckpoint(locks []*credentialLock, locations credentialFileLocations, tempName string) error {
+	hook := credentialFilesystemHooks.afterOrderedLocksAcquired
+	if hook == nil {
 		return nil
 	}
-	out, err := json.MarshalIndent(creds, "", "  ")
+	checkpoint := credentialFilesystemCheckpoint{
+		AppPaths:      make([]string, 0, len(locks)),
+		ReleasePaths:  make([]string, 0, len(locks)),
+		PreferredPath: locations.preferred,
+		LegacyPath:    locations.legacy,
+		TempName:      tempName,
+	}
+	for _, lock := range locks {
+		checkpoint.AppPaths = append(checkpoint.AppPaths, lock.directory.appPath)
+	}
+	for i := len(locks) - 1; i >= 0; i-- {
+		checkpoint.ReleasePaths = append(checkpoint.ReleasePaths, locks[i].directory.appPath)
+	}
+	if err := hook(checkpoint); err != nil {
+		return fmt.Errorf("run ordered credential lock checkpoint: %w", err)
+	}
+	return nil
+}
+
+func verifyCredentialLock(lock *credentialLock) error {
+	if err := lock.directory.verify(); err != nil {
+		return err
+	}
+	if err := verifyNamedFile(lock.directory.app, lockName, lock.info, true); err != nil {
+		return fmt.Errorf("verify credential lock: %w", err)
+	}
+	return nil
+}
+
+func verifyLockedCredentialState(directories []*credentialDirectory, locks []*credentialLock) error {
+	for _, directory := range directories {
+		if err := directory.verify(); err != nil {
+			return err
+		}
+	}
+	for _, lock := range locks {
+		if err := verifyCredentialLock(lock); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (operation *credentialOperation) snapshotCredentialFile(directory *credentialDirectory, path string) (*credentialFileSnapshot, error) {
+	snapshot := &credentialFileSnapshot{directory: directory, path: path}
+	operation.snapshots = append(operation.snapshots, snapshot)
+	if directory == nil {
+		return snapshot, nil
+	}
+	file, info, exists, err := openCredentialFile(directory.app)
+	if err != nil {
+		return nil, err
+	}
+	snapshot.file = file
+	snapshot.info = info
+	snapshot.exists = exists
+	if exists {
+		if err := verifyCredentialLinkCount(file, 1); err != nil {
+			return nil, errors.Join(errors.New("credential file must have exactly one link"), err)
+		}
+	}
+	return snapshot, nil
+}
+
+func readCredentialSnapshot(
+	snapshot *credentialFileSnapshot,
+	directories []*credentialDirectory,
+	locks []*credentialLock,
+) (map[string]string, error) {
+	if !snapshot.exists {
+		return map[string]string{}, nil
+	}
+	if hook := credentialFilesystemHooks.afterFileValidationBeforeRead; hook != nil {
+		if err := hook(snapshot.directory.appPath, snapshot.path); err != nil {
+			return nil, err
+		}
+	}
+	if err := verifyLockedCredentialState(directories, locks); err != nil {
+		return nil, err
+	}
+	if err := verifyNamedFile(snapshot.directory.app, fileName, snapshot.info, false); err != nil {
+		return nil, fmt.Errorf("credential file changed before read: %w", err)
+	}
+	if _, err := snapshot.file.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek credential file: %w", err)
+	}
+	data, err := io.ReadAll(snapshot.file)
+	if err != nil {
+		return nil, fmt.Errorf("read credential file: %w", err)
+	}
+	return decodeCredentials(snapshot.path, data)
+}
+
+func runCredentialReadCheckpoint(snapshot *credentialFileSnapshot) error {
+	hook := credentialFilesystemHooks.afterCredentialReadWhileLocked
+	if hook == nil {
+		return nil
+	}
+	dir := filepath.Dir(snapshot.path)
+	if snapshot.directory != nil {
+		dir = snapshot.directory.appPath
+	}
+	if err := hook(dir, snapshot.path); err != nil {
+		return err
+	}
+	return nil
+}
+
+func installCredentialFile(
+	operation *credentialOperation,
+	directory *credentialDirectory,
+	locations credentialFileLocations,
+	credentials map[string]string,
+	currentInfo os.FileInfo,
+	currentExists bool,
+	legacySnapshot *credentialFileSnapshot,
+) error {
+	out, err := json.MarshalIndent(credentials, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode credential config: %w", err)
 	}
-
 	if hook := credentialFilesystemHooks.beforeTempCreation; hook != nil {
-		if err := hook(directory.appPath, path); err != nil {
+		if err := hook(directory.appPath, locations.preferred); err != nil {
 			return err
 		}
 	}
-	if err := directory.verify(); err != nil {
+	if err := verifyCredentialInstallState(directory, "", nil, currentInfo, currentExists, operation.locks, legacySnapshot); err != nil {
 		return err
 	}
+
+	operation.tempDirectory = directory
 	var tempInfo os.FileInfo
-	temp, tempName, tempInfo, err = createCredentialTemp(directory.app)
+	operation.temp, operation.tempName, tempInfo, err = createCredentialTemp(directory.app)
 	if err != nil {
 		return err
 	}
-	tempExists = true
-	if _, err := temp.Write(out); err != nil {
+	operation.tempExists = true
+	if _, err := operation.temp.Write(out); err != nil {
 		return fmt.Errorf("write credential temporary file: %w", err)
 	}
-	if err := temp.Sync(); err != nil {
+	if err := operation.temp.Sync(); err != nil {
 		return fmt.Errorf("sync credential temporary file: %w", err)
 	}
 	if hook := credentialFilesystemHooks.afterTempCreation; hook != nil {
-		if err := hook(directory.appPath, path, tempName); err != nil {
+		if err := hook(directory.appPath, locations.preferred, operation.tempName); err != nil {
 			return err
 		}
 	}
-	if err := directory.verify(); err != nil {
+	if err := verifyCredentialInstallState(directory, operation.tempName, tempInfo, currentInfo, currentExists, operation.locks, legacySnapshot); err != nil {
 		return err
 	}
-	if err := verifyNamedFile(directory.app, lockName, lockInfo, true); err != nil {
-		return fmt.Errorf("credential lock changed before replace: %w", err)
+	if err := runOrderedCredentialLockCheckpoint(operation.locks, locations, operation.tempName); err != nil {
+		return err
 	}
-	if exists {
-		if err := verifyNamedFile(directory.app, fileName, currentInfo, false); err != nil {
-			return fmt.Errorf("credential file changed before replace: %w", err)
-		}
-	} else {
-		appeared, _, nowExists, err := openCredentialFile(directory.app)
-		if err != nil {
-			return err
-		}
-		if nowExists {
-			return errors.Join(errors.New("credential file appeared before replace"), closeCredentialFile(appeared))
-		}
+	if err := verifyCredentialInstallState(directory, operation.tempName, tempInfo, currentInfo, currentExists, operation.locks, legacySnapshot); err != nil {
+		return err
 	}
 
-	if err := unix.Renameat(int(directory.app.Fd()), tempName, int(directory.app.Fd()), fileName); err != nil {
+	if err := unix.Renameat(int(directory.app.Fd()), operation.tempName, int(directory.app.Fd()), fileName); err != nil {
 		return fmt.Errorf("replace credential file: %w", err)
 	}
-	tempExists = false
-	renamed = true
+	operation.tempExists = false
+	operation.installed = true
 	if hook := credentialFilesystemHooks.afterRenameBeforeVerification; hook != nil {
-		if err := hook(directory.appPath, path); err != nil {
+		if err := hook(directory.appPath, locations.preferred); err != nil {
 			return err
 		}
 	}
-	if err := directory.verify(); err != nil {
+	if err := verifyLockedCredentialState([]*credentialDirectory{directory}, operation.locks); err != nil {
 		return err
 	}
 	if err := verifyNamedFile(directory.app, fileName, tempInfo, false); err != nil {
 		return fmt.Errorf("verify replaced credential file: %w", err)
+	}
+	if err := verifyCredentialLinkCount(operation.temp, 1); err != nil {
+		return fmt.Errorf("verify replaced credential link count: %w", err)
 	}
 	if err := syncCredentialDirectory(int(directory.app.Fd())); err != nil {
 		return fmt.Errorf("sync credential directory: %w", err)
@@ -241,61 +517,143 @@ func secureMutateCredentialFile(path string, create bool, mutate func(map[string
 	return nil
 }
 
-func finalizeCredentialMutation(retErr error, directory *credentialDirectory, lock, temp *os.File, tempName string, tempExists, renamed bool) error {
-	if temp == nil {
-		if lock != nil {
-			retErr = errors.Join(retErr, releaseCredentialLock(lock))
-		}
-		if directory != nil {
-			retErr = errors.Join(retErr, directory.close())
-		}
-		return retErr
+func verifyCredentialInstallState(
+	directory *credentialDirectory,
+	tempName string,
+	tempInfo os.FileInfo,
+	currentInfo os.FileInfo,
+	currentExists bool,
+	locks []*credentialLock,
+	legacySnapshot *credentialFileSnapshot,
+) error {
+	if err := verifyLockedCredentialState([]*credentialDirectory{directory}, locks); err != nil {
+		return err
 	}
-	if tempExists {
-		if err := unlinkTempFile(int(directory.app.Fd()), tempName); err != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("remove credential temporary file: %w", err))
-			retErr = errors.Join(retErr, eraseCredentialFile(temp))
+	if tempName != "" {
+		if err := verifyNamedFile(directory.app, tempName, tempInfo, false); err != nil {
+			return fmt.Errorf("credential temporary file changed before replace: %w", err)
 		}
-		retErr = errors.Join(retErr, closeTempFile(temp))
-		if lock != nil {
-			retErr = errors.Join(retErr, releaseCredentialLock(lock))
+	}
+	if currentExists {
+		if err := verifyNamedFile(directory.app, fileName, currentInfo, false); err != nil {
+			return fmt.Errorf("credential file changed before replace: %w", err)
 		}
-		if directory != nil {
-			retErr = errors.Join(retErr, directory.close())
+	} else if err := ensureCredentialFileAbsent(directory.app); err != nil {
+		return err
+	}
+	if legacySnapshot != nil && legacySnapshot.directory != nil {
+		if legacySnapshot.exists {
+			if err := verifyNamedFile(legacySnapshot.directory.app, fileName, legacySnapshot.info, false); err != nil {
+				return fmt.Errorf("legacy credential file changed before preferred replace: %w", err)
+			}
+		} else if err := ensureCredentialFileAbsent(legacySnapshot.directory.app); err != nil {
+			return fmt.Errorf("legacy credential file appeared before preferred replace: %w", err)
 		}
-		return retErr
+	}
+	return nil
+}
+
+func ensureCredentialFileAbsent(dir *os.File) error {
+	file, _, exists, err := openCredentialFile(dir)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	return errors.Join(errors.New("credential file appeared during operation"), closeCredentialFile(file))
+}
+
+func removeCredentialSnapshot(snapshot *credentialFileSnapshot, locks []*credentialLock) error {
+	if snapshot == nil || !snapshot.exists {
+		return nil
+	}
+	if err := verifyLockedCredentialState([]*credentialDirectory{snapshot.directory}, locks); err != nil {
+		return err
+	}
+	if err := verifyNamedFile(snapshot.directory.app, fileName, snapshot.info, false); err != nil {
+		return fmt.Errorf("legacy credential file changed before removal: %w", err)
+	}
+	if err := verifyCredentialLinkCount(snapshot.file, 1); err != nil {
+		return fmt.Errorf("legacy credential link count is unsafe: %w", err)
+	}
+	if err := unix.Unlinkat(int(snapshot.directory.app.Fd()), fileName, 0); err != nil {
+		return fmt.Errorf("remove legacy credential file: %w", err)
+	}
+	if err := verifyCredentialLinkCount(snapshot.file, 0); err != nil {
+		return fmt.Errorf("verify legacy credential removal: %w", err)
+	}
+	if err := syncCredentialDirectory(int(snapshot.directory.app.Fd())); err != nil {
+		return fmt.Errorf("sync legacy credential directory: %w", err)
+	}
+	snapshot.exists = false
+	return nil
+}
+
+func verifyCredentialLinkCount(file *os.File, want uint64) error {
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return fmt.Errorf("inspect credential link count: %w", err)
+	}
+	if uint64(stat.Nlink) != want {
+		return fmt.Errorf("credential link count = %d, want %d", stat.Nlink, want)
+	}
+	return nil
+}
+
+func (operation *credentialOperation) finalize(bodyErr error) error {
+	var cleanupErr error
+	for i := len(operation.snapshots) - 1; i >= 0; i-- {
+		snapshot := operation.snapshots[i]
+		if snapshot != nil && snapshot.file != nil {
+			cleanupErr = errors.Join(cleanupErr, closeCredentialFile(snapshot.file))
+			snapshot.file = nil
+		}
+	}
+
+	if operation.temp == nil {
+		cleanupErr = errors.Join(cleanupErr, releaseOrderedCredentialLocks(operation.locks))
+		cleanupErr = errors.Join(cleanupErr, closeCredentialDirectories(operation.directories))
+		return errors.Join(bodyErr, cleanupErr)
+	}
+	if operation.tempExists {
+		if err := unlinkTempFile(int(operation.tempDirectory.app.Fd()), operation.tempName); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove credential temporary file: %w", err))
+			cleanupErr = errors.Join(cleanupErr, eraseCredentialFile(operation.temp))
+		}
+		cleanupErr = errors.Join(cleanupErr, closeTempFile(operation.temp))
+		operation.temp = nil
+		cleanupErr = errors.Join(cleanupErr, releaseOrderedCredentialLocks(operation.locks))
+		cleanupErr = errors.Join(cleanupErr, closeCredentialDirectories(operation.directories))
+		return errors.Join(bodyErr, cleanupErr)
 	}
 
 	var stable *os.File
-	if renamed {
-		fd, err := unix.Dup(int(temp.Fd()))
-		if err != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("duplicate replaced credential descriptor: %w", err))
-			stable = temp
-		} else {
-			stable = os.NewFile(uintptr(fd), "replaced-credential")
-			retErr = errors.Join(retErr, closeTempFile(temp))
-		}
+	fd, duplicateErr := unix.Dup(int(operation.temp.Fd()))
+	if duplicateErr != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("duplicate replaced credential descriptor: %w", duplicateErr))
+		stable = operation.temp
 	} else {
-		retErr = errors.Join(retErr, closeTempFile(temp))
+		stable = os.NewFile(uintptr(fd), "replaced-credential")
+		cleanupErr = errors.Join(cleanupErr, closeTempFile(operation.temp))
+		operation.temp = nil
 	}
-	if lock != nil {
-		retErr = errors.Join(retErr, releaseCredentialLock(lock))
-	}
-	if directory != nil {
-		retErr = errors.Join(retErr, directory.close())
-	}
-	if renamed && retErr != nil {
-		retErr = errors.Join(retErr, eraseCredentialFile(stable))
+	cleanupErr = errors.Join(cleanupErr, releaseOrderedCredentialLocks(operation.locks))
+	cleanupErr = errors.Join(cleanupErr, closeCredentialDirectories(operation.directories))
+
+	shouldErase := operation.installed && (cleanupErr != nil || (bodyErr != nil && !operation.preserveInstalledOnBodyError))
+	if shouldErase {
+		cleanupErr = errors.Join(cleanupErr, eraseCredentialFile(stable))
 	}
 	if stable != nil {
-		if stable == temp {
-			retErr = errors.Join(retErr, closeTempFile(stable))
+		if stable == operation.temp {
+			cleanupErr = errors.Join(cleanupErr, closeTempFile(stable))
+			operation.temp = nil
 		} else {
-			retErr = errors.Join(retErr, stable.Close())
+			cleanupErr = errors.Join(cleanupErr, stable.Close())
 		}
 	}
-	return retErr
+	return errors.Join(bodyErr, cleanupErr)
 }
 
 func openCredentialDirectory(appPath string, create bool) (*credentialDirectory, error) {

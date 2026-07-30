@@ -55,6 +55,7 @@ type configFilesystemHooks struct {
 	afterOrderedLocksAcquired               func(configFilesystemCheckpoint) error
 	afterPreferredInstallBeforeLegacyUnlink func(configFileLocations) error
 	beforeNamedRetirement                   func(string, string) error
+	afterNamedRetirement                    func(string, string) error
 }
 
 var configHooks configFilesystemHooks
@@ -179,6 +180,9 @@ func migrateConfigFile(locations configFileLocations) (retErr error) {
 			return fmt.Errorf("preferred config file changed during reconciliation: %w", err)
 		}
 		if !legacyExists {
+			if legacy != nil {
+				return ensureConfigFileAbsent(legacy.app)
+			}
 			return nil
 		}
 		return removeConfigFile(legacy, legacyInfo, locks)
@@ -201,7 +205,10 @@ func migrateConfigFile(locations configFileLocations) (retErr error) {
 		if err := verifyLockedConfigState(directories, locks); err != nil {
 			return err
 		}
-		return ensureConfigFileAbsent(preferred.app)
+		if err := ensureConfigFileAbsent(preferred.app); err != nil {
+			return err
+		}
+		return ensureConfigFileAbsent(legacy.app)
 	}
 	if err := verifyLockedConfigState(directories, locks); err != nil {
 		return errors.Join(err, closeConfigFile(legacyFile))
@@ -874,8 +881,7 @@ func installConfigFile(
 		}
 		tempExists = false
 		if err := verifyInstalledConfig(directory, tempInfo, locks); err != nil {
-			rollbackErr := rollbackAbsentConfigInstall(directory.app, tempName, tempInfo, &tempExists)
-			return errors.Join(err, rollbackErr)
+			return err
 		}
 		return nil
 	}
@@ -892,14 +898,8 @@ func installConfigFile(
 			postErr = fmt.Errorf("previous config link count changed during exchange: %w", err)
 		}
 	}
-	if postErr != nil {
-		rollbackErr := rollbackExchangedConfigInstall(directory.app, tempName, tempInfo, &tempExists)
-		return errors.Join(postErr, rollbackErr)
-	}
-	if err := retireNamedConfigEntry(directory.app, tempName, expected, previousFile, "previous config file"); err != nil {
-		return err
-	}
-	return nil
+	retireErr := retireNamedConfigEntry(directory.app, tempName, expected, previousFile, "previous config file")
+	return errors.Join(postErr, retireErr)
 }
 
 func verifyInstalledConfig(directory *configDirectory, installed os.FileInfo, locks []*configLock) error {
@@ -913,34 +913,6 @@ func verifyInstalledConfig(directory *configDirectory, installed os.FileInfo, lo
 		return fmt.Errorf("sync config directory: %w", err)
 	}
 	return nil
-}
-
-func rollbackAbsentConfigInstall(dir *os.File, tempName string, installed os.FileInfo, tempExists *bool) error {
-	if err := verifyNamedConfigFile(dir, fileName, installed, false); err != nil {
-		return fmt.Errorf("preserve substituted absent config during rollback: %w", err)
-	}
-	if err := renameConfigNoReplace(int(dir.Fd()), fileName, tempName); err != nil {
-		return fmt.Errorf("rollback absent config install: %w", err)
-	}
-	*tempExists = true
-	if err := verifyNamedConfigFile(dir, tempName, installed, false); err != nil {
-		return fmt.Errorf("verify rolled back absent config: %w", err)
-	}
-	return unix.Fsync(int(dir.Fd()))
-}
-
-func rollbackExchangedConfigInstall(dir *os.File, tempName string, installed os.FileInfo, tempExists *bool) error {
-	if err := verifyNamedConfigFile(dir, fileName, installed, false); err != nil {
-		return fmt.Errorf("preserve substituted config during exchange rollback: %w", err)
-	}
-	if err := exchangeConfigNames(int(dir.Fd()), fileName, tempName); err != nil {
-		return fmt.Errorf("rollback exchanged config install: %w", err)
-	}
-	*tempExists = true
-	if err := verifyNamedConfigFile(dir, tempName, installed, false); err != nil {
-		return fmt.Errorf("verify rolled back exchanged config: %w", err)
-	}
-	return unix.Fsync(int(dir.Fd()))
 }
 
 func cleanupConfigTempByIdentity(dir *os.File, temp *os.File, name string, expected os.FileInfo, exists bool) error {
@@ -1098,6 +1070,15 @@ func retireNamedConfigEntry(dir *os.File, name string, expected os.FileInfo, sta
 		restoreErr := renameConfigNoReplace(int(dir.Fd()), retiredName, name)
 		return errors.Join(fmt.Errorf("%s changed before retirement", description), restoreErr)
 	}
+	if hook := configHooks.afterNamedRetirement; hook != nil {
+		if err := hook(dir.Name(), name); err != nil {
+			return fmt.Errorf("run post-retirement config checkpoint: %w", err)
+		}
+	}
+	appeared, err := namedConfigEntryExists(dir, name)
+	if err != nil {
+		return fmt.Errorf("inspect retired %s canonical name: %w", description, err)
+	}
 	if err := unix.Unlinkat(int(dir.Fd()), retiredName, 0); err != nil {
 		return fmt.Errorf("remove retired %s: %w", description, err)
 	}
@@ -1107,7 +1088,22 @@ func retireNamedConfigEntry(dir *os.File, name string, expected os.FileInfo, sta
 	if err := unix.Fsync(int(dir.Fd())); err != nil {
 		return fmt.Errorf("sync directory after retiring %s: %w", description, err)
 	}
+	if appeared && description != "config lock" {
+		return fmt.Errorf("%s reappeared during retirement", description)
+	}
 	return nil
+}
+
+func namedConfigEntryExists(dir *os.File, name string) (bool, error) {
+	var stat unix.Stat_t
+	err := unix.Fstatat(int(dir.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW)
+	if errors.Is(err, unix.ENOENT) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func verifyFileLinkCount(file *os.File, want uint64) error {

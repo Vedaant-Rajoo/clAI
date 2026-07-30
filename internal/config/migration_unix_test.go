@@ -483,6 +483,76 @@ func hasConfigTransientEntry(t *testing.T, root string) bool {
 	return false
 }
 
+func TestConfigMigrationLegacyAppearanceFailsClosed(t *testing.T) {
+	t.Run("preferred only", func(t *testing.T) {
+		preferred, legacy := useMigrationRoots(t)
+		preferredBytes := []byte(`{"contract":"config-file/v1","provider":"rules","model":"preferred-only","init_completed":true}`)
+		writeConfigFixture(t, preferred, preferredBytes)
+		if err := os.Mkdir(filepath.Join(legacy, "clai"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		substitute := []byte(`{"provider":"late-legacy"}`)
+		useConfigFilesystemTestHooks(t, configFilesystemHooks{
+			afterOrderedLocksAcquired: func(checkpoint configFilesystemCheckpoint) error {
+				return os.WriteFile(checkpoint.LegacyPath, substitute, 0o600)
+			},
+		})
+		_, err := Load()
+		if err == nil {
+			t.Fatal("Load unexpectedly accepted legacy appearance after absence snapshot")
+		}
+		assertFileBytes(t, configPathAt(preferred), preferredBytes)
+		assertFileBytes(t, configPathAt(legacy), substitute)
+	})
+
+	t.Run("empty state with interrupted lock", func(t *testing.T) {
+		preferred, legacy := useMigrationRoots(t)
+		for _, root := range []string{preferred, legacy} {
+			if err := os.Mkdir(filepath.Join(root, "clai"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(preferred, "clai", lockName), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		substitute := []byte(`{"provider":"late-empty-legacy"}`)
+		useConfigFilesystemTestHooks(t, configFilesystemHooks{
+			afterOrderedLocksAcquired: func(checkpoint configFilesystemCheckpoint) error {
+				return os.WriteFile(checkpoint.LegacyPath, substitute, 0o600)
+			},
+		})
+		_, err := Load()
+		if err == nil {
+			t.Fatal("Load unexpectedly accepted legacy appearance from empty state")
+		}
+		assertPathMissing(t, configPathAt(preferred))
+		assertFileBytes(t, configPathAt(legacy), substitute)
+	})
+
+	t.Run("post-retirement recreation", func(t *testing.T) {
+		preferred, legacy := useMigrationRoots(t)
+		writeConfigFixture(t, legacy, []byte(`{"provider":"rules","model":"retired-original","init_completed":true}`))
+		legacyPath := configPathAt(legacy)
+		substitute := []byte(`{"provider":"post-retirement-legacy"}`)
+		useConfigFilesystemTestHooks(t, configFilesystemHooks{
+			afterNamedRetirement: func(dir, name string) error {
+				if dir == filepath.Dir(legacyPath) && name == fileName {
+					return os.WriteFile(legacyPath, substitute, 0o600)
+				}
+				return nil
+			},
+		})
+		_, err := Load()
+		if err == nil {
+			t.Fatal("Load unexpectedly accepted legacy recreation after retirement")
+		}
+		assertFileBytes(t, legacyPath, substitute)
+		if _, statErr := os.Stat(configPathAt(preferred)); statErr != nil {
+			t.Fatalf("preferred install was not retained after late legacy recreation: %v", statErr)
+		}
+	})
+}
+
 func TestConfigMigrationConcurrent(t *testing.T) {
 	t.Run("same process", func(t *testing.T) {
 		preferred, legacy := useMigrationRoots(t)

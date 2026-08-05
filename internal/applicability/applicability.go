@@ -22,6 +22,10 @@ const (
 type Result struct {
 	Decision Decision
 	Reasons  []string
+	// Tools lists the executables resolved from an edited command in
+	// first-seen order. Only EvaluateEdited populates it, so renderers can
+	// reuse the resolution walk instead of re-parsing the command.
+	Tools []string
 }
 
 // Inventory is the read-only capability surface needed by the gate.

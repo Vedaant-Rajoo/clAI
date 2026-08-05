@@ -239,17 +239,6 @@ func SourceWithError(provider, explicit string) (string, error) {
 	return "none", nil
 }
 
-func selectedCredentialFileLocations() (credentialFileLocations, error) {
-	roots, err := resolveConfigRoots()
-	if err != nil {
-		return credentialFileLocations{}, fmt.Errorf("resolve config roots: %w", err)
-	}
-	return credentialFileLocations{
-		preferred: roots.PreferredPath(fileName),
-		legacy:    roots.LegacyPath(fileName),
-	}, nil
-}
-
 func resolveCredentialFileLocations(createPreferred bool) (credentialFileLocations, error) {
 	roots, err := resolveConfigRoots()
 	if err != nil {
@@ -340,16 +329,6 @@ func validateCredentialRootParents(path string) error {
 
 func credentialRoot(path string) string {
 	return filepath.Dir(filepath.Dir(path))
-}
-
-// configPath remains as a focused compatibility helper for tests and callers
-// inside this package. Production reads and mutations resolve both locations.
-func configPath() (string, error) {
-	locations, err := selectedCredentialFileLocations()
-	if err != nil {
-		return "", err
-	}
-	return locations.preferred, nil
 }
 
 func readFile(provider string) (string, error) {

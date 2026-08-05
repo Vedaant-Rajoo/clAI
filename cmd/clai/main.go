@@ -253,7 +253,7 @@ func (c cli) runWidget(args []string) int {
 		fmt.Fprintf(c.stderr, "clai widget: %v\nRun 'clai widget help' for usage.\n", err)
 		return exitUsage
 	}
-	if fs.NArg() != 0 || !validShell(*f.shell) || *f.resultFile == "" {
+	if fs.NArg() != 0 || !shellinit.Supported(*f.shell) || *f.resultFile == "" {
 		fmt.Fprintln(c.stderr, "usage: clai widget --shell <fish|bash|zsh> --result-file <path>\nRun 'clai widget help' for usage.")
 		return exitUsage
 	}
@@ -542,15 +542,6 @@ func runTUI(p provider.Provider, inventory *capability.Cached, activeShell, devE
 		return app.Outcome{}, nil
 	}
 	return result.Outcome(), nil
-}
-
-func validShell(shell string) bool {
-	switch shell {
-	case "fish", "bash", "zsh":
-		return true
-	default:
-		return false
-	}
 }
 
 func inspectWidgetResult(path string) (os.FileInfo, error) {

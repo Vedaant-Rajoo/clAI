@@ -181,34 +181,18 @@ func (p Provider) Compile(ctx context.Context, request provider.Request) ([]prov
 		return nil, err
 	}
 
-	// Precedence: the unexported test seam, then the loopback-gated development
-	// override, then the pinned production endpoint. Both overrides are still
-	// classified lexically below, so neither can reach a remote host under a
-	// local-only policy or carry userinfo credentials.
-	baseURL := p.baseURL
-	if baseURL == "" {
-		baseURL = p.DevEndpoint
-	}
-	if baseURL == "" {
-		baseURL = defaultEndpoint
-	}
-	class, err := machinecontext.ClassifyEndpoint(baseURL)
+	baseURL, class, selection, err := provider.ResolveCompileSetup(provider.CompileSetup{
+		Name:            "anthropic",
+		TestEndpoint:    p.baseURL,
+		DevEndpoint:     p.DevEndpoint,
+		DefaultEndpoint: defaultEndpoint,
+		Policy:          p.Policy,
+		SharedFields:    p.SharedFields,
+		APIKey:          p.APIKey,
+		KeyHint:         "run `clai auth login --provider anthropic` or set ANTHROPIC_API_KEY",
+	}, request)
 	if err != nil {
-		return nil, fmt.Errorf("anthropic: %w", err)
-	}
-	policy := p.Policy
-	if policy == "" {
-		policy = machinecontext.DefaultPolicy(false, class)
-	}
-	if policy == machinecontext.PolicyLocalOnly && class == machinecontext.EndpointRemote {
-		return nil, errors.New("anthropic: local-only context policy prohibits a remote endpoint")
-	}
-	selection, err := machinecontext.Select(request.Context, request.Capabilities, policy, p.SharedFields)
-	if err != nil {
-		return nil, fmt.Errorf("anthropic: context policy: %w", err)
-	}
-	if p.APIKey == "" {
-		return nil, errors.New("anthropic: no API key (run `clai auth login --provider anthropic` or set ANTHROPIC_API_KEY)")
+		return nil, err
 	}
 
 	model := p.Model
@@ -417,23 +401,9 @@ func classifyStreamError(err error) error {
 // classifyProxyMode reports "direct", "configured-proxy", or "unknown" for the
 // base transport. It never reveals a proxy URL or credentials.
 func classifyProxyMode(base http.RoundTripper, endpoint string) string {
-	httpTransport, ok := base.(*http.Transport)
-	if !ok {
-		return "unknown"
-	}
-	if httpTransport.Proxy == nil {
-		return "direct"
-	}
 	req, err := http.NewRequest(http.MethodPost, endpoint, nil)
 	if err != nil {
 		return "unknown"
 	}
-	proxyURL, err := httpTransport.Proxy(req)
-	if err != nil {
-		return "unknown"
-	}
-	if proxyURL == nil {
-		return "direct"
-	}
-	return "configured-proxy"
+	return provider.ProxyMode(base, req)
 }

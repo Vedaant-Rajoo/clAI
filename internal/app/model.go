@@ -13,7 +13,6 @@ import (
 	"github.com/Vedaant-Rajoo/clai/internal/provider"
 	"github.com/Vedaant-Rajoo/clai/internal/provider/rules"
 	"github.com/Vedaant-Rajoo/clai/internal/safety"
-	"github.com/Vedaant-Rajoo/clai/internal/shellsyntax"
 	"github.com/Vedaant-Rajoo/clai/internal/textsafe"
 	"github.com/Vedaant-Rajoo/clai/internal/validate"
 	"github.com/charmbracelet/bubbles/cursor"
@@ -257,9 +256,9 @@ func (m Model) Outcome() Outcome {
 	return outcome
 }
 
-func (m Model) Accepted() bool { return m.Outcome().Accepted }
+func (m Model) Accepted() bool { return m.accepted }
 
-func (m Model) Command() string { return m.Outcome().Command }
+func (m Model) Command() string { return m.command }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
@@ -361,7 +360,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			if m.screen == screenReview {
-				if m.safety.Decision == safety.Block || !m.validation.Valid || m.applicability.Decision == applicability.Rejected {
+				if _, canAccept := acceptVerb(m.safety.Decision, m.validation.Valid, m.applicability.Decision); !canAccept {
 					return m, nil
 				}
 				m.accepted = true
@@ -546,7 +545,7 @@ func (m Model) reviewView() string {
 	}
 	usedContext := ""
 	if m.contextExpanded {
-		usedContext = section("Context used", strings.Join(contextLines(m.context, m.inventory, m.candidate.Requirements, m.edited, m.command), "\n"))
+		usedContext = section("Context used", strings.Join(contextLines(m.context, m.inventory, m.candidate.Requirements, m.edited, m.applicability.Tools), "\n"))
 	}
 	intent := mutedStyle.Render("intent: " + textsafe.Visible(m.intent))
 
@@ -653,7 +652,7 @@ func section(title, body string) string {
 	return headerStyle.Render(title) + "\n" + body
 }
 
-func contextLines(c machinecontext.Context, inventory applicability.Inventory, requirements []capability.Requirement, edited bool, command string) []string {
+func contextLines(c machinecontext.Context, inventory applicability.Inventory, requirements []capability.Requirement, edited bool, editedTools []string) []string {
 	gitRepo := "no"
 	if c.GitRepository {
 		gitRepo = "yes"
@@ -676,7 +675,7 @@ func contextLines(c machinecontext.Context, inventory applicability.Inventory, r
 	for _, line := range lines {
 		seen[line] = true
 	}
-	for _, line := range relevantCapabilityLines(inventory, requirements, edited, command) {
+	for _, line := range relevantCapabilityLines(inventory, requirements, edited, editedTools) {
 		if !seen[line] {
 			lines = append(lines, line)
 			seen[line] = true
@@ -687,12 +686,16 @@ func contextLines(c machinecontext.Context, inventory applicability.Inventory, r
 
 // relevantCapabilityLines exposes only facts used by the current applicability
 // decision. It never includes inventory paths, probe output, or unrelated tools.
-func relevantCapabilityLines(inventory applicability.Inventory, requirements []capability.Requirement, edited bool, command string) []string {
+func relevantCapabilityLines(inventory applicability.Inventory, requirements []capability.Requirement, edited bool, editedTools []string) []string {
 	if inventory == nil {
 		return nil
 	}
 	if edited {
-		return editedCapabilityLines(inventory, command)
+		lines := make([]string, 0, len(editedTools))
+		for _, name := range editedTools {
+			lines = append(lines, toolCapabilityLine(inventory, name))
+		}
+		return lines
 	}
 
 	seen := make(map[string]bool)
@@ -718,26 +721,6 @@ func relevantCapabilityLines(inventory applicability.Inventory, requirements []c
 			}
 			seen["os"] = true
 			lines = append(lines, "os: "+textsafe.Visible(inventory.OSFamily()))
-		}
-	}
-	return lines
-}
-
-func editedCapabilityLines(inventory applicability.Inventory, command string) []string {
-	parsed := shellsyntax.Parse(command)
-	if !parsed.Supported() {
-		return nil
-	}
-	seen := make(map[string]bool)
-	var lines []string
-	for _, pipeline := range parsed.List.Pipelines {
-		for _, simple := range pipeline.Commands {
-			resolved := shellsyntax.ResolveExecutable(simple)
-			if !resolved.Found || resolved.Base == "" || seen[resolved.Base] {
-				continue
-			}
-			seen[resolved.Base] = true
-			lines = append(lines, toolCapabilityLine(inventory, resolved.Base))
 		}
 	}
 	return lines
@@ -835,20 +818,27 @@ func decisionStyle(decision safety.Decision) lipgloss.Style {
 	}
 }
 
+// acceptVerb names the outcome of pressing enter on the review screen and
+// reports whether accepting is permitted. The enter gate and the action hint
+// both derive from it, so the two can never drift.
+func acceptVerb(decision safety.Decision, valid bool, appDecision applicability.Decision) (string, bool) {
+	switch {
+	case !valid:
+		return "invalid", false
+	case decision == safety.Block:
+		return "blocked", false
+	case appDecision == applicability.Rejected:
+		return "inapplicable", false
+	}
+	return "accept", true
+}
+
 // reviewActions builds the single action hint line. The leading "enter <verb>"
 // token names the accept outcome in words (accept/blocked/invalid) so the
 // consequence of pressing enter is legible without color, and the "?"/"c" hints
 // reflect whether each disclosure section is currently open.
 func reviewActions(decision safety.Decision, valid bool, appDecision applicability.Decision, whyExpanded, contextExpanded bool) string {
-	verb := "accept"
-	switch {
-	case !valid:
-		verb = "invalid"
-	case decision == safety.Block:
-		verb = "blocked"
-	case appDecision == applicability.Rejected:
-		verb = "inapplicable"
-	}
+	verb, _ := acceptVerb(decision, valid, appDecision)
 
 	why := "? why"
 	if whyExpanded {

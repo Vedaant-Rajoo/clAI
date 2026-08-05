@@ -21,6 +21,7 @@ import (
 	"github.com/Vedaant-Rajoo/clai/internal/provider/openrouter"
 	"github.com/Vedaant-Rajoo/clai/internal/provider/rules"
 	"github.com/Vedaant-Rajoo/clai/internal/safety"
+	"github.com/Vedaant-Rajoo/clai/internal/shellinit"
 	"github.com/Vedaant-Rajoo/clai/internal/validate"
 )
 
@@ -601,13 +602,13 @@ func TestFallbackPassesThroughSuccess(t *testing.T) {
 
 func TestValidShell(t *testing.T) {
 	for _, shell := range []string{"fish", "bash", "zsh"} {
-		if !validShell(shell) {
-			t.Errorf("validShell(%q) = false", shell)
+		if !shellinit.Supported(shell) {
+			t.Errorf("shellinit.Supported(%q) = false", shell)
 		}
 	}
 	for _, shell := range []string{"", "sh", "/bin/fish", "FISH"} {
-		if validShell(shell) {
-			t.Errorf("validShell(%q) = true", shell)
+		if shellinit.Supported(shell) {
+			t.Errorf("shellinit.Supported(%q) = true", shell)
 		}
 	}
 }

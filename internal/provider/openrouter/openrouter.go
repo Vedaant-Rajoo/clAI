@@ -5,8 +5,6 @@ package openrouter
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -104,33 +102,18 @@ func (p Provider) Compile(ctx context.Context, request provider.Request) ([]prov
 		return nil, err
 	}
 
-	// Precedence: the unexported test seam, then the loopback-gated development
-	// override, then the pinned production endpoint. Both overrides are still
-	// classified lexically below.
-	endpoint := p.endpoint
-	if endpoint == "" {
-		endpoint = p.DevEndpoint
-	}
-	if endpoint == "" {
-		endpoint = defaultEndpoint
-	}
-	class, err := machinecontext.ClassifyEndpoint(endpoint)
+	endpoint, class, selection, err := provider.ResolveCompileSetup(provider.CompileSetup{
+		Name:            "openrouter",
+		TestEndpoint:    p.endpoint,
+		DevEndpoint:     p.DevEndpoint,
+		DefaultEndpoint: defaultEndpoint,
+		Policy:          p.Policy,
+		SharedFields:    p.SharedFields,
+		APIKey:          p.APIKey,
+		KeyHint:         "run `clai auth login --provider openrouter` or set OPENROUTER_API_KEY",
+	}, request)
 	if err != nil {
-		return nil, fmt.Errorf("openrouter: %w", err)
-	}
-	policy := p.Policy
-	if policy == "" {
-		policy = machinecontext.DefaultPolicy(false, class)
-	}
-	if policy == machinecontext.PolicyLocalOnly && class == machinecontext.EndpointRemote {
-		return nil, errors.New("openrouter: local-only context policy prohibits a remote endpoint")
-	}
-	selection, err := machinecontext.Select(request.Context, request.Capabilities, policy, p.SharedFields)
-	if err != nil {
-		return nil, fmt.Errorf("openrouter: context policy: %w", err)
-	}
-	if p.APIKey == "" {
-		return nil, errors.New("openrouter: no API key (run `clai auth login --provider openrouter` or set OPENROUTER_API_KEY)")
+		return nil, err
 	}
 
 	model := p.Model
@@ -206,25 +189,7 @@ func buildRequestBody(model, intent string, selection machinecontext.Selection) 
 }
 
 func makeReceipt(model, endpoint string, class machinecontext.EndpointClass, proxyMode string, selection machinecontext.Selection, body []byte) RequestReceipt {
-	sum := sha256.Sum256(body)
-	receipt := RequestReceipt{
-		Version: "request-receipt/v1", Provider: "openrouter", Model: model,
-		EffectiveEndpoint: endpoint, EndpointClassification: class, ProxyMode: proxyMode,
-		ContextPolicy: selection.Policy, SelectorVersion: machinecontext.SelectorVersion,
-		RequestBody:     append([]byte(nil), body...),
-		RequestBodyHash: BodyHash{Algorithm: "sha256", Value: hex.EncodeToString(sum[:])},
-	}
-	for _, field := range selection.Capsule.Fields {
-		switch field.Sharing {
-		case machinecontext.SharingSelected:
-			receipt.SelectedFields = append(receipt.SelectedFields, field)
-		case machinecontext.SharingRedacted:
-			receipt.RedactedFields = append(receipt.RedactedFields, field)
-		case machinecontext.SharingOmitted:
-			receipt.OmittedFields = append(receipt.OmittedFields, field)
-		}
-	}
-	return receipt
+	return provider.NewReceipt("openrouter", model, endpoint, class, proxyMode, selection, body)
 }
 
 func noRedirectClient(base *http.Client) *http.Client {
@@ -288,25 +253,7 @@ func sanitizeRetryAfter(value string) string {
 }
 
 func classifyProxyMode(client *http.Client, request *http.Request) string {
-	transport := client.Transport
-	if transport == nil {
-		transport = http.DefaultTransport
-	}
-	httpTransport, ok := transport.(*http.Transport)
-	if !ok {
-		return "unknown"
-	}
-	if httpTransport.Proxy == nil {
-		return "direct"
-	}
-	proxyURL, err := httpTransport.Proxy(request)
-	if err != nil {
-		return "unknown"
-	}
-	if proxyURL == nil {
-		return "direct"
-	}
-	return "configured-proxy"
+	return provider.ProxyMode(client.Transport, request)
 }
 
 func responseContent(body []byte) (string, error) {

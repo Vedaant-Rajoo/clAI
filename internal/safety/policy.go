@@ -1,7 +1,6 @@
 package safety
 
 import (
-	"path"
 	"slices"
 	"strings"
 
@@ -125,7 +124,7 @@ func classifyExecutable(resolved shellsyntax.ExecutableResolution, commandIndex,
 func resolveEnvSplitDispatch(command shellsyntax.SimpleCommand) shellsyntax.ExecutableResolution {
 	words := command.Words
 	index := len(command.Assignments)
-	if index >= len(words) || safetyExecutableBase(words[index].Value) != "env" {
+	if index >= len(words) || shellsyntax.ExecutableBase(words[index].Value) != "env" {
 		return shellsyntax.ExecutableResolution{}
 	}
 
@@ -214,7 +213,7 @@ dispatch:
 		if words[index].Dynamic {
 			return shellsyntax.ExecutableResolution{}
 		}
-		switch safetyExecutableBase(words[index].Value) {
+		switch shellsyntax.ExecutableBase(words[index].Value) {
 		case "command":
 			var ok bool
 			index, ok = consumeCommandDispatchOptions(words, index+1)
@@ -274,7 +273,7 @@ func consumeEnvDispatchOptions(words []shellsyntax.Word, index int) (int, bool) 
 			index++
 			continue
 		}
-		if safetyAssignment(value) {
+		if shellsyntax.IsAssignment(value) {
 			index++
 			continue
 		}
@@ -330,33 +329,6 @@ func consumeEnvShortOptions(words []shellsyntax.Word, index int) (int, bool) {
 		}
 	}
 	return index + 1, true
-}
-
-func safetyExecutableBase(value string) string {
-	value = strings.TrimRight(value, "/")
-	if value == "" {
-		return ""
-	}
-	return path.Base(value)
-}
-
-func safetyAssignment(value string) bool {
-	equals := strings.IndexByte(value, '=')
-	if equals < 1 {
-		return false
-	}
-	for index, r := range value[:equals] {
-		if index == 0 {
-			if r != '_' && (r < 'A' || r > 'Z') && (r < 'a' || r > 'z') {
-				return false
-			}
-			continue
-		}
-		if r != '_' && (r < 'A' || r > 'Z') && (r < 'a' || r > 'z') && (r < '0' || r > '9') {
-			return false
-		}
-	}
-	return true
 }
 
 func classifyRedirects(redirects []shellsyntax.Redirect, add func(Decision, string)) {

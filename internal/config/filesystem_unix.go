@@ -1002,17 +1002,6 @@ func ensureConfigFileAbsent(dir *os.File) error {
 	return errors.Join(errors.New("config file appeared during operation"), closeConfigFile(file))
 }
 
-func removeConfigFileIfPresent(directory *configDirectory, locks []*configLock) error {
-	file, info, exists, err := openConfigFile(directory.app)
-	if err != nil || !exists {
-		return err
-	}
-	if err := closeConfigFile(file); err != nil {
-		return err
-	}
-	return removeConfigFile(directory, info, locks)
-}
-
 func removeConfigFile(directory *configDirectory, expected os.FileInfo, locks []*configLock) (retErr error) {
 	if err := verifyLockedConfigState([]*configDirectory{directory}, locks); err != nil {
 		return err

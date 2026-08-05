@@ -1280,6 +1280,7 @@ func TestReviewDisplaysRelevantCapabilityFacts(t *testing.T) {
 
 	model.edited = true
 	model.command = "command /usr/bin/rg TODO | missing"
+	model.applicability = applicability.EvaluateEdited(model.command, model.inventory)
 	edited := model.View()
 	for _, want := range []string{"tool rg: present 14.1.0", "tool missing: absent"} {
 		if !strings.Contains(edited, want) {
@@ -1288,7 +1289,7 @@ func TestReviewDisplaysRelevantCapabilityFacts(t *testing.T) {
 	}
 	// The command hero intentionally displays exact command bytes; capability
 	// facts themselves must use only resolved base names.
-	facts := relevantCapabilityLines(model.inventory, model.candidate.Requirements, true, model.command)
+	facts := relevantCapabilityLines(model.inventory, model.candidate.Requirements, true, model.applicability.Tools)
 	if strings.Contains(strings.Join(facts, "\n"), "/usr/bin/rg") {
 		t.Fatalf("edited capability facts exposed executable path: %v", facts)
 	}
@@ -1297,7 +1298,7 @@ func TestReviewDisplaysRelevantCapabilityFacts(t *testing.T) {
 	// replacement idiom parses and its executable positions are derived rather
 	// than skipped for parse uncertainty. Only genuine executable positions are
 	// derived: rg is an argument to xargs here, not a command of its own.
-	braced := relevantCapabilityLines(model.inventory, nil, true, "rg --files | xargs -I{} du -h {}")
+	braced := relevantCapabilityLines(model.inventory, nil, true, applicability.EvaluateEdited("rg --files | xargs -I{} du -h {}", model.inventory).Tools)
 	joined := strings.Join(braced, "\n")
 	for _, want := range []string{"tool rg: present 14.1.0", "tool xargs: absent"} {
 		if !strings.Contains(joined, want) {

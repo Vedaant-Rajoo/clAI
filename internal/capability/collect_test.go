@@ -367,6 +367,41 @@ func TestInventoryProcessInvocationLifetime(t *testing.T) {
 	}
 }
 
+func TestCancelledFirstInventoryCollectionRemainsRetryable(t *testing.T) {
+	var calls int
+	cached := newCached(func(ctx context.Context) Inventory {
+		calls++
+		fact := ToolFact{Name: "git", Present: true}
+		if ctx.Err() == nil {
+			fact.Version = "2.45.1"
+		}
+		return Inventory{
+			version: InventoryVersion,
+			tools:   []ToolFact{fact},
+		}
+	})
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	first := cached.Inventory(cancelled)
+	if fact, _ := first.LookupTool("git"); fact.Version.Known() {
+		t.Fatalf("cancelled first inventory unexpectedly had a version: %#v", fact)
+	}
+
+	second := cached.Inventory(context.Background())
+	if fact, _ := second.LookupTool("git"); fact.Version != "2.45.1" {
+		t.Fatalf("retry inventory fact = %#v, want collected version", fact)
+	}
+	if calls != 2 {
+		t.Fatalf("collector calls after cancelled-first retry = %d, want 2", calls)
+	}
+
+	_ = cached.Inventory(context.Background())
+	if calls != 2 {
+		t.Fatalf("collector calls after committed retry = %d, want cached result", calls)
+	}
+}
+
 func TestDirectRunnerRejectsOverflow(t *testing.T) {
 	t.Parallel()
 

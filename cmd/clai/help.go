@@ -24,6 +24,8 @@ Usage:
   clai auth status [--provider <name>] [--api-key <value>]
   clai auth logout [--provider <name>]
 
+Use -h or --help anywhere, or help as the trailing argument, to show this page.
+
 Options must follow the subcommand and use the documented space-separated form.
 
 Subcommands:
@@ -35,19 +37,13 @@ Flags:
   --provider name    provider: openrouter (default) | anthropic | openai
   --api-key key      API key override (status only)
 
-Storage:
-  On macOS and Linux, file-backed credentials use
-  $XDG_CONFIG_HOME/clai/credentials.json when XDG_CONFIG_HOME is absolute,
-  otherwise $HOME/.config/clai/credentials.json. A relative value is invalid.
-  Windows keeps its platform user configuration directory; OS keychain entries do not move;
-  old-only macOS Application Support state migrates one way on Darwin. Preferred
-  files win and mixed-version use after migration is unsupported.
-
 Examples:
   clai auth login --provider openrouter
   clai auth status --provider openrouter
   clai auth status --provider openrouter --api-key <value>
   clai auth logout --provider openrouter
+
+Run "clai help storage" for credential locations and migration details.
 `,
 	},
 	{
@@ -74,6 +70,26 @@ Examples:
 
 Usage:
   clai version
+`,
+	},
+	{
+		name:    "storage",
+		summary: "Explain configuration and credential storage",
+		hidden:  true,
+		long: `Configuration and credential storage.
+
+On macOS and Linux, a non-empty $XDG_CONFIG_HOME selects:
+  $XDG_CONFIG_HOME/clai/config.json
+  $XDG_CONFIG_HOME/clai/credentials.json
+
+XDG_CONFIG_HOME must be absolute. A relative XDG_CONFIG_HOME is invalid.
+When it is unset or empty, clai uses:
+  $HOME/.config/clai/config.json
+  $HOME/.config/clai/credentials.json
+
+Windows keeps its platform user configuration directory. OS keychain entries
+do not move. On Darwin, old-only macOS Application Support state migrates one way;
+preferred files win. Mixed-version downgrade after migration is unsupported.
 `,
 	},
 	{
@@ -161,12 +177,8 @@ Environment:
   CLAI_DELIVERY      default delivery: clipboard | stdout | insert
 
 Flags override environment variables; both override config.json.
-On macOS and Linux, a non-empty $XDG_CONFIG_HOME selects
-$XDG_CONFIG_HOME/clai/config.json and XDG_CONFIG_HOME must be absolute.
-Otherwise clai uses $HOME/.config/clai/config.json. A relative XDG_CONFIG_HOME is invalid.
-Windows keeps its platform user configuration directory.
-On Darwin, old-only macOS Application Support state migrates one way; preferred
-files win. Mixed-version downgrade after migration is unsupported.
+
+Run "clai help storage" for configuration paths and migration details.
 
 Use "clai help <command>" or "clai <command> help" for more information.
 `)

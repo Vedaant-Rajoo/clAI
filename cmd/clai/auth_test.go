@@ -83,7 +83,7 @@ func TestAuthHelpParserOptionsStaySynchronized(t *testing.T) {
 	for _, option := range flagToken.FindAllString(commandLong("auth"), -1) {
 		documented[option] = true
 	}
-	want := map[string]bool{"--provider": true, "--api-key": true}
+	want := map[string]bool{"--provider": true, "--api-key": true, "--help": true}
 	if len(documented) != len(want) {
 		t.Fatalf("documented auth options = %#v, want %#v", documented, want)
 	}
@@ -91,6 +91,75 @@ func TestAuthHelpParserOptionsStaySynchronized(t *testing.T) {
 		if !documented[option] {
 			t.Fatalf("auth help missing parser option %s", option)
 		}
+	}
+}
+
+func TestReadLineUsesHiddenInputForTTY(t *testing.T) {
+	input, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+
+	originalIsTerminal, originalReadSecret := stdinIsTerminal, readTerminalSecret
+	stdinIsTerminal = func(fd int) bool {
+		if fd != int(input.Fd()) {
+			t.Fatalf("terminal check fd = %d, want %d", fd, input.Fd())
+		}
+		return true
+	}
+	readTerminalSecret = func(fd int) ([]byte, error) {
+		if fd != int(input.Fd()) {
+			t.Fatalf("ReadPassword fd = %d, want %d", fd, input.Fd())
+		}
+		return []byte("  tty-secret  \r\n"), nil
+	}
+	t.Cleanup(func() {
+		stdinIsTerminal = originalIsTerminal
+		readTerminalSecret = originalReadSecret
+	})
+
+	var output bytes.Buffer
+	got, err := readLine(input, &output)
+	if err != nil {
+		t.Fatalf("readLine: %v", err)
+	}
+	if got != "tty-secret" {
+		t.Fatalf("key = %q, want trimmed hidden key", got)
+	}
+	if output.String() != "\n" {
+		t.Fatalf("output = %q, want only the replacement newline", output.String())
+	}
+	if strings.Contains(output.String(), got) {
+		t.Fatal("hidden key was written to output")
+	}
+}
+
+func TestReadLinePreservesNonTTYInput(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stdin")
+	if err := os.WriteFile(path, []byte("  piped-secret  \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	input, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+
+	originalIsTerminal := stdinIsTerminal
+	stdinIsTerminal = func(int) bool { return false }
+	t.Cleanup(func() { stdinIsTerminal = originalIsTerminal })
+
+	var output bytes.Buffer
+	got, err := readLine(input, &output)
+	if err != nil {
+		t.Fatalf("readLine: %v", err)
+	}
+	if got != "piped-secret" {
+		t.Fatalf("key = %q, want trimmed piped key", got)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("non-TTY output = %q, want empty", output.String())
 	}
 }
 
@@ -794,6 +863,23 @@ func TestAuthStatusExplicitKeyUsesStdoutWithoutDisclosure(t *testing.T) {
 	}
 	if strings.Contains(out.String(), secret) || strings.Contains(errOut.String(), secret) {
 		t.Fatal("status output disclosed API key")
+	}
+}
+
+func TestAuthStatusNotAuthenticatedIncludesLoginHint(t *testing.T) {
+	c, out, errOut := captureCLI()
+	c.authSourceWithError = func(providerName, explicit string) (string, error) {
+		if providerName != "anthropic" || explicit != "" {
+			t.Fatalf("source arguments = %q, %q", providerName, explicit)
+		}
+		return "none", nil
+	}
+	if got := c.run([]string{"auth", "status", "--provider", "anthropic"}); got != exitError {
+		t.Fatalf("exit = %d, want %d", got, exitError)
+	}
+	want := "anthropic: not authenticated; run `clai auth login --provider anthropic`\n"
+	if out.String() != want || errOut.Len() != 0 {
+		t.Fatalf("stdout=%q stderr=%q, want stdout %q", out.String(), errOut.String(), want)
 	}
 }
 

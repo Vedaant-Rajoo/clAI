@@ -55,6 +55,13 @@ func TestOutputStreamRouting(t *testing.T) {
 			wantStderr: "",
 		},
 		{
+			name:       "auth flag help to stdout",
+			args:       []string{"auth", "login", "--help"},
+			wantCode:   exitOK,
+			wantStdout: "clai auth login",
+			wantStderr: "",
+		},
+		{
 			name:       "init script to stdout",
 			args:       []string{"init", "fish"},
 			wantCode:   exitOK,
@@ -66,7 +73,7 @@ func TestOutputStreamRouting(t *testing.T) {
 			args:       []string{"bogus"},
 			wantCode:   exitUsage,
 			wantStdout: "",
-			wantStderr: "unknown command",
+			wantStderr: "type your intent inside the interactive screen",
 		},
 		{
 			name:       "unknown flag to stderr",

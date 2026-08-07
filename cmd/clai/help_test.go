@@ -26,8 +26,12 @@ func TestHelpRouting(t *testing.T) {
 		{"top --help", []string{"--help"}, exitOK},
 		{"help auth", []string{"help", "auth"}, exitOK},
 		{"auth help", []string{"auth", "help"}, exitOK},
-		{"auth -h rejected before verb", []string{"auth", "-h"}, exitUsage},
-		{"auth --help rejected before verb", []string{"auth", "--help"}, exitUsage},
+		{"auth -h before verb", []string{"auth", "-h"}, exitOK},
+		{"auth --help before verb", []string{"auth", "--help"}, exitOK},
+		{"auth login -h", []string{"auth", "login", "-h"}, exitOK},
+		{"auth login --help", []string{"auth", "login", "--help"}, exitOK},
+		{"auth flag then --help", []string{"auth", "status", "--provider", "anthropic", "--help"}, exitOK},
+		{"auth trailing help", []string{"auth", "status", "--provider", "anthropic", "help"}, exitOK},
 		{"help init", []string{"help", "init"}, exitOK},
 		{"init help", []string{"init", "help"}, exitOK},
 		{"init -h", []string{"init", "-h"}, exitOK},
@@ -35,6 +39,7 @@ func TestHelpRouting(t *testing.T) {
 		{"version help", []string{"version", "help"}, exitOK},
 		{"help version", []string{"help", "version"}, exitOK},
 		{"help widget", []string{"help", "widget"}, exitOK},
+		{"help storage", []string{"help", "storage"}, exitOK},
 		{"widget help", []string{"widget", "help"}, exitOK},
 		{"widget -h", []string{"widget", "-h"}, exitOK},
 		{"help unknown", []string{"help", "bogus"}, exitUsage},
@@ -72,6 +77,7 @@ func TestMainHelpContent(t *testing.T) {
 		"--copy", "--print-command", "--provider", "--model",
 		"--api-key", "--fallback-rules", "--context-policy", "--share-context", "--version",
 		"rules", "openrouter", "anthropic",
+		"clai help storage",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("main help missing %q", want)
@@ -96,6 +102,8 @@ func TestAuthHelpContent(t *testing.T) {
 		"clai auth status [--provider <name>] [--api-key <value>]",
 		"clai auth logout [--provider <name>]",
 		"space-separated",
+		"--help",
+		"clai help storage",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("auth help missing %q", want)
@@ -104,7 +112,7 @@ func TestAuthHelpContent(t *testing.T) {
 }
 
 func TestLookupCommand(t *testing.T) {
-	for _, name := range []string{"auth", "init", "version", "widget"} {
+	for _, name := range []string{"auth", "init", "version", "storage", "widget"} {
 		if _, ok := lookupCommand(name); !ok {
 			t.Errorf("lookupCommand(%q) not found", name)
 		}
@@ -114,14 +122,24 @@ func TestLookupCommand(t *testing.T) {
 	}
 }
 
-func TestMainHelpConfigRoot(t *testing.T) {
+func TestStorageHelpConfigRoot(t *testing.T) {
 	var buf bytes.Buffer
 	printMainHelp(&buf)
-	help := buf.String()
+	mainHelp := buf.String()
+	if !strings.Contains(mainHelp, "clai help storage") {
+		t.Fatal("main help does not route detailed storage guidance")
+	}
+	if strings.Contains(mainHelp, "$XDG_CONFIG_HOME/clai/config.json") {
+		t.Fatal("main help still front-loads detailed storage paths")
+	}
+
+	help := commandLong("storage")
 
 	for _, want := range []string{
 		"$XDG_CONFIG_HOME/clai/config.json",
+		"$XDG_CONFIG_HOME/clai/credentials.json",
 		"$HOME/.config/clai/config.json",
+		"$HOME/.config/clai/credentials.json",
 		"XDG_CONFIG_HOME must be absolute",
 		"A relative XDG_CONFIG_HOME is invalid",
 		"Windows keeps its platform user configuration directory",
@@ -137,18 +155,13 @@ func TestMainHelpConfigRoot(t *testing.T) {
 	}
 }
 
-func TestAuthHelpConfigRoot(t *testing.T) {
+func TestAuthHelpRoutesStorageDetails(t *testing.T) {
 	authHelp := commandLong("auth")
-	for _, want := range []string{
-		"$XDG_CONFIG_HOME/clai/credentials.json",
-		"$HOME/.config/clai/credentials.json",
-		"OS keychain entries do not move",
-		"Windows keeps its platform user configuration directory",
-		"old-only macOS Application Support state migrates one way",
-	} {
-		if !strings.Contains(authHelp, want) {
-			t.Errorf("auth help missing config-root contract %q", want)
-		}
+	if !strings.Contains(authHelp, "clai help storage") {
+		t.Fatal("auth help does not route detailed storage guidance")
+	}
+	if strings.Contains(authHelp, "$XDG_CONFIG_HOME/clai/credentials.json") {
+		t.Fatal("auth help still front-loads detailed storage paths")
 	}
 
 	docsPath := filepath.Join("..", "..", "docs", "providers.md")

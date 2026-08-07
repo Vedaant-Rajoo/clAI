@@ -23,6 +23,12 @@ import (
 	"unicode/utf8"
 
 	"github.com/Vedaant-Rajoo/clai/internal/auth"
+	"golang.org/x/term"
+)
+
+var (
+	stdinIsTerminal    = term.IsTerminal
+	readTerminalSecret = term.ReadPassword
 )
 
 const (
@@ -229,7 +235,7 @@ func (c cli) runAuth(command authCommand) int {
 func (c cli) authLogin(provider string) int {
 	readKey := c.authReadLine
 	if readKey == nil {
-		readKey = readLine
+		readKey = func() (string, error) { return readLine(os.Stdin, c.stdout) }
 	}
 	switch provider {
 	case "openrouter":
@@ -299,7 +305,7 @@ func (c cli) authStatus(provider, explicit string) int {
 		return exitError
 	}
 	if source == "none" {
-		fmt.Fprintf(c.stdout, "%s: not authenticated\n", provider)
+		fmt.Fprintf(c.stdout, "%s: not authenticated; run `clai auth login --provider %s`\n", provider, provider)
 		return exitError
 	}
 	fmt.Fprintf(c.stdout, "%s: authenticated (%s)\n", provider, source)
@@ -319,8 +325,19 @@ func (c cli) authLogout(provider string) int {
 	return exitOK
 }
 
-func readLine() (string, error) {
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+func readLine(input *os.File, output io.Writer) (string, error) {
+	if stdinIsTerminal(int(input.Fd())) {
+		line, err := readTerminalSecret(int(input.Fd()))
+		// ReadPassword disables terminal echo, including the newline. Move the
+		// next status or error message onto a fresh line after input completes.
+		fmt.Fprintln(output)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(line)), nil
+	}
+
+	line, err := bufio.NewReader(input).ReadString('\n')
 	if err != nil && !(errors.Is(err, io.EOF) && line != "") {
 		if errors.Is(err, io.EOF) {
 			return "", errors.New("end of input")

@@ -31,10 +31,11 @@ import (
 )
 
 var (
-	version        = "dev"
-	executeTUI     = runTUI
-	loadConfig     = config.Load
-	clipboardWrite = clipboard.WriteAll
+	version           = "dev"
+	executeTUI        = runTUI
+	loadConfig        = config.Load
+	resolveCredential = auth.Resolve
+	clipboardWrite    = clipboard.WriteAll
 )
 
 const (
@@ -78,7 +79,7 @@ func (c cli) run(args []string) int {
 			return c.runWidget(args[1:])
 		default:
 			if !strings.HasPrefix(args[0], "-") {
-				fmt.Fprintf(c.stderr, "clai: unknown command %q\nRun 'clai help' for usage.\n", args[0])
+				fmt.Fprintf(c.stderr, "clai: unknown command %q\nTo compile a request, run 'clai' and type your intent inside the interactive screen.\nRun 'clai help' for usage.\n", args[0])
 				return exitUsage
 			}
 		}
@@ -89,7 +90,7 @@ func (c cli) run(args []string) int {
 
 // runAuthCommand routes the strict `clai auth <verb> [options]` grammar.
 func (c cli) runAuthCommand(args []string) int {
-	if len(args) == 1 && args[0] == "help" {
+	if authHelpRequested(args) {
 		return c.runHelp([]string{"auth"})
 	}
 	command, err := parseAuthArgs(args)
@@ -98,6 +99,18 @@ func (c cli) runAuthCommand(args []string) int {
 		return exitUsage
 	}
 	return c.runAuth(command)
+}
+
+// authHelpRequested honors flag-style help anywhere in the auth grammar and
+// the command-style spelling when it is the trailing argument. It runs before
+// strict auth parsing so requesting help never performs credential I/O.
+func authHelpRequested(args []string) bool {
+	for _, arg := range args {
+		if arg == "-h" || arg == "--help" {
+			return true
+		}
+	}
+	return len(args) > 0 && args[len(args)-1] == "help"
 }
 
 func (c cli) runVersion(args []string) int {
@@ -206,7 +219,7 @@ func (c cli) runInteractive(args []string) int {
 		return exitUsage
 	}
 
-	p, err := selectProvider(resolvedProvider, resolvedModel, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint)
+	p, err := selectProvider(resolvedProvider, resolvedModel, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint, c.stderr)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai: %v\n", err)
 		return exitError
@@ -290,7 +303,7 @@ func (c cli) runWidget(args []string) int {
 		}
 	}()
 
-	p, err := selectProvider(resolvedProvider, resolvedModel, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint)
+	p, err := selectProvider(resolvedProvider, resolvedModel, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint, c.stderr)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai widget: %v\n", err)
 		return exitError
@@ -638,14 +651,21 @@ func (f fallback) Compile(ctx context.Context, request provider.Request) ([]prov
 	return rules.Provider{}.Compile(ctx, request)
 }
 
-func selectProvider(name, model, apiKey string, fallbackRules bool, policy machinecontext.Policy, sharedFields []string, devEndpoint string) (provider.Provider, error) {
+func selectProvider(name, model, apiKey string, fallbackRules bool, policy machinecontext.Policy, sharedFields []string, devEndpoint string, notices io.Writer) (provider.Provider, error) {
 	switch name {
 	case "rules", "":
 		return rules.Provider{}, nil
 	case "openrouter":
-		key, err := auth.Resolve("openrouter", apiKey)
+		key, err := resolveCredential("openrouter", apiKey)
 		if err != nil {
 			return nil, err
+		}
+		if key == "" {
+			if fallbackRules {
+				printMissingKeyFallbackNotice(notices, "openrouter")
+				return rules.Provider{}, nil
+			}
+			return nil, missingAPIKeyError("openrouter")
 		}
 		var p provider.Provider = openrouter.Provider{APIKey: key, Model: model, Policy: policy, SharedFields: sharedFields, DevEndpoint: devEndpoint}
 		if fallbackRules {
@@ -653,9 +673,16 @@ func selectProvider(name, model, apiKey string, fallbackRules bool, policy machi
 		}
 		return p, nil
 	case "anthropic":
-		key, err := auth.Resolve("anthropic", apiKey)
+		key, err := resolveCredential("anthropic", apiKey)
 		if err != nil {
 			return nil, err
+		}
+		if key == "" {
+			if fallbackRules {
+				printMissingKeyFallbackNotice(notices, "anthropic")
+				return rules.Provider{}, nil
+			}
+			return nil, missingAPIKeyError("anthropic")
 		}
 		var p provider.Provider = anthropic.Provider{APIKey: key, Model: model, Policy: policy, SharedFields: sharedFields, DevEndpoint: devEndpoint}
 		if fallbackRules {
@@ -667,4 +694,15 @@ func selectProvider(name, model, apiKey string, fallbackRules bool, policy machi
 	default:
 		return nil, fmt.Errorf("unknown provider %q (known: rules, openrouter, anthropic)", name)
 	}
+}
+
+// missingAPIKeyError mirrors the actionable error produced by each remote
+// provider's compile setup so selecting it fails with the same next steps
+// before the interactive screen opens.
+func missingAPIKeyError(name string) error {
+	return fmt.Errorf("%s: no API key (run `clai auth login --provider %s` or set %s)", name, name, auth.EnvVarFor(name))
+}
+
+func printMissingKeyFallbackNotice(w io.Writer, name string) {
+	fmt.Fprintf(w, "clai: no %s API key; using rules fallback; run `clai auth login --provider %s`\n", name, name)
 }

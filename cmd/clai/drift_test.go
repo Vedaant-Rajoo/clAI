@@ -41,7 +41,7 @@ func driftCases() []driftCase {
 			name:        "auth",
 			register:    func(*flag.FlagSet) {},
 			help:        func() string { return commandLong("auth") },
-			allowInHelp: map[string]bool{"--provider": true, "--api-key": true},
+			allowInHelp: map[string]bool{"--provider": true, "--api-key": true, "--help": true},
 		},
 	}
 }

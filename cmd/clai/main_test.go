@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -26,7 +28,7 @@ import (
 )
 
 func TestSelectProviderDefaultIsRules(t *testing.T) {
-	p, err := selectProvider("rules", "", "", false, machinecontext.PolicyLocalOnly, nil, "")
+	p, err := selectProvider("rules", "", "", false, machinecontext.PolicyLocalOnly, nil, "", io.Discard)
 	if err != nil {
 		t.Fatalf("selectProvider: %v", err)
 	}
@@ -37,7 +39,7 @@ func TestSelectProviderDefaultIsRules(t *testing.T) {
 
 func TestSelectProviderOpenRouterUsesEnvKey(t *testing.T) {
 	t.Setenv("OPENROUTER_API_KEY", "sk-or-test")
-	p, err := selectProvider("openrouter", "some/model", "", false, machinecontext.PolicyRemoteMinimal, nil, "")
+	p, err := selectProvider("openrouter", "some/model", "", false, machinecontext.PolicyRemoteMinimal, nil, "", io.Discard)
 	if err != nil {
 		t.Fatalf("selectProvider: %v", err)
 	}
@@ -55,7 +57,7 @@ func TestSelectProviderOpenRouterUsesEnvKey(t *testing.T) {
 
 func TestSelectProviderOpenRouterExplicitKeyWins(t *testing.T) {
 	t.Setenv("OPENROUTER_API_KEY", "env-key")
-	p, err := selectProvider("openrouter", "", "flag-key", false, machinecontext.PolicyRemoteMinimal, nil, "")
+	p, err := selectProvider("openrouter", "", "flag-key", false, machinecontext.PolicyRemoteMinimal, nil, "", io.Discard)
 	if err != nil {
 		t.Fatalf("selectProvider: %v", err)
 	}
@@ -66,7 +68,7 @@ func TestSelectProviderOpenRouterExplicitKeyWins(t *testing.T) {
 
 func TestSelectProviderFallbackWraps(t *testing.T) {
 	t.Setenv("OPENROUTER_API_KEY", "sk-or-test")
-	p, err := selectProvider("openrouter", "", "", true, machinecontext.PolicyRemoteMinimal, nil, "")
+	p, err := selectProvider("openrouter", "", "", true, machinecontext.PolicyRemoteMinimal, nil, "", io.Discard)
 	if err != nil {
 		t.Fatalf("selectProvider: %v", err)
 	}
@@ -76,20 +78,20 @@ func TestSelectProviderFallbackWraps(t *testing.T) {
 }
 
 func TestSelectProviderUnknown(t *testing.T) {
-	if _, err := selectProvider("bogus", "", "", false, machinecontext.PolicyLocalOnly, nil, ""); err == nil {
+	if _, err := selectProvider("bogus", "", "", false, machinecontext.PolicyLocalOnly, nil, "", io.Discard); err == nil {
 		t.Error("want error for unknown provider")
 	}
 }
 
 func TestSelectProviderUnimplemented(t *testing.T) {
-	if _, err := selectProvider("openai", "", "", false, machinecontext.PolicyRemoteMinimal, nil, ""); err == nil {
+	if _, err := selectProvider("openai", "", "", false, machinecontext.PolicyRemoteMinimal, nil, "", io.Discard); err == nil {
 		t.Error("want error for unimplemented provider")
 	}
 }
 
 func TestSelectProviderAnthropicUsesEnvKey(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-	p, err := selectProvider("anthropic", "claude-opus-4-8", "", false, machinecontext.PolicyRemoteMinimal, nil, "")
+	p, err := selectProvider("anthropic", "claude-opus-4-8", "", false, machinecontext.PolicyRemoteMinimal, nil, "", io.Discard)
 	if err != nil {
 		t.Fatalf("selectProvider: %v", err)
 	}
@@ -111,7 +113,7 @@ func TestSelectProviderAnthropicUsesEnvKey(t *testing.T) {
 func TestAnthropicModelDefaultAndOverride(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
 	t.Run("default left empty for provider default", func(t *testing.T) {
-		p, err := selectProvider("anthropic", "", "", false, machinecontext.PolicyRemoteMinimal, nil, "")
+		p, err := selectProvider("anthropic", "", "", false, machinecontext.PolicyRemoteMinimal, nil, "", io.Discard)
 		if err != nil {
 			t.Fatalf("selectProvider: %v", err)
 		}
@@ -120,7 +122,7 @@ func TestAnthropicModelDefaultAndOverride(t *testing.T) {
 		}
 	})
 	t.Run("CLI override forwarded verbatim", func(t *testing.T) {
-		p, err := selectProvider("anthropic", "claude-opus-4-8", "", false, machinecontext.PolicyRemoteMinimal, nil, "")
+		p, err := selectProvider("anthropic", "claude-opus-4-8", "", false, machinecontext.PolicyRemoteMinimal, nil, "", io.Discard)
 		if err != nil {
 			t.Fatalf("selectProvider: %v", err)
 		}
@@ -132,7 +134,7 @@ func TestAnthropicModelDefaultAndOverride(t *testing.T) {
 
 func TestSelectProviderAnthropicExplicitKeyWins(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "env-key")
-	p, err := selectProvider("anthropic", "", "flag-key", false, machinecontext.PolicyRemoteMinimal, nil, "")
+	p, err := selectProvider("anthropic", "", "flag-key", false, machinecontext.PolicyRemoteMinimal, nil, "", io.Discard)
 	if err != nil {
 		t.Fatalf("selectProvider: %v", err)
 	}
@@ -143,7 +145,7 @@ func TestSelectProviderAnthropicExplicitKeyWins(t *testing.T) {
 
 func TestSelectProviderAnthropicFallbackWraps(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-	p, err := selectProvider("anthropic", "", "", true, machinecontext.PolicyRemoteMinimal, nil, "")
+	p, err := selectProvider("anthropic", "", "", true, machinecontext.PolicyRemoteMinimal, nil, "", io.Discard)
 	if err != nil {
 		t.Fatalf("selectProvider: %v", err)
 	}
@@ -155,13 +157,125 @@ func TestSelectProviderAnthropicFallbackWraps(t *testing.T) {
 func TestSelectProviderAnthropicSharedFieldsForwarded(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
 	shared := []string{machinecontext.FieldWorkingDirectory}
-	p, err := selectProvider("anthropic", "", "", false, machinecontext.PolicyRemoteExplicit, shared, "")
+	p, err := selectProvider("anthropic", "", "", false, machinecontext.PolicyRemoteExplicit, shared, "", io.Discard)
 	if err != nil {
 		t.Fatalf("selectProvider: %v", err)
 	}
 	ap := p.(anthropic.Provider)
 	if len(ap.SharedFields) != 1 || ap.SharedFields[0] != machinecontext.FieldWorkingDirectory {
 		t.Errorf("SharedFields = %v, want [working_directory]", ap.SharedFields)
+	}
+}
+
+func TestSelectProviderMissingKeyFailsFast(t *testing.T) {
+	original := resolveCredential
+	resolveCredential = func(string, string) (string, error) { return "", nil }
+	t.Cleanup(func() { resolveCredential = original })
+
+	for _, name := range []string{"openrouter", "anthropic"} {
+		t.Run(name, func(t *testing.T) {
+			var notices bytes.Buffer
+			p, err := selectProvider(name, "", "", false, machinecontext.PolicyRemoteMinimal, nil, "", &notices)
+			if err == nil {
+				t.Fatal("selectProvider returned no missing-key error")
+			}
+			if p != nil {
+				t.Fatalf("provider = %T, want nil", p)
+			}
+			for _, want := range []string{name + ": no API key", "clai auth login --provider " + name, authEnvForTest(name)} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %q, want %q", err, want)
+				}
+			}
+			if notices.Len() != 0 {
+				t.Fatalf("notice = %q, want empty", notices.String())
+			}
+		})
+	}
+}
+
+func TestSelectProviderMissingKeyUsesRulesFallback(t *testing.T) {
+	original := resolveCredential
+	resolveCredential = func(string, string) (string, error) { return "", nil }
+	t.Cleanup(func() { resolveCredential = original })
+
+	for _, name := range []string{"openrouter", "anthropic"} {
+		t.Run(name, func(t *testing.T) {
+			var notices bytes.Buffer
+			p, err := selectProvider(name, "", "", true, machinecontext.PolicyRemoteMinimal, nil, "", &notices)
+			if err != nil {
+				t.Fatalf("selectProvider: %v", err)
+			}
+			if _, ok := p.(rules.Provider); !ok {
+				t.Fatalf("provider = %T, want rules.Provider", p)
+			}
+			want := fmt.Sprintf("clai: no %s API key; using rules fallback; run `clai auth login --provider %s`\n", name, name)
+			if notices.String() != want {
+				t.Fatalf("notice = %q, want %q", notices.String(), want)
+			}
+		})
+	}
+}
+
+func authEnvForTest(name string) string {
+	if name == "anthropic" {
+		return "ANTHROPIC_API_KEY"
+	}
+	return "OPENROUTER_API_KEY"
+}
+
+func TestInteractiveMissingKeyStopsBeforeTUI(t *testing.T) {
+	swapLoadConfig(t, config.Config{}, nil)
+	originalResolve := resolveCredential
+	resolveCredential = func(string, string) (string, error) { return "", nil }
+	t.Cleanup(func() { resolveCredential = originalResolve })
+
+	called := false
+	originalTUI := executeTUI
+	executeTUI = func(provider.Provider, *capability.Cached, string, string) (app.Outcome, error) {
+		called = true
+		return app.Outcome{}, nil
+	}
+	t.Cleanup(func() { executeTUI = originalTUI })
+
+	c, out, errOut := captureCLI()
+	if code := c.run([]string{"--provider", "anthropic"}); code != exitError {
+		t.Fatalf("exit = %d, want %d", code, exitError)
+	}
+	if called {
+		t.Fatal("TUI opened before the missing-key failure")
+	}
+	if out.Len() != 0 || !strings.Contains(errOut.String(), "clai auth login --provider anthropic") {
+		t.Fatalf("stdout=%q stderr=%q", out.String(), errOut.String())
+	}
+}
+
+func TestInteractiveMissingKeyFallbackNoticesBeforeTUI(t *testing.T) {
+	swapLoadConfig(t, config.Config{}, nil)
+	originalResolve := resolveCredential
+	resolveCredential = func(string, string) (string, error) { return "", nil }
+	t.Cleanup(func() { resolveCredential = originalResolve })
+
+	called := false
+	originalTUI := executeTUI
+	executeTUI = func(p provider.Provider, _ *capability.Cached, _, _ string) (app.Outcome, error) {
+		called = true
+		if _, ok := p.(rules.Provider); !ok {
+			t.Fatalf("provider = %T, want rules.Provider", p)
+		}
+		return app.Outcome{}, nil
+	}
+	t.Cleanup(func() { executeTUI = originalTUI })
+
+	c, out, errOut := captureCLI()
+	if code := c.run([]string{"--provider", "openrouter", "--fallback-rules"}); code != exitOK {
+		t.Fatalf("exit = %d, want %d", code, exitOK)
+	}
+	if !called {
+		t.Fatal("rules fallback did not reach the TUI")
+	}
+	if out.Len() != 0 || errOut.String() != "clai: no openrouter API key; using rules fallback; run `clai auth login --provider openrouter`\n" {
+		t.Fatalf("stdout=%q stderr=%q", out.String(), errOut.String())
 	}
 }
 
@@ -644,6 +758,70 @@ func TestWidgetRejectsUnsafeResultBeforeTUI(t *testing.T) {
 	}
 	if called {
 		t.Fatal("TUI ran for an invalid result target")
+	}
+}
+
+func TestWidgetMissingKeyBehavior(t *testing.T) {
+	originalResolve := resolveCredential
+	resolveCredential = func(string, string) (string, error) { return "", nil }
+	t.Cleanup(func() { resolveCredential = originalResolve })
+
+	for _, tc := range []struct {
+		name         string
+		fallback     bool
+		wantCode     int
+		wantTUICalls int
+		wantStderr   string
+	}{
+		{
+			name:         "hard failure before TUI",
+			wantCode:     exitError,
+			wantTUICalls: 0,
+			wantStderr:   "clai widget: anthropic: no API key (run `clai auth login --provider anthropic` or set ANTHROPIC_API_KEY)\n",
+		},
+		{
+			name:         "rules fallback notice",
+			fallback:     true,
+			wantCode:     exitCancelled,
+			wantTUICalls: 1,
+			wantStderr:   "clai: no anthropic API key; using rules fallback; run `clai auth login --provider anthropic`\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			swapLoadConfig(t, config.Config{}, nil)
+			path := filepath.Join(t.TempDir(), "result")
+			if err := os.WriteFile(path, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			calls := 0
+			originalTUI := executeTUI
+			executeTUI = func(p provider.Provider, _ *capability.Cached, _, _ string) (app.Outcome, error) {
+				calls++
+				if tc.fallback {
+					if _, ok := p.(rules.Provider); !ok {
+						t.Fatalf("provider = %T, want rules.Provider", p)
+					}
+				}
+				return app.Outcome{}, nil
+			}
+			t.Cleanup(func() { executeTUI = originalTUI })
+
+			args := []string{"widget", "--shell", "fish", "--result-file", path, "--provider", "anthropic"}
+			if tc.fallback {
+				args = append(args, "--fallback-rules")
+			}
+			c, out, errOut := captureCLI()
+			if code := c.run(args); code != tc.wantCode {
+				t.Fatalf("exit = %d, want %d", code, tc.wantCode)
+			}
+			if calls != tc.wantTUICalls {
+				t.Fatalf("TUI calls = %d, want %d", calls, tc.wantTUICalls)
+			}
+			if out.Len() != 0 || errOut.String() != tc.wantStderr {
+				t.Fatalf("stdout=%q stderr=%q, want stderr %q", out.String(), errOut.String(), tc.wantStderr)
+			}
+		})
 	}
 }
 

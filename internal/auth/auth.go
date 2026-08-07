@@ -86,18 +86,28 @@ type credentialFileLocations struct {
 // preventing an untrusted keyring implementation from reflecting credential
 // material through its error string.
 type backendError struct {
-	operation string
-	cause     error
+	message string
+	cause   error
 }
 
-func (e backendError) Error() string { return e.operation }
+func (e backendError) Error() string { return e.message }
 func (e backendError) Unwrap() error { return e.cause }
 
-func secretFreeBackendError(operation string, err error) error {
+func secretFreeBackendError(operation, provider string, err error) error {
 	if err == nil {
 		return nil
 	}
-	return backendError{operation: operation, cause: err}
+	hint := fmt.Sprintf("run `clai auth login --provider %s` to use the private file fallback", provider)
+	if env := EnvVarFor(provider); env != "" {
+		hint = fmt.Sprintf("set %s or %s", env, hint)
+	}
+	if roots, rootErr := resolveConfigRoots(); rootErr == nil {
+		hint += fmt.Sprintf(" at %q", roots.PreferredPath(fileName))
+	}
+	return backendError{
+		message: fmt.Sprintf("%s: keyring unavailable; %s, then retry after fixing keyring access", operation, hint),
+		cause:   err,
+	}
 }
 
 // EnvVarFor returns the conventional environment variable for a provider.
@@ -141,7 +151,7 @@ func Resolve(provider, explicit string) (string, error) {
 			return "", fileErr
 		}
 		return "", errors.Join(
-			secretFreeBackendError("read credential from keyring", keyringErr),
+			secretFreeBackendError("read credential from keyring", provider, keyringErr),
 			fmt.Errorf("read credential from config file: %w", fileErr),
 		)
 	}
@@ -149,25 +159,42 @@ func Resolve(provider, explicit string) (string, error) {
 		return key, nil
 	}
 	if !errors.Is(keyringErr, keyring.ErrNotFound) {
-		return "", secretFreeBackendError("read credential from keyring", keyringErr)
+		return "", secretFreeBackendError("read credential from keyring", provider, keyringErr)
 	}
 	return "", nil
 }
 
-// Store persists an API key, preferring the OS keyring and falling back to a
-// private config file when the keyring is unavailable. After a successful
-// keyring store, stale file copies are removed on a best-effort basis; a file
-// cleanup failure does not turn the successful credential store into a
-// failure.
-func Store(provider, key string) error {
+// StoreResult carries non-fatal follow-up work from a successful StoreDetailed
+// call. Warning never changes whether the credential was stored successfully.
+type StoreResult struct {
+	Warning error
+}
+
+// StoreDetailed persists an API key, preferring the OS keyring and falling
+// back to a private config file when the keyring is unavailable. It reports
+// non-fatal cleanup trouble separately: a successful keyring write remains
+// authoritative even when removal of an older file-backed copy fails.
+func StoreDetailed(provider, key string) (StoreResult, error) {
 	if err := credentialKeyring.Set(serviceName, provider, key); err == nil {
-		_ = deleteFileEntry(provider)
-		return nil
+		if cleanupErr := deleteFileEntry(provider); cleanupErr != nil {
+			return StoreResult{Warning: fmt.Errorf("credential stored in keyring, but stale file cleanup failed: %w; remove the stale entry from the private credential file and retry login", cleanupErr)}, nil
+		}
+		return StoreResult{}, nil
+	} else if fileErr := writeFile(provider, key); fileErr != nil {
+		return StoreResult{}, errors.Join(
+			secretFreeBackendError("store credential in keyring", provider, err),
+			fmt.Errorf("store credential in config file: %w", fileErr),
+		)
 	}
-	if err := writeFile(provider, key); err != nil {
-		return fmt.Errorf("store credential in config file: %w", err)
-	}
-	return nil
+	return StoreResult{}, nil
+}
+
+// Store is the compatibility wrapper for callers that only distinguish
+// success from failure. Use StoreDetailed when a non-fatal warning can be
+// shown to the user.
+func Store(provider, key string) error {
+	_, err := StoreDetailed(provider, key)
+	return err
 }
 
 // Delete removes the stored key from both keyring and reconciled file storage.
@@ -178,7 +205,7 @@ func Delete(provider string) error {
 	if errors.Is(keyringErr, keyring.ErrNotFound) {
 		keyringErr = nil
 	} else if keyringErr != nil {
-		keyringErr = secretFreeBackendError("delete credential from keyring", keyringErr)
+		keyringErr = secretFreeBackendError("delete credential from keyring", provider, keyringErr)
 	}
 	fileErr := deleteFileEntry(provider)
 	if fileErr != nil {
@@ -223,7 +250,7 @@ func SourceWithError(provider, explicit string) (string, error) {
 			return "", fileErr
 		}
 		return "", errors.Join(
-			secretFreeBackendError("inspect credential keyring", keyringErr),
+			secretFreeBackendError("inspect credential keyring", provider, keyringErr),
 			fmt.Errorf("inspect credential config file: %w", fileErr),
 		)
 	}
@@ -231,7 +258,7 @@ func SourceWithError(provider, explicit string) (string, error) {
 		return "config file", nil
 	}
 	if !errors.Is(keyringErr, keyring.ErrNotFound) {
-		return "", secretFreeBackendError("inspect credential keyring", keyringErr)
+		return "", secretFreeBackendError("inspect credential keyring", provider, keyringErr)
 	}
 	return "none", nil
 }

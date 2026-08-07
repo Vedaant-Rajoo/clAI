@@ -4,7 +4,6 @@ package auth
 
 import (
 	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +21,8 @@ const (
 	credentialLockTimeout = 2 * time.Second
 	credentialLockPoll    = 10 * time.Millisecond
 )
+
+var errCredentialReadLockUnavailable = errors.New("credential lock unavailable on read-only storage")
 
 type credentialDirectory struct {
 	basePath string
@@ -111,7 +112,7 @@ func credentialStorageStateExists(locations credentialFileLocations) (bool, erro
 			return false, errors.Join(listErr, closeErr)
 		}
 		for _, name := range names {
-			if name == fileName || isCredentialTransientName(name) {
+			if name == fileName || isCredentialTransientCandidate(name) {
 				return true, nil
 			}
 		}
@@ -133,22 +134,13 @@ func readCredentialDirectoryNames(dir *os.File) ([]string, error) {
 	return names, nil
 }
 
-func isCredentialTransientName(name string) bool {
-	if !strings.HasPrefix(name, ".credentials-") || !strings.HasSuffix(name, ".tmp") {
-		return false
-	}
-	hexPart := strings.TrimSuffix(strings.TrimPrefix(name, ".credentials-"), ".tmp")
-	if len(hexPart) != 24 {
-		return false
-	}
-	_, err := hex.DecodeString(hexPart)
-	return err == nil
+func isCredentialTransientCandidate(name string) bool {
+	return strings.HasPrefix(name, ".credentials-") && strings.HasSuffix(name, ".tmp")
 }
 
 // removeStaleCredentialTemps retires interrupted secret-bearing temporary files
-// only after every participating root lock is held. Unsafe names fail closed;
-// verified regular files are erased before unlink so an unlink/fsync failure
-// cannot leave credential bytes behind.
+// only after every participating root lock is held. Cleanup is best-effort so
+// a foreign or mis-permissioned transient cannot wedge credential storage.
 func removeStaleCredentialTemps(directories []*credentialDirectory, locks []*credentialLock) error {
 	for _, directory := range directories {
 		if err := verifyLockedCredentialState([]*credentialDirectory{directory}, locks); err != nil {
@@ -160,60 +152,32 @@ func removeStaleCredentialTemps(directories []*credentialDirectory, locks []*cre
 		}
 		sort.Strings(names)
 		for _, name := range names {
-			if !isCredentialTransientName(name) {
+			if !isCredentialTransientCandidate(name) {
 				continue
 			}
-			if err := removeStaleCredentialTemp(directory, locks, name); err != nil {
-				return err
-			}
+			removeStaleCredentialTemp(directory, name)
 		}
 	}
 	return nil
 }
 
-func removeStaleCredentialTemp(directory *credentialDirectory, locks []*credentialLock, name string) (retErr error) {
-	if err := verifyLockedCredentialState([]*credentialDirectory{directory}, locks); err != nil {
-		return err
-	}
+func removeStaleCredentialTemp(directory *credentialDirectory, name string) {
 	fd, err := unix.Openat(int(directory.app.Fd()), name, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return fmt.Errorf("open stale credential temporary file: %w", err)
-	}
-	file := os.NewFile(uintptr(fd), name)
-	defer func() {
-		if file != nil {
-			retErr = errors.Join(retErr, file.Close())
+	if err == nil {
+		file := os.NewFile(uintptr(fd), name)
+		if info, statErr := file.Stat(); statErr == nil && info.Mode().IsRegular() {
+			var stat unix.Stat_t
+			if unix.Fstat(fd, &stat) == nil && stat.Nlink == 1 {
+				// Erase through the held descriptor before unlinking. A foreign
+				// hard link is not truncated because it may name unrelated data.
+				_ = eraseCredentialFile(file)
+			}
 		}
-	}()
-	info, err := file.Stat()
-	if err != nil {
-		return fmt.Errorf("inspect stale credential temporary file: %w", err)
+		_ = file.Close()
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
-		return errors.New("stale credential temporary file must be a private regular non-symlink file")
+	if err := unix.Unlinkat(int(directory.app.Fd()), name, 0); err == nil {
+		_ = syncCredentialDirectory(int(directory.app.Fd()))
 	}
-	if err := verifyCredentialLinkCount(file, 1); err != nil {
-		return fmt.Errorf("stale credential temporary link count is unsafe: %w", err)
-	}
-	if err := verifyNamedFile(directory.app, name, info, false); err != nil {
-		return fmt.Errorf("verify stale credential temporary file: %w", err)
-	}
-	if err := eraseCredentialFile(file); err != nil {
-		return fmt.Errorf("erase stale credential temporary file: %w", err)
-	}
-	if err := verifyNamedFile(directory.app, name, info, false); err != nil {
-		return fmt.Errorf("stale credential temporary file changed before removal: %w", err)
-	}
-	if err := unix.Unlinkat(int(directory.app.Fd()), name, 0); err != nil {
-		return fmt.Errorf("remove stale credential temporary file: %w", err)
-	}
-	if err := verifyCredentialLinkCount(file, 0); err != nil {
-		return fmt.Errorf("verify stale credential temporary removal: %w", err)
-	}
-	if err := syncCredentialDirectory(int(directory.app.Fd())); err != nil {
-		return fmt.Errorf("sync stale credential temporary removal: %w", err)
-	}
-	return nil
 }
 
 func secureCredentialFileOperation(
@@ -239,6 +203,9 @@ func secureCredentialFileOperation(
 	}
 	operation.locks, err = acquireOrderedCredentialLocks(operation.directories)
 	if err != nil {
+		if mutate == nil && errors.Is(err, errCredentialReadLockUnavailable) {
+			return readCredentialFileLockless(preferred, locations.preferred)
+		}
 		return nil, err
 	}
 	if err := runOrderedCredentialLockCheckpoint(operation.locks, locations, ""); err != nil {
@@ -326,6 +293,31 @@ func secureCredentialFileOperation(
 		return nil, err
 	}
 	return credentials, nil
+}
+
+func readCredentialFileLockless(directory *credentialDirectory, path string) (credentials map[string]string, retErr error) {
+	file, info, exists, err := openCredentialFile(directory.app)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return map[string]string{}, nil
+	}
+	defer func() { retErr = errors.Join(retErr, closeCredentialFile(file)) }()
+	if err := directory.verify(); err != nil {
+		return nil, err
+	}
+	if err := verifyNamedFile(directory.app, fileName, info, false); err != nil {
+		return nil, fmt.Errorf("credential file changed before lockless read: %w", err)
+	}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return nil, fmt.Errorf("read credential file %q without a lock: %w", path, err)
+	}
+	if err := verifyNamedFile(directory.app, fileName, info, false); err != nil {
+		return nil, fmt.Errorf("credential file changed during lockless read: %w", err)
+	}
+	return decodeCredentials(path, data)
 }
 
 func openCredentialDirectories(locations credentialFileLocations) ([]*credentialDirectory, *credentialDirectory, *credentialDirectory, error) {
@@ -756,7 +748,7 @@ func openCredentialDirectory(appPath string, create bool) (*credentialDirectory,
 	result.app = os.NewFile(uintptr(fd), appPath)
 	if created {
 		if err := result.app.Chmod(0o700); err != nil {
-			return nil, errors.Join(fmt.Errorf("set credential directory permissions: %w", err), result.close())
+			return nil, errors.Join(fmt.Errorf("set credential directory %q permissions: %w", appPath, err), result.close())
 		}
 	}
 	result.appInfo, err = result.app.Stat()
@@ -764,7 +756,7 @@ func openCredentialDirectory(appPath string, create bool) (*credentialDirectory,
 		return nil, errors.Join(fmt.Errorf("inspect credential directory: %w", err), result.close())
 	}
 	if !result.appInfo.IsDir() || result.appInfo.Mode().Perm()&0o077 != 0 {
-		return nil, errors.Join(errors.New("credential directory must be a private non-symlink directory"), result.close())
+		return nil, errors.Join(fmt.Errorf("credential directory %q must be a private non-symlink directory; run chmod 700 %q", appPath, appPath), result.close())
 	}
 	if err := result.verify(); err != nil {
 		return nil, errors.Join(err, result.close())
@@ -840,7 +832,7 @@ func (directory *credentialDirectory) verify() error {
 		return errors.New("credential directory path changed during operation")
 	}
 	if info.Mode().Perm()&0o077 != 0 {
-		return errors.New("credential directory permissions allow group or other access")
+		return fmt.Errorf("credential directory %q permissions allow group or other access; run chmod 700 %q", directory.appPath, directory.appPath)
 	}
 	return nil
 }
@@ -869,18 +861,22 @@ func (directory *credentialDirectory) close() error {
 }
 
 func acquireCredentialLock(dir *os.File) (*os.File, os.FileInfo, error) {
+	lockPath := filepath.Join(dir.Name(), lockName)
 	fd, err := unix.Openat(int(dir.Fd()), lockName, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
 	created := err == nil
 	if errors.Is(err, unix.EEXIST) {
 		fd, err = unix.Openat(int(dir.Fd()), lockName, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	}
+	if errors.Is(err, unix.EACCES) || errors.Is(err, unix.EROFS) {
+		return nil, nil, errors.Join(errCredentialReadLockUnavailable, fmt.Errorf("open credential lock %q: %w", lockPath, err))
+	}
 	if err != nil {
-		return nil, nil, fmt.Errorf("open credential lock: %w", err)
+		return nil, nil, fmt.Errorf("open credential lock %q: %w", lockPath, err)
 	}
 	lock := os.NewFile(uintptr(fd), lockName)
 	if created {
 		if err := lock.Chmod(0o600); err != nil {
-			return nil, nil, errors.Join(fmt.Errorf("set credential lock permissions: %w", err), lock.Close())
+			return nil, nil, errors.Join(fmt.Errorf("set credential lock %q permissions: %w; run chmod 600 %q", lockPath, err, lockPath), lock.Close())
 		}
 	}
 	info, err := lock.Stat()
@@ -888,7 +884,7 @@ func acquireCredentialLock(dir *os.File) (*os.File, os.FileInfo, error) {
 		return nil, nil, errors.Join(fmt.Errorf("inspect credential lock: %w", err), lock.Close())
 	}
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
-		return nil, nil, errors.Join(errors.New("credential lock must be a private regular non-symlink file"), lock.Close())
+		return nil, nil, errors.Join(fmt.Errorf("credential lock %q must be a private regular non-symlink file; run chmod 600 %q", lockPath, lockPath), lock.Close())
 	}
 	deadline := time.Now().Add(credentialLockTimeout)
 	for {
@@ -900,7 +896,7 @@ func acquireCredentialLock(dir *os.File) (*os.File, os.FileInfo, error) {
 			return nil, nil, errors.Join(fmt.Errorf("lock credential file: %w", err), lock.Close())
 		}
 		if time.Now().After(deadline) {
-			return nil, nil, errors.Join(errors.New("timed out acquiring credential lock"), lock.Close())
+			return nil, nil, errors.Join(fmt.Errorf("timed out acquiring credential lock %q; another clai process may be running; retrying is safe", lockPath), lock.Close())
 		}
 		time.Sleep(credentialLockPoll)
 	}
@@ -929,23 +925,27 @@ func releaseCredentialLock(lock *os.File) error {
 }
 
 func openCredentialFile(dir *os.File) (*os.File, os.FileInfo, bool, error) {
+	path := filepath.Join(dir.Name(), fileName)
 	fd, err := unix.Openat(int(dir.Fd()), fileName, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if errors.Is(err, unix.ENOENT) {
 		return nil, nil, false, nil
 	}
 	if err != nil {
-		return nil, nil, false, fmt.Errorf("open credential file: %w", err)
+		if errors.Is(err, unix.EACCES) {
+			return nil, nil, false, fmt.Errorf("open credential file %q: %w; run chmod 600 %q", path, err, path)
+		}
+		return nil, nil, false, fmt.Errorf("open credential file %q: %w", path, err)
 	}
 	file := os.NewFile(uintptr(fd), fileName)
 	info, err := file.Stat()
 	if err != nil {
-		return nil, nil, false, errors.Join(fmt.Errorf("inspect credential file: %w", err), file.Close())
+		return nil, nil, false, errors.Join(fmt.Errorf("inspect credential file %q: %w", path, err), file.Close())
 	}
 	if !info.Mode().IsRegular() {
-		return nil, nil, false, errors.Join(errors.New("credential file must be a regular non-symlink file"), file.Close())
+		return nil, nil, false, errors.Join(fmt.Errorf("credential file %q must be a regular non-symlink file", path), file.Close())
 	}
 	if info.Mode().Perm()&0o077 != 0 {
-		return nil, nil, false, errors.Join(errors.New("credential file permissions allow group or other access"), file.Close())
+		return nil, nil, false, errors.Join(fmt.Errorf("credential file %q permissions allow group or other access; run chmod 600 %q", path, path), file.Close())
 	}
 	return file, info, true, nil
 }
@@ -963,7 +963,7 @@ func createCredentialTemp(dir *os.File) (*os.File, string, os.FileInfo, error) {
 		if _, err := rand.Read(random[:]); err != nil {
 			return nil, "", nil, fmt.Errorf("generate credential temporary name: %w", err)
 		}
-		name := ".credentials-" + hex.EncodeToString(random[:]) + ".tmp"
+		name := fmt.Sprintf(".credentials-%x.tmp", random[:])
 		fd, err := unix.Openat(int(dir.Fd()), name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
 		if errors.Is(err, unix.EEXIST) {
 			continue
@@ -972,15 +972,16 @@ func createCredentialTemp(dir *os.File) (*os.File, string, os.FileInfo, error) {
 			return nil, "", nil, fmt.Errorf("create credential temporary file: %w", err)
 		}
 		file := os.NewFile(uintptr(fd), name)
+		path := filepath.Join(dir.Name(), name)
 		if err := file.Chmod(0o600); err != nil {
-			return nil, "", nil, errors.Join(fmt.Errorf("set credential temporary permissions: %w", err), cleanupEmptyTemp(file, int(dir.Fd()), name))
+			return nil, "", nil, errors.Join(fmt.Errorf("set credential temporary %q permissions: %w; run chmod 600 %q", path, err, path), cleanupEmptyTemp(file, int(dir.Fd()), name))
 		}
 		info, err := file.Stat()
 		if err != nil {
 			return nil, "", nil, errors.Join(fmt.Errorf("inspect credential temporary file: %w", err), cleanupEmptyTemp(file, int(dir.Fd()), name))
 		}
 		if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
-			return nil, "", nil, errors.Join(errors.New("created credential file is not a private regular file"), cleanupEmptyTemp(file, int(dir.Fd()), name))
+			return nil, "", nil, errors.Join(fmt.Errorf("created credential file %q is not a private regular file; run chmod 600 %q", path, path), cleanupEmptyTemp(file, int(dir.Fd()), name))
 		}
 		return file, name, info, nil
 	}
@@ -1016,6 +1017,7 @@ func unlinkInstalledCredentialFile(dir *os.File, expected os.FileInfo) error {
 }
 
 func verifyNamedFile(dir *os.File, name string, expected os.FileInfo, lock bool) (retErr error) {
+	path := filepath.Join(dir.Name(), name)
 	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
@@ -1031,9 +1033,9 @@ func verifyNamedFile(dir *os.File, name string, expected os.FileInfo, lock bool)
 	}
 	if info.Mode().Perm()&0o077 != 0 {
 		if lock {
-			return errors.New("lock permissions allow group or other access")
+			return fmt.Errorf("lock %q permissions allow group or other access; run chmod 600 %q", path, path)
 		}
-		return errors.New("file permissions allow group or other access")
+		return fmt.Errorf("file %q permissions allow group or other access; run chmod 600 %q", path, path)
 	}
 	return nil
 }

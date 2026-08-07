@@ -276,13 +276,22 @@ func (c cli) authLogin(provider string) int {
 }
 
 func (c cli) storeKey(provider, key string) int {
-	store := c.authStore
-	if store == nil {
-		store = auth.Store
+	var result auth.StoreResult
+	var err error
+	switch {
+	case c.authStoreDetailed != nil:
+		result, err = c.authStoreDetailed(provider, key)
+	case c.authStore != nil:
+		err = c.authStore(provider, key)
+	default:
+		result, err = auth.StoreDetailed(provider, key)
 	}
-	if err := store(provider, key); err != nil {
+	if err != nil {
 		fmt.Fprintf(c.stderr, "clai auth login: store key: %v\n", err)
 		return exitError
+	}
+	if result.Warning != nil {
+		fmt.Fprintf(c.stderr, "clai auth login: warning: %v\n", result.Warning)
 	}
 	sourceWithError := c.authSourceWithError
 	if sourceWithError == nil {

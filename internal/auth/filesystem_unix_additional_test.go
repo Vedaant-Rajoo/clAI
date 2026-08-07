@@ -334,6 +334,11 @@ func TestCredentialLockTimeoutIsBoundedAndReleasesDescriptors(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "timed out acquiring credential lock") {
 		t.Fatalf("Store error = %v, want lock timeout", err)
 	}
+	for _, want := range []string{filepath.Join(dir, lockName), "another clai", "retrying is safe"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Store lock-timeout error = %q, want %q", err, want)
+		}
+	}
 	if elapsed < credentialLockTimeout || elapsed > credentialLockTimeout+time.Second {
 		t.Fatalf("lock timeout elapsed %v, want [%v,%v]", elapsed, credentialLockTimeout, credentialLockTimeout+time.Second)
 	}

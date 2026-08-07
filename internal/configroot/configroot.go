@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 )
 
 var (
@@ -21,6 +22,11 @@ var (
 	lookupEnv     = os.LookupEnv
 	userHomeDir   = os.UserHomeDir
 	userConfigDir = os.UserConfigDir
+
+	relativeXDGWarningOnce sync.Once
+	warnRelativeXDG        = func(value string) {
+		fmt.Fprintf(os.Stderr, "clai: warning: ignoring relative XDG_CONFIG_HOME %q; using the platform default config directory\n", value)
+	}
 )
 
 // Roots names the preferred configuration base and an optional legacy base.
@@ -32,6 +38,10 @@ type Roots struct {
 // Resolve discovers clai's configuration roots for the current platform.
 func Resolve() (Roots, error) {
 	xdg, _ := lookupEnv("XDG_CONFIG_HOME")
+	if xdg != "" && !filepath.IsAbs(xdg) {
+		relativeXDGWarningOnce.Do(func() { warnRelativeXDG(xdg) })
+		xdg = ""
+	}
 
 	switch currentGOOS {
 	case "darwin":

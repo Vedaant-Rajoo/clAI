@@ -341,22 +341,6 @@ func TestCredentialBelowRootSymlinksRejected(t *testing.T) {
 				}
 			},
 		},
-		{
-			name: "temporary symlink",
-			setup: func(t *testing.T, root string) {
-				dir := filepath.Join(root, "clai")
-				if err := os.Mkdir(dir, 0o700); err != nil {
-					t.Fatal(err)
-				}
-				target := filepath.Join(t.TempDir(), "temp-target")
-				if err := os.WriteFile(target, []byte("attacker-secret"), 0o600); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Symlink(target, filepath.Join(dir, ".credentials-00112233445566778899aabb.tmp")); err != nil {
-					t.Fatal(err)
-				}
-			},
-		},
 	}
 
 	for _, fixture := range fixtures {

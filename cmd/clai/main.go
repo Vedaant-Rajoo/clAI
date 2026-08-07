@@ -60,6 +60,7 @@ type cli struct {
 	authRuntime         authRuntime
 	authReadLine        func() (string, error)
 	authStore           func(provider, key string) error
+	authStoreDetailed   func(provider, key string) (auth.StoreResult, error)
 	authDelete          func(provider string) error
 	authSourceWithError func(provider, explicit string) (string, error)
 }

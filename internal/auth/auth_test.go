@@ -188,13 +188,22 @@ func TestEmptySuccessfulKeyringValueFallsBackConsistently(t *testing.T) {
 }
 
 func TestResolveOperationalKeyringError(t *testing.T) {
-	backendErr := errors.New("keyring unavailable")
+	backendErr := errors.New("backend-secret-sentinel")
 	kr := &fakeKeyring{getErr: backendErr}
 	base := useTestBackends(t, kr)
 	t.Setenv("OPENROUTER_API_KEY", "")
 
 	if _, err := Resolve("openrouter", ""); !errors.Is(err, backendErr) {
 		t.Fatalf("Resolve error = %v, want keyring error", err)
+	} else {
+		for _, want := range []string{"keyring unavailable", "OPENROUTER_API_KEY", filepath.Join(base, "clai", fileName), "retry"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("Resolve error = %q, want %q", err, want)
+			}
+		}
+		if strings.Contains(err.Error(), backendErr.Error()) {
+			t.Fatalf("Resolve error reflected untrusted backend text: %v", err)
+		}
 	}
 
 	writeCredentialFixture(t, base, `{"openrouter":"fallback-key"}`)
@@ -305,6 +314,23 @@ func TestInsecurePathsRejectedAcrossOperations(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestCredentialPermissionErrorNamesPathAndRemedy(t *testing.T) {
+	kr := &fakeKeyring{getErr: keyring.ErrNotFound}
+	base := useTestBackends(t, kr)
+	path := writeCredentialFixture(t, base, `{"openrouter":"stored-secret"}`)
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Resolve("openrouter", "")
+	if err == nil {
+		t.Fatal("Resolve unexpectedly accepted permissive credentials")
+	}
+	if !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), "chmod 600") {
+		t.Fatalf("Resolve error = %q, want path and chmod remedy", err)
 	}
 }
 
@@ -427,8 +453,12 @@ func TestStoreKeyringSuccessWinsOverStaleFallbackCleanupFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := Store("openrouter", "replacement-secret"); err != nil {
-		t.Fatalf("Store reported failure after successful keyring write: %v", err)
+	result, err := StoreDetailed("openrouter", "replacement-secret")
+	if err != nil {
+		t.Fatalf("StoreDetailed reported failure after successful keyring write: %v", err)
+	}
+	if result.Warning == nil || !strings.Contains(result.Warning.Error(), path) || !strings.Contains(result.Warning.Error(), "chmod 600") {
+		t.Fatalf("StoreDetailed warning = %v, want stale-file path and remedy", result.Warning)
 	}
 	if got := kr.values["openrouter"]; got != "replacement-secret" {
 		t.Fatalf("keyring credential = %q, want replacement-secret", got)
@@ -439,6 +469,9 @@ func TestStoreKeyringSuccessWinsOverStaleFallbackCleanupFailure(t *testing.T) {
 	}
 	if string(data) != `{"openrouter":"`+secret+`"}` {
 		t.Fatalf("failed cleanup changed stale fallback: %q", data)
+	}
+	if err := Store("openrouter", "second-replacement"); err != nil {
+		t.Fatalf("Store compatibility wrapper surfaced non-fatal warning: %v", err)
 	}
 }
 

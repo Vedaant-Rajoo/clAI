@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Vedaant-Rajoo/clai/internal/app"
+	"github.com/Vedaant-Rajoo/clai/internal/auth"
 	"github.com/Vedaant-Rajoo/clai/internal/capability"
 	"github.com/Vedaant-Rajoo/clai/internal/config"
 	"github.com/Vedaant-Rajoo/clai/internal/provider"
@@ -900,6 +901,28 @@ func TestAuthLoginOpenAIWarnsProviderIsNotUsable(t *testing.T) {
 	}
 	if strings.Contains(out.String(), secret) {
 		t.Fatal("login output disclosed API key")
+	}
+}
+
+func TestAuthLoginPrintsNonFatalStoreWarningAndSucceeds(t *testing.T) {
+	c, out, errOut := captureCLI()
+	warning := errors.New("stale credential file cleanup needs attention")
+	c.authStoreDetailed = func(providerName, key string) (auth.StoreResult, error) {
+		if providerName != "anthropic" || key != "secret" {
+			t.Fatalf("store arguments = %q, %q", providerName, key)
+		}
+		return auth.StoreResult{Warning: warning}, nil
+	}
+	c.authSourceWithError = func(string, string) (string, error) { return "keyring", nil }
+
+	if got := c.storeKey("anthropic", "secret"); got != exitOK {
+		t.Fatalf("exit = %d, want %d", got, exitOK)
+	}
+	if !strings.Contains(errOut.String(), "clai auth login: warning: "+warning.Error()) {
+		t.Fatalf("stderr = %q, want non-fatal store warning", errOut.String())
+	}
+	if !strings.Contains(out.String(), "Stored anthropic credentials (keyring).") {
+		t.Fatalf("stdout = %q, want success message", out.String())
 	}
 }
 

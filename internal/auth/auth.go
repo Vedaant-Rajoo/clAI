@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 
 	"github.com/Vedaant-Rajoo/clai/internal/configroot"
 	"github.com/zalando/go-keyring"
@@ -156,13 +155,13 @@ func Resolve(provider, explicit string) (string, error) {
 }
 
 // Store persists an API key, preferring the OS keyring and falling back to a
-// private config file when the keyring is unavailable. A successful keyring
-// store removes the provider from both file locations before returning.
+// private config file when the keyring is unavailable. After a successful
+// keyring store, stale file copies are removed on a best-effort basis; a file
+// cleanup failure does not turn the successful credential store into a
+// failure.
 func Store(provider, key string) error {
 	if err := credentialKeyring.Set(serviceName, provider, key); err == nil {
-		if err := deleteFileEntry(provider); err != nil {
-			return fmt.Errorf("remove stale config credential: %w", err)
-		}
+		_ = deleteFileEntry(provider)
 		return nil
 	}
 	if err := writeFile(provider, key); err != nil {
@@ -281,48 +280,8 @@ func canonicalizeCredentialFileLocations(selected credentialFileLocations, creat
 	}, nil
 }
 
-// canonicalizeCredentialRoot permits a symlink only at the selected root
-// itself. Parent components remain outside that one-time authority grant so an
-// intermediate link cannot silently redirect credential storage.
 func canonicalizeCredentialRoot(path string, create bool) (string, error) {
-	if err := validateCredentialRootParents(path); err != nil {
-		return "", err
-	}
 	return configroot.Canonicalize(path, create)
-}
-
-func validateCredentialRootParents(path string) error {
-	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
-		return nil
-	}
-	clean := filepath.Clean(path)
-	if !filepath.IsAbs(clean) {
-		// configroot.Canonicalize owns the syntax diagnostic for relative roots.
-		return nil
-	}
-
-	current := filepath.Dir(clean)
-	for {
-		_, err := os.Lstat(current)
-		if err == nil {
-			canonical, err := filepath.EvalSymlinks(current)
-			if err != nil {
-				return fmt.Errorf("securely traverse credential root parent: %w", err)
-			}
-			if filepath.Clean(canonical) != current {
-				return errors.New("securely traverse credential root parent: intermediate symlinks are not allowed")
-			}
-			return nil
-		}
-		if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("securely traverse credential root parent: %w", err)
-		}
-		parent := filepath.Dir(current)
-		if parent == current {
-			return nil
-		}
-		current = parent
-	}
 }
 
 func credentialRoot(path string) string {

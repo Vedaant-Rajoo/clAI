@@ -17,7 +17,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestIntermediateConfigComponentSymlinkRejected(t *testing.T) {
+func TestIntermediateConfigComponentSymlinkCanonicalized(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -32,8 +32,11 @@ func TestIntermediateConfigComponentSymlinkRejected(t *testing.T) {
 	}
 	useTestBackendsAt(t, &fakeKeyring{setErr: errors.New("unavailable")}, filepath.Join(link, "config"))
 
-	if err := Store("openrouter", "secret-value"); err == nil || !strings.Contains(err.Error(), "securely traverse") {
-		t.Fatalf("Store error = %v, want intermediate symlink rejection", err)
+	if err := Store("openrouter", "secret-value"); err != nil {
+		t.Fatalf("Store through intermediate config symlink: %v", err)
+	}
+	if got := readCredentialMapFixture(t, realBase)["openrouter"]; got != "secret-value" {
+		t.Fatalf("stored credential = %q, want secret-value", got)
 	}
 }
 

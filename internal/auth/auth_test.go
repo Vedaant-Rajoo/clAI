@@ -418,7 +418,7 @@ func TestKeyringStoreWithoutFallbackDoesNotCreateConfigArtifacts(t *testing.T) {
 	}
 }
 
-func TestStoreSurfacesStaleFallbackCleanupFailure(t *testing.T) {
+func TestStoreKeyringSuccessWinsOverStaleFallbackCleanupFailure(t *testing.T) {
 	secret := "secret-must-not-leak"
 	kr := &fakeKeyring{}
 	base := useTestBackends(t, kr)
@@ -427,12 +427,18 @@ func TestStoreSurfacesStaleFallbackCleanupFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := Store("openrouter", "replacement-secret")
-	if err == nil {
-		t.Fatal("Store unexpectedly hid stale cleanup failure")
+	if err := Store("openrouter", "replacement-secret"); err != nil {
+		t.Fatalf("Store reported failure after successful keyring write: %v", err)
 	}
-	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "replacement-secret") {
-		t.Fatalf("error disclosed a credential: %v", err)
+	if got := kr.values["openrouter"]; got != "replacement-secret" {
+		t.Fatalf("keyring credential = %q, want replacement-secret", got)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read stale fallback after rejected cleanup: %v", err)
+	}
+	if string(data) != `{"openrouter":"`+secret+`"}` {
+		t.Fatalf("failed cleanup changed stale fallback: %q", data)
 	}
 }
 

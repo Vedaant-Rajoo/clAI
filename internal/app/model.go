@@ -189,7 +189,15 @@ func (m Model) compile(ctx context.Context, requestID uint64) tea.Cmd {
 	p := m.provider
 	inventorySource := m.inventorySource
 	return func() tea.Msg {
-		collected := machinecontext.CollectWithShell(shell)
+		if err := ctx.Err(); err != nil {
+			return compileResult{requestID: requestID, err: err}
+		}
+
+		collected := machinecontext.CollectContext(ctx, shell)
+		if err := ctx.Err(); err != nil {
+			return compileResult{requestID: requestID, context: collected, err: err}
+		}
+
 		inventory := inventorySource.Inventory(ctx)
 		if err := ctx.Err(); err != nil {
 			return compileResult{requestID: requestID, context: collected, inventory: inventory, err: err}

@@ -11,53 +11,59 @@ func TestCommandBoundaryAndStructuralValidation(t *testing.T) {
 	tests := []struct {
 		name    string
 		command string
-		valid   bool
+		class   Class
 	}{
-		{name: "simple command", command: "git status --short", valid: true},
-		{name: "supported list and pipeline", command: "pwd && printf x | rg x; date", valid: true},
-		{name: "supported assignments wrappers and redirects", command: "FOO=bar env -i command -- /usr/bin/printf ok >out", valid: true},
-		{name: "quoted angle brackets", command: "printf '%s\\n' '<tag>'", valid: true},
-		{name: "escaped angle brackets", command: `printf \<tag\>`, valid: true},
-		{name: "ordinary Unicode", command: "printf '%s' 日本語", valid: true},
-		{name: "non prohibited format character", command: "printf soft" + string(rune(0x00AD)) + "hyphen", valid: true},
-		{name: "empty command", command: "   ", valid: false},
-		{name: "line feed", command: "printf one\nprintf two", valid: false},
-		{name: "carriage return", command: "printf one\rprintf two", valid: false},
-		{name: "nul byte", command: "printf one\x00printf two", valid: false},
-		{name: "escape byte", command: "printf '\x1b]52;c;payload\a'", valid: false},
-		{name: "readline control byte", command: "printf one\x01printf two", valid: false},
-		{name: "tab control byte", command: "printf\tone", valid: false},
-		{name: "unresolved placeholder", command: "rg <pattern>", valid: false},
-		{name: "unclosed double quote", command: `printf "hello`, valid: false},
-		{name: "unclosed single quote", command: "printf 'hello", valid: false},
-		{name: "trailing escape", command: "printf hello\\", valid: false},
-		{name: "leading pipe", command: "| ls", valid: false},
-		{name: "trailing pipe", command: "ls |", valid: false},
-		{name: "trailing conditional", command: "pwd &&", valid: false},
-		{name: "trailing semicolon", command: "printf '%s\\n' done;", valid: false},
-		{name: "empty list segment", command: "pwd && || date", valid: false},
-		{name: "missing redirect target", command: "printf ok >", valid: false},
-		{name: "unsupported background", command: "printf ok &", valid: false},
-		{name: "unsupported comment", command: "printf ok # note", valid: false},
-		{name: "unsupported grouping", command: "(printf ok)", valid: false},
-		{name: "unsupported command substitution", command: "printf $(date)", valid: false},
-		{name: "unsupported process substitution", command: "cat <(printf x)", valid: false},
-		{name: "unsupported parameter expansion", command: "printf $HOME", valid: false},
-		{name: "unsupported here document", command: "cat <<EOF", valid: false},
-		{name: "unsupported here string", command: "cat <<<value", valid: false},
-		{name: "unsupported shell evaluation", command: `sh -c 'rm file'`, valid: false},
-		{name: "unsupported env wrapper option", command: "env -u FOO rm file", valid: false},
-		{name: "unsupported command wrapper option", command: "command -v rm", valid: false},
+		{name: "simple command", command: "git status --short", class: Valid},
+		{name: "supported list and pipeline", command: "pwd && printf x | rg x; date", class: Valid},
+		{name: "supported assignments wrappers and redirects", command: "FOO=bar env -i command -- /usr/bin/printf ok >out", class: Valid},
+		{name: "quoted angle brackets", command: "printf '%s\\n' '<tag>'", class: Valid},
+		{name: "escaped angle brackets", command: `printf \<tag\>`, class: Valid},
+		{name: "ordinary Unicode", command: "printf '%s' 日本語", class: Valid},
+		{name: "non prohibited format character", command: "printf soft" + string(rune(0x00AD)) + "hyphen", class: Valid},
+		{name: "empty command", command: "   ", class: Invalid},
+		{name: "line feed", command: "printf one\nprintf two", class: Invalid},
+		{name: "carriage return", command: "printf one\rprintf two", class: Invalid},
+		{name: "nul byte", command: "printf one\x00printf two", class: Invalid},
+		{name: "escape byte", command: "printf '\x1b]52;c;payload\a'", class: Invalid},
+		{name: "readline control byte", command: "printf one\x01printf two", class: Invalid},
+		{name: "tab control byte", command: "printf\tone", class: Invalid},
+		{name: "unresolved placeholder", command: "rg <pattern>", class: Invalid},
+		{name: "unclosed double quote", command: `printf "hello`, class: Invalid},
+		{name: "unclosed single quote", command: "printf 'hello", class: Invalid},
+		{name: "trailing escape", command: "printf hello\\", class: Invalid},
+		{name: "leading pipe", command: "| ls", class: Invalid},
+		{name: "trailing pipe", command: "ls |", class: Invalid},
+		{name: "trailing conditional", command: "pwd &&", class: Invalid},
+		{name: "trailing semicolon", command: "printf '%s\\n' done;", class: Invalid},
+		{name: "empty list segment", command: "pwd && || date", class: Invalid},
+		{name: "missing redirect target", command: "printf ok >", class: Invalid},
+		{name: "unsupported background", command: "printf ok &", class: Warning},
+		{name: "unsupported comment", command: "printf ok # note", class: Warning},
+		{name: "unsupported grouping", command: "(printf ok)", class: Warning},
+		{name: "unsupported command substitution", command: "printf $(date)", class: Warning},
+		{name: "unsupported process substitution", command: "cat <(printf x)", class: Warning},
+		{name: "unsupported parameter expansion", command: "printf $HOME", class: Warning},
+		{name: "unsupported here document", command: "cat <<EOF", class: Warning},
+		{name: "unsupported here string", command: "cat <<<value", class: Warning},
+		{name: "unsupported shell evaluation", command: `sh -c 'rm file'`, class: Warning},
+		{name: "unsupported env wrapper option", command: "env -u FOO rm file", class: Warning},
+		{name: "unsupported command wrapper option", command: "command -v rm", class: Warning},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := Command(tt.command)
-			if result.Valid != tt.valid {
-				t.Fatalf("Command(%q) = %#v, want valid %v", tt.command, result, tt.valid)
+			if result.Class != tt.class {
+				t.Fatalf("Command(%q) = %#v, want class %q", tt.command, result, tt.class)
 			}
-			if !tt.valid && len(result.Reasons) == 0 {
-				t.Fatalf("Command(%q).Reasons is empty", tt.command)
+			if got, want := result.Valid, tt.class != Invalid; got != want {
+				t.Fatalf("Command(%q).Valid = %v, want %v for class %q", tt.command, got, want, tt.class)
+			}
+			if tt.class == Valid && len(result.Reasons) != 0 {
+				t.Fatalf("Command(%q) is fully valid but carries reasons %v", tt.command, result.Reasons)
+			}
+			if tt.class != Valid && len(result.Reasons) == 0 {
+				t.Fatalf("Command(%q) has class %q without a reason", tt.command, tt.class)
 			}
 		})
 	}

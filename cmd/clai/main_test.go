@@ -1119,7 +1119,10 @@ func TestWidgetApplicabilityBranchesAndEditedDerivationObservable(t *testing.T) 
 	inventory := capability.NewFixtureInventory(
 		"linux", "amd64",
 		capability.ShellIdentity{Family: capability.ShellFish},
-		[]capability.ToolFact{{Name: "grep", Present: true}},
+		[]capability.ToolFact{
+			{Name: "grep", Present: true},
+			{Name: "definitely-absent-tool", Present: false},
+		},
 	)
 	hardRequirement := []capability.Requirement{{Kind: capability.RequirementShell, Name: "bash"}}
 
@@ -1153,6 +1156,11 @@ func TestWidgetApplicabilityBranchesAndEditedDerivationObservable(t *testing.T) 
 	}
 	if !found {
 		t.Fatalf("edited reasons = %v, want derived base name naming the missing executable", edited.Reasons)
+	}
+
+	unprobed := widgetApplicability(app.Outcome{Command: "ls -la", Edited: true}, inventory)
+	if unprobed.Decision != applicability.Applicable || len(unprobed.Reasons) != 0 {
+		t.Fatalf("edited unprobed tool at widget boundary = %+v, want no false applicability warning", unprobed)
 	}
 }
 

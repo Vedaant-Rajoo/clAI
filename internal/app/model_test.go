@@ -12,6 +12,7 @@ import (
 	"github.com/Vedaant-Rajoo/clai/internal/capability"
 	machinecontext "github.com/Vedaant-Rajoo/clai/internal/context"
 	"github.com/Vedaant-Rajoo/clai/internal/provider"
+	"github.com/Vedaant-Rajoo/clai/internal/validate"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -558,6 +559,47 @@ func TestCtrlCCancelsLoadingAndQuitsWhileEscapeReturnsToInput(t *testing.T) {
 	}
 }
 
+func TestLoadingViewShowsCancelAndQuitHints(t *testing.T) {
+	m := NewWithProvider(stubProvider{})
+	m.input.SetValue("show status")
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	t.Cleanup(m.cancelActiveCompile)
+
+	if view := stripANSI(m.View()); !strings.Contains(view, "esc cancel · ctrl+c quit") {
+		t.Fatalf("loading view missing cancel/quit hints: %q", view)
+	}
+}
+
+func TestEscapeFromReviewReturnsToInput(t *testing.T) {
+	m := submitIntent(t, NewWithProvider(stubProvider{candidates: []provider.Candidate{{
+		Command:     "pwd",
+		Explanation: "current directory",
+	}}}), "where am i")
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if cmd != nil || m.screen != screenInput {
+		t.Fatalf("Escape from review: cmd nil=%v screen=%v, want nil/input", cmd == nil, m.screen)
+	}
+	if m.input.Value() != "where am i" || m.command != "" || m.explanation != "" || m.accepted {
+		t.Fatalf("review cancellation retained candidate state: input=%q command=%q explanation=%q accepted=%v", m.input.Value(), m.command, m.explanation, m.accepted)
+	}
+}
+
+func TestEscapeFromNoSuggestionReturnsToInput(t *testing.T) {
+	m := submitIntent(t, NewWithProvider(stubProvider{}), "find something")
+	if m.screen != screenNoSuggestion {
+		t.Fatalf("setup screen = %v, want no suggestion", m.screen)
+	}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if cmd != nil || m.screen != screenInput || m.input.Value() != "find something" {
+		t.Fatalf("Escape from no suggestion: cmd nil=%v screen=%v input=%q, want nil/input/restored intent", cmd == nil, m.screen, m.input.Value())
+	}
+}
+
 type ignoresCancellationProvider struct {
 	started chan struct{}
 	release chan struct{}
@@ -751,6 +793,30 @@ func TestDecisionsAreDistinguishableWithoutColor(t *testing.T) {
 	}
 }
 
+func TestUnsupportedParameterExpansionWarnsAndCanBeAccepted(t *testing.T) {
+	const command = "echo $HOME"
+	m := submitIntent(t, NewWithProvider(stubProvider{candidates: []provider.Candidate{{
+		Command:     command,
+		Explanation: "shows the home directory",
+	}}}), "show my home")
+
+	if !m.validation.Valid || m.validation.Class != validate.Warning {
+		t.Fatalf("validation = %+v, want warning-class eligibility", m.validation)
+	}
+	view := stripANSI(m.View())
+	for _, want := range []string{"warning", "parameter expansion", "enter accept"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("warning review missing %q: %q", want, view)
+		}
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	accepted := updated.(Model)
+	if !accepted.Accepted() || accepted.Command() != command {
+		t.Fatalf("accepted warning command = accepted %v command %q, want exact raw bytes", accepted.Accepted(), accepted.Command())
+	}
+}
+
 // stripANSI removes CSI escape sequences so assertions see exactly what a
 // colorless terminal presents.
 func stripANSI(s string) string {
@@ -864,6 +930,28 @@ func TestReviewTogglesWhyAndContext(t *testing.T) {
 	m = press(m, 'c')
 	if v := stripANSI(m.View()); strings.Contains(v, "cwd:") {
 		t.Fatalf("c did not collapse the context again:\n%s", v)
+	}
+}
+
+func TestEditedCommandLabelsOriginalExplanation(t *testing.T) {
+	m := submitIntent(t, NewWithProvider(stubProvider{candidates: []provider.Candidate{{
+		Command:     "pwd",
+		Explanation: "reports the current directory",
+	}}}), "where am i")
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	m = updated.(Model)
+	m.commandInput.SetValue("ls -la")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+	m = updated.(Model)
+
+	view := stripANSI(m.View())
+	for _, want := range []string{"Explanation for the original suggestion", "reports the current directory"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("edited review missing %q: %q", want, view)
+		}
 	}
 }
 
@@ -1118,8 +1206,10 @@ func TestApplicabilitySelectionAndWidgetBoundary(t *testing.T) {
 		}},
 	}
 	model := submitIntent(t, NewFromDeps(Deps{
-		Provider:        stubProvider{candidates: []provider.Candidate{candidate}},
-		InventorySource: staticInventorySource{},
+		Provider: stubProvider{candidates: []provider.Candidate{candidate}},
+		InventorySource: staticInventorySource{inventory: capability.NewFixtureInventory("linux", "amd64", capability.ShellIdentity{}, []capability.ToolFact{
+			{Name: "definitely_missing_clai_tool", Present: false},
+		})},
 	}), "where am i")
 	if model.applicability.Decision != applicability.Marked {
 		t.Fatalf("applicability = %+v, want soft mark", model.applicability)
@@ -1145,8 +1235,10 @@ func TestCandidateExplanationAndApplicabilityReasonsSanitized(t *testing.T) {
 		}},
 	}
 	model := submitIntent(t, NewFromDeps(Deps{
-		Provider:        stubProvider{candidates: []provider.Candidate{candidate}},
-		InventorySource: staticInventorySource{},
+		Provider: stubProvider{candidates: []provider.Candidate{candidate}},
+		InventorySource: staticInventorySource{inventory: capability.NewFixtureInventory("linux", "amd64", capability.ShellIdentity{}, []capability.ToolFact{
+			{Name: "bad\x1btool", Present: false},
+		})},
 	}), "review")
 	model.whyExpanded = true
 	view := model.View()
@@ -1178,8 +1270,8 @@ func TestEditedOutcomeDiscriminator(t *testing.T) {
 	model.commandInput.SetValue("pwd")
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
-	if model.applicability.Decision != applicability.Marked {
-		t.Fatalf("edited applicability = %+v, want presence-only mark", model.applicability)
+	if model.applicability.Decision != applicability.Applicable {
+		t.Fatalf("edited applicability = %+v, want unprobed pwd to remain applicable", model.applicability)
 	}
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	outcome := updated.(Model).Outcome()
@@ -1198,8 +1290,10 @@ func TestEditReviewDerivesExecutablesFromBytes(t *testing.T) {
 		}},
 	}
 	model := submitIntent(t, NewFromDeps(Deps{
-		Provider:        stubProvider{candidates: []provider.Candidate{candidate}},
-		InventorySource: staticInventorySource{},
+		Provider: stubProvider{candidates: []provider.Candidate{candidate}},
+		InventorySource: staticInventorySource{inventory: capability.NewFixtureInventory("linux", "amd64", capability.ShellIdentity{}, []capability.ToolFact{
+			{Name: "rg", Present: false},
+		})},
 	}), "run commands")
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
 	model = updated.(Model)
@@ -1209,15 +1303,15 @@ func TestEditReviewDerivesExecutablesFromBytes(t *testing.T) {
 	if model.applicability.Decision != applicability.Marked {
 		t.Fatalf("edited applicability = %+v, want marked", model.applicability)
 	}
-	if len(model.applicability.Reasons) != 2 || !strings.Contains(model.applicability.Reasons[0], "tool rg") || !strings.Contains(model.applicability.Reasons[1], "tool missing") {
-		t.Fatalf("edited reasons = %v, want executable-position order", model.applicability.Reasons)
+	if len(model.applicability.Reasons) != 1 || !strings.Contains(model.applicability.Reasons[0], "tool rg") {
+		t.Fatalf("edited reasons = %v, want only the probed-absent executable", model.applicability.Reasons)
 	}
 	if !model.edited || len(model.Outcome().Requirements) != 0 {
 		t.Fatalf("edited state retained model requirements: %+v", model.Outcome())
 	}
 }
 
-func TestEditedParseUncertaintyDefersToValidation(t *testing.T) {
+func TestEditedUnsupportedSyntaxWarnsWithoutApplicabilityGuess(t *testing.T) {
 	model := submitIntent(t, NewFromDeps(Deps{
 		Provider: stubProvider{candidates: []provider.Candidate{{
 			Command:     "pwd",
@@ -1230,8 +1324,8 @@ func TestEditedParseUncertaintyDefersToValidation(t *testing.T) {
 	model.commandInput.SetValue("echo $(missing)")
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
-	if model.validation.Valid {
-		t.Fatal("structural validation accepted parser uncertainty")
+	if !model.validation.Valid || model.validation.Class != validate.Warning {
+		t.Fatalf("validation = %+v, want warning-class eligibility", model.validation)
 	}
 	if model.applicability.Decision != applicability.Applicable || len(model.applicability.Reasons) != 0 {
 		t.Fatalf("applicability asserted on parser uncertainty: %+v", model.applicability)
@@ -1259,6 +1353,7 @@ func TestReviewDisplaysRelevantCapabilityFacts(t *testing.T) {
 		Explanation: "searches TODO markers",
 		Requirements: []capability.Requirement{
 			{Kind: capability.RequirementTool, Name: "rg", MinVersion: "14.1"},
+			{Kind: capability.RequirementTool, Name: "grep"},
 			{Kind: capability.RequirementShell, Name: "bash"},
 			{Kind: capability.RequirementOS, Name: "linux"},
 			{Kind: capability.RequirementTool, Name: "rg"},
@@ -1272,8 +1367,9 @@ func TestReviewDisplaysRelevantCapabilityFacts(t *testing.T) {
 		os:    "darwin",
 		shell: capability.ShellFish,
 		tools: map[string]capability.ToolFact{
-			"rg":  {Name: "rg", Present: true, Path: "/secret/bin/rg", Version: "14.1.0"},
-			"git": {Name: "git", Present: true, Path: "/secret/bin/git", Version: "2.50.0"},
+			"rg":   {Name: "rg", Present: true, Path: "/secret/bin/rg", Version: "14.1.0"},
+			"grep": {Name: "grep", Present: false},
+			"git":  {Name: "git", Present: true, Path: "/secret/bin/git", Version: "2.50.0"},
 		},
 	}
 	model.applicability = applicability.Evaluate(model.candidate.Requirements, model.inventory)
@@ -1281,7 +1377,7 @@ func TestReviewDisplaysRelevantCapabilityFacts(t *testing.T) {
 	model.contextExpanded = true
 
 	view := model.View()
-	for _, want := range []string{"tool rg: present 14.1.0", "shell: fish", "os: darwin"} {
+	for _, want := range []string{"tool rg: present 14.1.0", "tool grep: absent", "shell: fish", "os: darwin"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("review missing relevant capability fact %q: %q", want, view)
 		}
@@ -1299,7 +1395,7 @@ func TestReviewDisplaysRelevantCapabilityFacts(t *testing.T) {
 	model.command = "command /usr/bin/rg TODO | missing"
 	model.applicability = applicability.EvaluateEdited(model.command, model.inventory)
 	edited := model.View()
-	for _, want := range []string{"tool rg: present 14.1.0", "tool missing: absent"} {
+	for _, want := range []string{"tool rg: present 14.1.0", "tool missing: not probed (outside the fixed inventory)"} {
 		if !strings.Contains(edited, want) {
 			t.Fatalf("edited review missing derived fact %q: %q", want, edited)
 		}
@@ -1317,12 +1413,40 @@ func TestReviewDisplaysRelevantCapabilityFacts(t *testing.T) {
 	// derived: rg is an argument to xargs here, not a command of its own.
 	braced := relevantCapabilityLines(model.inventory, nil, true, applicability.EvaluateEdited("rg --files | xargs -I{} du -h {}", model.inventory).Tools)
 	joined := strings.Join(braced, "\n")
-	for _, want := range []string{"tool rg: present 14.1.0", "tool xargs: absent"} {
+	for _, want := range []string{"tool rg: present 14.1.0", "tool xargs: not probed (outside the fixed inventory)"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("edited brace command missing derived fact %q: %v", want, braced)
 		}
 	}
 	if strings.Contains(joined, "{}") || strings.Contains(joined, "-I") {
 		t.Fatalf("capability facts leaked brace or flag syntax: %v", braced)
+	}
+}
+
+func TestEditedUnprobedToolRendersHonestFactWithoutWarning(t *testing.T) {
+	model := submitIntent(t, NewFromDeps(Deps{
+		Provider: stubProvider{candidates: []provider.Candidate{{
+			Command:     "pwd",
+			Explanation: "current directory",
+		}}},
+		InventorySource: staticInventorySource{},
+	}), "list files")
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	model = updated.(Model)
+	model.commandInput.SetValue("ls -la")
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	model.contextExpanded = true
+
+	if model.applicability.Decision != applicability.Applicable || len(model.applicability.Reasons) != 0 {
+		t.Fatalf("edited ls applicability = %+v, want no claim about an unprobed tool", model.applicability)
+	}
+	view := stripANSI(model.View())
+	if strings.Contains(view, "may not work") {
+		t.Fatalf("edited ls review shows a false applicability warning: %q", view)
+	}
+	if !strings.Contains(view, "tool ls: not probed (outside the fixed inventory)") {
+		t.Fatalf("edited ls review missing honest capability fact: %q", view)
 	}
 }

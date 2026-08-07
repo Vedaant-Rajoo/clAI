@@ -27,7 +27,7 @@ func EvaluateEdited(command string, inventory Inventory) Result {
 			seen[resolved.Base] = true
 			tools = append(tools, resolved.Base)
 			fact, known := inventory.LookupTool(resolved.Base)
-			if !known || !fact.Present {
+			if known && !fact.Present {
 				missing = append(missing, resolved.Base)
 			}
 		}
@@ -38,7 +38,7 @@ func EvaluateEdited(command string, inventory Inventory) Result {
 	}
 	reasons := make([]string, len(missing))
 	for index, name := range missing {
-		reasons[index] = fmt.Sprintf("tool %s: may not work (not present in capability inventory)", name)
+		reasons[index] = fmt.Sprintf("tool %s: may not work (not installed)", name)
 	}
 	return Result{Decision: Marked, Reasons: reasons, Tools: tools}
 }

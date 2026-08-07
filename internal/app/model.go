@@ -239,6 +239,19 @@ func (m *Model) cancelActiveCompile() {
 	m.activeRequest = 0
 }
 
+func (m *Model) returnToInput() {
+	m.candidate = provider.Candidate{}
+	m.command = ""
+	m.explanation = ""
+	m.accepted = false
+	m.edited = false
+	m.applicability = applicability.Result{}
+	m.input.SetValue(m.intent)
+	m.input.CursorEnd()
+	m.input.Focus()
+	m.screen = screenInput
+}
+
 func configureCursor(input *textinput.Model) {
 	input.Cursor.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 	input.Cursor.SetMode(cursor.CursorStatic)
@@ -349,6 +362,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.screen = screenInput
 				return m, nil
 			}
+			if m.screen == screenReview || m.screen == screenNoSuggestion {
+				m.returnToInput()
+				return m, nil
+			}
 
 			return m, tea.Quit
 		case "enter":
@@ -362,7 +379,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			if m.screen == screenReview {
-				if _, canAccept := acceptVerb(m.safety.Decision, m.validation.Valid, m.applicability.Decision); !canAccept {
+				if _, canAccept := acceptVerb(m.safety.Decision, m.validation.Class, m.applicability.Decision); !canAccept {
 					return m, nil
 				}
 				m.accepted = true
@@ -381,16 +398,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "b":
 			if m.screen == screenReview || m.screen == screenNoSuggestion {
-				m.candidate = provider.Candidate{}
-				m.command = ""
-				m.explanation = ""
-				m.accepted = false
-				m.edited = false
-				m.applicability = applicability.Result{}
-				m.input.SetValue(m.intent)
-				m.input.CursorEnd()
-				m.input.Focus()
-				m.screen = screenInput
+				m.returnToInput()
 				return m, nil
 			}
 		case "r":
@@ -505,7 +513,7 @@ func (m Model) inputView() string {
 	if m.err != nil {
 		sections = append(sections, blockStyle.Render("Error: "+textsafe.Visible(m.err.Error())))
 	}
-	sections = append(sections, mutedStyle.Render("enter submit · esc quit"))
+	sections = append(sections, mutedStyle.Render("enter submit · esc/ctrl+c quit"))
 	return m.fitSections(sections)
 }
 
@@ -514,6 +522,7 @@ func (m Model) loadingView() string {
 		headerStyle.Render("What do you want to do?"),
 		textsafe.Visible(m.intent),
 		m.spinner.View() + mutedStyle.Render("Compiling suggestion..."),
+		mutedStyle.Render("esc cancel · ctrl+c quit"),
 	})
 }
 
@@ -538,12 +547,16 @@ func (m Model) devEndpointBanner() string {
 func (m Model) reviewView() string {
 	command := commandStyle.Render(textsafe.Visible(m.command))
 	status := statusLine(m.validation, m.safety, m.applicability)
-	actions := mutedStyle.Render(reviewActions(m.safety.Decision, m.validation.Valid, m.applicability.Decision, m.whyExpanded, m.contextExpanded))
+	actions := mutedStyle.Render(reviewActions(m.safety.Decision, m.validation.Class, m.applicability.Decision, m.whyExpanded, m.contextExpanded))
 
 	reasons := reviewReasons(m.validation, m.safety, m.applicability)
 	why := ""
 	if m.whyExpanded {
-		why = section("Why", textsafe.Visible(m.explanation))
+		title := "Why"
+		if m.edited {
+			title = "Explanation for the original suggestion"
+		}
+		why = section(title, textsafe.Visible(m.explanation))
 	}
 	usedContext := ""
 	if m.contextExpanded {
@@ -628,7 +641,7 @@ func (m Model) editCommandView() string {
 	return m.fitSections(m.withDevBanner([]string{
 		headerStyle.Render("Edit command"),
 		m.commandInput.View(),
-		mutedStyle.Render("enter save · esc discard"),
+		mutedStyle.Render("enter save · esc discard · ctrl+c quit"),
 	}))
 }
 
@@ -646,7 +659,7 @@ func (m Model) noSuggestionView() string {
 		headerStyle.Render("No suggestion"),
 		section("Intent", textsafe.Visible(m.intent)),
 		"The provider returned no command candidate.",
-		mutedStyle.Render("enter/r retry · b back · esc cancel"),
+		mutedStyle.Render("enter/r retry · b/esc back · ctrl+c quit"),
 	}))
 }
 
@@ -729,8 +742,11 @@ func relevantCapabilityLines(inventory applicability.Inventory, requirements []c
 }
 
 func toolCapabilityLine(inventory applicability.Inventory, name string) string {
-	status := "absent"
-	if fact, known := inventory.LookupTool(name); known && fact.Present {
+	fact, known := inventory.LookupTool(name)
+	status := "not probed (outside the fixed inventory)"
+	if known && !fact.Present {
+		status = "absent"
+	} else if known {
 		status = "present"
 		if fact.Version.Known() {
 			status += " " + fact.Version.String()
@@ -757,9 +773,12 @@ func cloneCandidate(candidate provider.Candidate) provider.Candidate {
 // statusLine names all three independent gates in words so the review remains
 // understandable without color; styling only reinforces those words.
 func statusLine(validation validate.Result, result safety.Result, appResult applicability.Result) string {
-	validity := allowStyle.Render("valid")
-	if !validation.Valid {
-		validity = blockStyle.Render("invalid")
+	validity := blockStyle.Render(string(validate.Invalid))
+	switch validation.Class {
+	case validate.Valid:
+		validity = allowStyle.Render(string(validate.Valid))
+	case validate.Warning:
+		validity = warnStyle.Render(string(validate.Warning))
 	}
 	decision := decisionStyle(result.Decision).Render(string(result.Decision))
 	appWord := "applicable"
@@ -775,12 +794,12 @@ func statusLine(validation validate.Result, result safety.Result, appResult appl
 	return strings.Join([]string{validity, decision, appStyle.Render(appWord)}, mutedStyle.Render(" · "))
 }
 
-// reviewReasons renders the sanitized reasons behind a non-allow or invalid
-// decision, validation reasons first. It returns an empty string when the
-// command is both valid and allowed, keeping the default review screen minimal.
+// reviewReasons renders the sanitized reasons behind a non-allow, validation
+// warning/invalidity, or applicability mark, with validation reasons first. It
+// returns an empty string only when every gate has no reason to show.
 func reviewReasons(validation validate.Result, result safety.Result, appResult applicability.Result) string {
 	var reasons []string
-	if !validation.Valid {
+	if validation.Class != validate.Valid {
 		reasons = append(reasons, validation.Reasons...)
 	}
 	if result.Decision != safety.Allow {
@@ -823,9 +842,9 @@ func decisionStyle(decision safety.Decision) lipgloss.Style {
 // acceptVerb names the outcome of pressing enter on the review screen and
 // reports whether accepting is permitted. The enter gate and the action hint
 // both derive from it, so the two can never drift.
-func acceptVerb(decision safety.Decision, valid bool, appDecision applicability.Decision) (string, bool) {
+func acceptVerb(decision safety.Decision, validity validate.Class, appDecision applicability.Decision) (string, bool) {
 	switch {
-	case !valid:
+	case validity != validate.Valid && validity != validate.Warning:
 		return "invalid", false
 	case decision == safety.Block:
 		return "blocked", false
@@ -838,9 +857,10 @@ func acceptVerb(decision safety.Decision, valid bool, appDecision applicability.
 // reviewActions builds the single action hint line. The leading "enter <verb>"
 // token names the accept outcome in words (accept/blocked/invalid) so the
 // consequence of pressing enter is legible without color, and the "?"/"c" hints
-// reflect whether each disclosure section is currently open.
-func reviewActions(decision safety.Decision, valid bool, appDecision applicability.Decision, whyExpanded, contextExpanded bool) string {
-	verb, _ := acceptVerb(decision, valid, appDecision)
+// reflect whether each disclosure section is currently open. Esc returns to the
+// input screen; Ctrl-C remains the review-screen quit action.
+func reviewActions(decision safety.Decision, validity validate.Class, appDecision applicability.Decision, whyExpanded, contextExpanded bool) string {
+	verb, _ := acceptVerb(decision, validity, appDecision)
 
 	why := "? why"
 	if whyExpanded {
@@ -857,7 +877,7 @@ func reviewActions(decision safety.Decision, valid bool, appDecision applicabili
 		"e edit",
 		why,
 		usedContext,
-		"b back",
-		"esc cancel",
+		"b/esc back",
+		"ctrl+c quit",
 	}, " · ")
 }

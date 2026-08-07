@@ -32,8 +32,9 @@ func TestApplicabilityTruthTable(t *testing.T) {
 		os:    "darwin",
 		shell: capability.ShellFish,
 		tools: map[string]capability.ToolFact{
-			"rg":  {Name: "rg", Present: true, Version: "14.1.0"},
-			"git": {Name: "git", Present: true},
+			"rg":   {Name: "rg", Present: true, Version: "14.1.0"},
+			"git":  {Name: "git", Present: true},
+			"grep": {Name: "grep", Present: false},
 		},
 	}
 	tests := []struct {
@@ -59,7 +60,7 @@ func TestApplicabilityTruthTable(t *testing.T) {
 		}, want: Marked, wantReasons: 1},
 		{name: "outside inventory", requirements: []capability.Requirement{
 			requirement(capability.RequirementTool, "python", ""),
-		}, want: Marked, wantReasons: 1},
+		}, want: Applicable},
 		{name: "unknown version", requirements: []capability.Requirement{
 			requirement(capability.RequirementTool, "git", "2.40"),
 		}, want: Marked, wantReasons: 1},
@@ -141,13 +142,14 @@ func TestUnknownMachineValueHardRejects(t *testing.T) {
 
 func TestEditReviewDerivesExecutablesFromBytes(t *testing.T) {
 	inventory := fixtureInventory{tools: map[string]capability.ToolFact{
-		"rg": {Name: "rg", Present: true},
+		"rg":      {Name: "rg", Present: true},
+		"missing": {Name: "missing", Present: false},
 	}}
 	result := EvaluateEdited("env FOO=bar /usr/bin/rg TODO | command missing --flag", inventory)
 	if result.Decision != Marked {
 		t.Fatalf("decision = %q, want marked", result.Decision)
 	}
-	want := []string{"tool missing: may not work (not present in capability inventory)"}
+	want := []string{"tool missing: may not work (not installed)"}
 	if !reflect.DeepEqual(result.Reasons, want) {
 		t.Fatalf("reasons = %v, want %v", result.Reasons, want)
 	}
@@ -159,14 +161,15 @@ func TestEditReviewDerivesExecutablesFromBytes(t *testing.T) {
 // The marks stay soft, so such a command remains exportable after acceptance.
 func TestEditedBraceCommandsDeriveExecutables(t *testing.T) {
 	inventory := fixtureInventory{tools: map[string]capability.ToolFact{
-		"du": {Name: "du", Present: true},
+		"du":    {Name: "du", Present: true},
+		"xargs": {Name: "xargs", Present: false},
 	}}
 
 	result := EvaluateEdited("xargs -I{} du -h {}", inventory)
 	if result.Decision != Marked {
 		t.Fatalf("decision = %q, want a soft mark for the absent xargs", result.Decision)
 	}
-	want := []string{"tool xargs: may not work (not present in capability inventory)"}
+	want := []string{"tool xargs: may not work (not installed)"}
 	if !reflect.DeepEqual(result.Reasons, want) {
 		t.Fatalf("reasons = %v, want %v", result.Reasons, want)
 	}
@@ -184,6 +187,25 @@ func TestEditedBraceCommandsDeriveExecutables(t *testing.T) {
 	// applicability assertion is made and structural validation decides.
 	if got := EvaluateEdited("{}/echo", inventory); got.Decision != Applicable || len(got.Reasons) != 0 {
 		t.Fatalf("EvaluateEdited({}/echo) = %+v, want no applicability assertion", got)
+	}
+}
+
+func TestUnprobedToolsDoNotProduceApplicabilityWarnings(t *testing.T) {
+	inventory := fixtureInventory{tools: map[string]capability.ToolFact{}}
+
+	modelResult := Evaluate([]capability.Requirement{
+		requirement(capability.RequirementTool, "ls", ""),
+	}, inventory)
+	if modelResult.Decision != Applicable || len(modelResult.Reasons) != 0 {
+		t.Fatalf("Evaluate(unprobed ls) = %+v, want applicable without a false warning", modelResult)
+	}
+
+	editedResult := EvaluateEdited("ls -la", inventory)
+	if editedResult.Decision != Applicable || len(editedResult.Reasons) != 0 {
+		t.Fatalf("EvaluateEdited(unprobed ls) = %+v, want applicable without a false warning", editedResult)
+	}
+	if !reflect.DeepEqual(editedResult.Tools, []string{"ls"}) {
+		t.Fatalf("EvaluateEdited(unprobed ls).Tools = %v, want the unprobed fact retained for rendering", editedResult.Tools)
 	}
 }
 

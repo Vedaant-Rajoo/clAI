@@ -42,6 +42,8 @@ var (
 	// ErrAuth reports a rejected credential (HTTP 401/403). The API key is
 	// never included in the error.
 	ErrAuth = errors.New("openrouter: authentication error")
+	// ErrInvalidRequest reports a rejected request or model (HTTP 400/404/422).
+	ErrInvalidRequest = errors.New("openrouter: invalid request")
 	// ErrRateLimited reports throttling (HTTP 429).
 	ErrRateLimited = errors.New("openrouter: rate limited")
 	// ErrServer reports a transient upstream failure (HTTP 5xx).
@@ -143,12 +145,16 @@ func (p Provider) Compile(ctx context.Context, request provider.Request) ([]prov
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	requestContext, cancel := context.WithTimeout(httpRequest.Context(), timeout)
+	timeoutErr := fmt.Errorf("openrouter: request timed out after %s: %w", timeout, context.DeadlineExceeded)
+	requestContext, cancel := context.WithTimeoutCause(httpRequest.Context(), timeout, timeoutErr)
 	defer cancel()
 	httpRequest = httpRequest.WithContext(requestContext)
 
 	response, err := client.Do(httpRequest)
 	if err != nil {
+		if contextErr := context.Cause(requestContext); contextErr != nil {
+			return nil, contextErr
+		}
 		return nil, fmt.Errorf("openrouter: %w", err)
 	}
 	defer response.Body.Close()
@@ -157,7 +163,7 @@ func (p Provider) Compile(ctx context.Context, request provider.Request) ([]prov
 	}
 	responseBytes, err := readResponseBody(response.Body)
 	if err != nil {
-		if contextErr := requestContext.Err(); contextErr != nil {
+		if contextErr := context.Cause(requestContext); contextErr != nil {
 			return nil, contextErr
 		}
 		return nil, err
@@ -223,6 +229,8 @@ func classifyHTTPError(response *http.Response) error {
 	switch {
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:
 		return fmt.Errorf("%w (HTTP %d): re-authenticate or check the API key (run `clai auth login --provider openrouter` or set OPENROUTER_API_KEY)", ErrAuth, status)
+	case status == http.StatusBadRequest || status == http.StatusNotFound || status == http.StatusUnprocessableEntity:
+		return fmt.Errorf("%w (HTTP %d): the request or model was rejected; check --model", ErrInvalidRequest, status)
 	case status == http.StatusTooManyRequests:
 		if retry := sanitizeRetryAfter(response.Header.Get("Retry-After")); retry != "" {
 			return fmt.Errorf("%w (HTTP %d): retry after %s, then back off before retrying", ErrRateLimited, status, retry)

@@ -169,11 +169,28 @@ func TestDeadlineExceededIsVisibleFailureWithNoExport(t *testing.T) {
 	if m.screen != screenInput || !errors.Is(m.err, context.DeadlineExceeded) {
 		t.Fatalf("deadline result: screen=%v err=%v", m.screen, m.err)
 	}
+	if got, want := m.err.Error(), "compile timed out after 2m0s: context deadline exceeded"; got != want {
+		t.Fatalf("deadline error = %q, want %q", got, want)
+	}
 	if !strings.Contains(m.View(), "Error:") {
 		t.Fatalf("deadline failure is not visible: %q", m.View())
 	}
 	if m.Accepted() || m.Command() != "" {
 		t.Fatalf("deadline exposed command: accepted=%v command=%q", m.Accepted(), m.Command())
+	}
+}
+
+func TestProviderLabeledDeadlineIsNotRelabeledAsOuterTimeout(t *testing.T) {
+	providerErr := fmt.Errorf("openrouter: request timed out after 30s: %w", context.DeadlineExceeded)
+	m := submitIntent(t, NewWithProvider(stubProvider{err: providerErr}), "anything")
+	if m.screen != screenInput || !errors.Is(m.err, context.DeadlineExceeded) {
+		t.Fatalf("deadline result: screen=%v err=%v", m.screen, m.err)
+	}
+	if got := m.err.Error(); got != providerErr.Error() {
+		t.Fatalf("deadline error = %q, want provider label %q", got, providerErr)
+	}
+	if strings.Contains(m.err.Error(), compileTimeout.String()) {
+		t.Fatalf("provider deadline was relabeled with outer timeout: %v", m.err)
 	}
 }
 

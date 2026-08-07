@@ -299,9 +299,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input.Focus()
 			if !errors.Is(msg.err, context.Canceled) {
 				m.err = msg.err
-				if errors.Is(msg.err, context.DeadlineExceeded) {
+				if msg.err == context.DeadlineExceeded {
 					// Keep the deadline in the error chain (errors.Is still matches)
 					// while giving the user a plain-language reason on the input screen.
+					// A provider-labeled inner deadline stays intact instead of being
+					// misleadingly relabeled with the outer compile timeout.
 					m.err = fmt.Errorf("compile timed out after %s: %w", compileTimeout, msg.err)
 				}
 			}

@@ -64,7 +64,7 @@ func TestEvaluateStructuralPolicyMatrix(t *testing.T) {
 		{name: "git stash drop blocks", command: "git stash drop", decision: Block, reason: "destructive operation"},
 		{name: "git stash clear blocks", command: "git stash clear", decision: Block, reason: "destructive operation"},
 		{name: "git push without force warns", command: "git push origin main", decision: Warn, reason: "not recognized"},
-		{name: "git branch delete merged unchanged allows", command: "git branch -d merged", decision: Allow, reason: "read-only"},
+		{name: "git branch delete merged warns", command: "git branch -d merged", decision: Warn, reason: "may modify repository state"},
 		{name: "git attached directory status allows", command: "git -C/tmp/repo status", decision: Allow, reason: "read-only"},
 		{name: "git add warns", command: "git add .", decision: Warn, reason: "repository state"},
 		{name: "docker pull warns", command: "docker pull image", decision: Warn, reason: "Docker command"},
@@ -82,6 +82,165 @@ func TestEvaluateStructuralPolicyMatrix(t *testing.T) {
 			}
 			if !containsReason(result.Reasons, tt.reason) {
 				t.Fatalf("Evaluate(%q).Reasons = %#v, want fragment %q", tt.command, result.Reasons, tt.reason)
+			}
+		})
+	}
+}
+
+func TestEvaluateArgumentSensitiveAllowList(t *testing.T) {
+	tests := []struct {
+		name     string
+		command  string
+		decision Decision
+		reason   string
+	}{
+		{name: "find delete warns", command: "find / -delete", decision: Warn, reason: "delete files"},
+		{name: "find fprint warns", command: "find . -fprint results.txt", decision: Warn, reason: "write results"},
+		{name: "find fprint0 warns", command: "find . -fprint0 results.bin", decision: Warn, reason: "write results"},
+		{name: "find fprintf warns", command: `find . -fprintf results.txt '%p\n'`, decision: Warn, reason: "write results"},
+		{name: "find fls warns", command: "find . -fls results.txt", decision: Warn, reason: "write results"},
+		{name: "go run warns", command: "go run x.go", decision: Warn, reason: "may execute code"},
+		{name: "go generate warns", command: "go generate ./...", decision: Warn, reason: "may execute code"},
+		{name: "go install warns", command: "go install example.test/tool@latest", decision: Warn, reason: "may execute code"},
+		{name: "go get warns", command: "go get example.test/mod", decision: Warn, reason: "may execute code"},
+		{name: "go env write warns", command: "go env -w GOPROXY=direct", decision: Warn, reason: "persistently change"},
+		{name: "go env unset warns", command: "go env -u GOPROXY", decision: Warn, reason: "persistently change"},
+		{name: "go list allows", command: "go list ./...", decision: Allow, reason: "read-only"},
+		{name: "go env allows", command: "go env GOPATH", decision: Allow, reason: "read-only"},
+		{name: "go version allows", command: "go version", decision: Allow, reason: "read-only"},
+		{name: "go doc allows", command: "go doc fmt", decision: Allow, reason: "read-only"},
+		{name: "go vet allows", command: "go vet ./...", decision: Allow, reason: "read-only"},
+		{name: "go vet custom tool warns", command: "go vet -vettool=custom-vet ./...", decision: Warn, reason: "custom analysis tool"},
+		{name: "go test warns specifically", command: "go test ./...", decision: Warn, reason: "compiles and runs"},
+		{name: "git branch create warns", command: "git branch feature", decision: Warn, reason: "may modify repository state"},
+		{name: "git branch delete warns", command: "git branch -d feature", decision: Warn, reason: "may modify repository state"},
+		{name: "git branch move warns", command: "git branch -m old new", decision: Warn, reason: "may modify repository state"},
+		{name: "git branch list allows", command: "git branch --list 'feature/*'", decision: Allow, reason: "read-only"},
+		{name: "git branch show current allows", command: "git branch --show-current", decision: Allow, reason: "read-only"},
+		{name: "git remote remove warns", command: "git remote remove origin", decision: Warn, reason: "may modify repository state"},
+		{name: "git remote update warns", command: "git remote update", decision: Warn, reason: "may modify repository state"},
+		{name: "git remote prune warns", command: "git remote prune origin", decision: Warn, reason: "may modify repository state"},
+		{name: "git remote list allows", command: "git remote -v", decision: Allow, reason: "read-only"},
+		{name: "git remote get url allows", command: "git remote get-url origin", decision: Allow, reason: "read-only"},
+		{name: "git tag create warns", command: "git tag release", decision: Warn, reason: "may modify repository state"},
+		{name: "git tag delete warns", command: "git tag -d release", decision: Warn, reason: "may modify repository state"},
+		{name: "git tag list allows", command: "git tag --list 'v*'", decision: Allow, reason: "read-only"},
+		{name: "git tag verify allows", command: "git tag --verify release", decision: Allow, reason: "read-only"},
+		{name: "rg pre warns", command: "rg --pre=sh p", decision: Warn, reason: "external preprocessor: sh"},
+		{name: "rg destructive pre blocks", command: "rg --pre='rm -rf' p", decision: Block, reason: "destructive executable: rm"},
+		{name: "rg pre after option terminator is data", command: "rg -- --pre=sh", decision: Allow, reason: "read-only"},
+		{name: "date set warns", command: "date -s tomorrow", decision: Warn, reason: "system clock"},
+		{name: "date format allows", command: "date '+%F'", decision: Allow, reason: "read-only"},
+		{name: "hostname set warns", command: "hostname new-name", decision: Warn, reason: "system hostname"},
+		{name: "hostname query allows", command: "hostname -f", decision: Allow, reason: "read-only"},
+		{name: "ifconfig up warns", command: "ifconfig en0 up", decision: Warn, reason: "network interface state"},
+		{name: "ifconfig down warns", command: "ifconfig en0 down", decision: Warn, reason: "network interface state"},
+		{name: "ifconfig bare up warns", command: "ifconfig up", decision: Warn, reason: "network interface state"},
+		{name: "ifconfig interface query allows", command: "ifconfig en0", decision: Allow, reason: "read-only"},
+		{name: "sort output warns", command: "sort -o output.txt input.txt", decision: Warn, reason: "write output"},
+		{name: "printf assignment warns", command: "printf -v name value", decision: Warn, reason: "assign a shell variable"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := Evaluate(tt.command)
+			if result.Decision != tt.decision || !containsReason(result.Reasons, tt.reason) {
+				t.Fatalf("Evaluate(%q) = %#v, want %q with %q", tt.command, result, tt.decision, tt.reason)
+			}
+		})
+	}
+}
+
+func TestEvaluatePassThroughDispatchers(t *testing.T) {
+	tests := []struct {
+		name     string
+		command  string
+		decision Decision
+		reason   string
+	}{
+		{name: "xargs destructive command blocks", command: "xargs rm -rf", decision: Block, reason: "destructive executable: rm"},
+		{name: "xargs options preserve block", command: "xargs -0 -n 1 /bin/rm -rf", decision: Block, reason: "destructive executable: rm"},
+		{name: "bsd xargs options preserve block", command: "xargs -J % -R 1 rm -rf", decision: Block, reason: "destructive executable: rm"},
+		{name: "timeout destructive command blocks", command: "timeout -k 1s 10s rm -rf", decision: Block, reason: "destructive executable: rm"},
+		{name: "nice elevated command blocks", command: "nice -n 5 sudo whoami", decision: Block, reason: "elevated-privilege executable: sudo"},
+		{name: "nohup shell evaluation blocks", command: "nohup sh -c 'printf ok'", decision: Block, reason: "shell command-string evaluation"},
+		{name: "stdbuf destructive command blocks", command: "stdbuf -oL rm file", decision: Block, reason: "destructive executable: rm"},
+		{name: "setsid destructive command blocks", command: "setsid --wait rm file", decision: Block, reason: "destructive executable: rm"},
+		{name: "nested dispatchers block", command: "timeout 5 nice -n 1 xargs rm -rf", decision: Block, reason: "destructive executable: rm"},
+		{name: "read only xargs allows", command: "xargs -I{} du -h {}", decision: Allow, reason: "read-only"},
+		{name: "read only timeout allows", command: "timeout 5 rg TODO", decision: Allow, reason: "read-only"},
+		{name: "replacement in dispatched executable warns", command: "xargs -I{} {}/echo value", decision: Warn, reason: "brace replacement syntax"},
+		{name: "replacement cannot hide destructive base", command: "xargs -I{} {}/rm value", decision: Block, reason: "destructive executable: rm"},
+		{name: "unknown xargs option warns", command: "xargs --future-option rm", decision: Warn, reason: "could not be resolved safely"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := Evaluate(tt.command)
+			if result.Decision != tt.decision || !containsReason(result.Reasons, tt.reason) {
+				t.Fatalf("Evaluate(%q) = %#v, want %q with %q", tt.command, result, tt.decision, tt.reason)
+			}
+		})
+	}
+}
+
+func TestEvaluateBundledCompilerCommandsUseSpecificPolicy(t *testing.T) {
+	tests := []struct {
+		command  string
+		decision Decision
+	}{
+		{"rg TODO", Allow},
+		{"grep -r TODO .", Allow},
+		{"git status", Allow},
+		{"git diff", Allow},
+		{"git diff --cached", Allow},
+		{"git log --oneline -10", Allow},
+		{"git branch --show-current", Allow},
+		{"git remote -v", Allow},
+		{"git tag --list", Allow},
+		{"pwd", Allow},
+		{"ls -la", Allow},
+		{"find . -type d", Allow},
+		{"find . -type f | wc -l", Allow},
+		{"find . -type f -mtime -1", Allow},
+		{"du -ah . | sort -hr | head -20", Allow},
+		{"du -sh .", Allow},
+		{"df -h", Allow},
+		{"rg 'TODO|FIXME'", Allow},
+		{"rg <pattern>", Warn},
+		{"go test ./...", Warn},
+		{"go vet ./...", Allow},
+		{"go list ./...", Allow},
+		{"ps aux", Allow},
+		{"lsof -iTCP -sTCP:LISTEN -n -P", Allow},
+		{"printenv", Allow},
+		{"printenv PATH", Allow},
+		{"printenv SHELL", Allow},
+		{"hostname", Allow},
+		{"ifconfig", Allow},
+		{"date", Allow},
+		{"docker ps", Allow},
+		{"docker images", Allow},
+		// These filters are part of the bundled-rule vocabulary even when a
+		// particular compiler revision does not currently select each one.
+		{"uniq input.txt", Allow},
+		{"tail -20 input.txt", Allow},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.command, func(t *testing.T) {
+			result := Evaluate(tt.command)
+			if result.Decision != tt.decision {
+				t.Fatalf("Evaluate(%q) = %#v, want %q", tt.command, result, tt.decision)
+			}
+			if containsReason(result.Reasons, "not recognized by the local safety policy") {
+				t.Fatalf("Evaluate(%q) used generic policy fallback: %#v", tt.command, result)
+			}
+			if tt.command == "go test ./..." && !containsReason(result.Reasons, "compiles and runs") {
+				t.Fatalf("Evaluate(%q) = %#v, want specific execution warning", tt.command, result)
+			}
+			if tt.command == "rg <pattern>" && !containsReason(result.Reasons, "missing its target") {
+				t.Fatalf("Evaluate(%q) = %#v, want specific malformed-placeholder warning", tt.command, result)
 			}
 		})
 	}

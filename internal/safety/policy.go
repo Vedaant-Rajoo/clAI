@@ -55,13 +55,7 @@ func Evaluate(command string) Result {
 	parsed := shellsyntax.Parse(command)
 	for _, pipeline := range parsed.List.Pipelines {
 		for commandIndex, simple := range pipeline.Commands {
-			resolved := shellsyntax.ResolveExecutable(simple)
-			if !resolved.Found {
-				resolved = resolveEnvSplitDispatch(simple)
-			}
-			if !resolved.Found {
-				resolved = resolveUnsupportedDispatch(simple)
-			}
+			resolved := resolveExecutable(simple)
 			if resolved.Found {
 				classifyExecutable(resolved, commandIndex, len(pipeline.Commands), add)
 			} else if len(simple.Words) > 0 || len(simple.Redirects) > 0 {
@@ -79,9 +73,30 @@ func Evaluate(command string) Result {
 }
 
 func classifyExecutable(resolved shellsyntax.ExecutableResolution, commandIndex, commandCount int, add func(Decision, string)) {
+	classifyExecutableDepth(resolved, commandIndex, commandCount, 0, add)
+}
+
+func classifyExecutableDepth(resolved shellsyntax.ExecutableResolution, commandIndex, commandCount, depth int, add func(Decision, string)) {
 	base := resolved.Base
 	args := wordValues(resolved.Arguments)
 	gitArgs, gitCommandKnown := gitCommand(args)
+
+	if outcome := resolvePassThroughDispatcher(resolved); outcome.recognized {
+		if outcome.uncertain {
+			add(Warn, "A dispatched executable position contains unresolved brace replacement syntax.")
+		}
+		switch {
+		case outcome.noOp:
+			add(Allow, "Command appears to be read-only.")
+		case !outcome.resolved.Found:
+			add(Warn, "Command dispatched through "+base+" could not be resolved safely.")
+		case depth >= maxDispatcherDepth:
+			add(Warn, "Command dispatcher nesting exceeds the safety analysis limit.")
+		default:
+			classifyExecutableDepth(outcome.resolved, commandIndex, commandCount, depth+1, add)
+		}
+		return
+	}
 
 	switch {
 	case slices.Contains([]string{"rm", "dd", "truncate", "mkfs", "mkfs.ext2", "mkfs.ext3", "mkfs.ext4", "mkfs.xfs", "mkfs.btrfs", "fdisk", "parted", "wipefs", "shutdown", "reboot", "halt", "poweroff", "kill", "pkill", "killall"}, base):
@@ -104,11 +119,31 @@ func classifyExecutable(resolved shellsyntax.ExecutableResolution, commandIndex,
 		add(Warn, "Git command may modify repository state.")
 	case base == "docker" && startsWithAnyArgument(args, "run", "build", "pull"):
 		add(Warn, "Docker command may create containers, build images, or download remote content.")
-	case base == "find" && dispatchesExternalCommand(args):
+	case base == "find" && findDispatchesExternalCommand(args):
 		add(Warn, "Command dispatches an external command through find -exec.")
-	case slices.Contains([]string{"pwd", "ls", "find", "rg", "du", "df", "date", "hostname", "go", "ps", "lsof", "printenv", "printf", "ifconfig", "echo"}, base):
+	case base == "find" && findMayModify(args):
+		add(Warn, "Find command may delete files or write results to a file.")
+	case base == "rg":
+		classifyRipgrep(resolved.Arguments, commandIndex, commandCount, depth, add)
+	case base == "go":
+		classifyGo(args, add)
+	case base == "git" && gitCommandKnown && gitReadOnly(gitArgs):
 		add(Allow, "Command appears to be read-only.")
-	case base == "git" && gitCommandKnown && startsWithAnyArgument(gitArgs, "status", "diff", "log", "branch", "remote", "tag"):
+	case base == "git" && gitCommandKnown && startsWithAnyArgument(gitArgs, "branch", "remote", "tag"):
+		add(Warn, "Git "+gitArgs[0]+" command may modify repository state.")
+	case base == "git" && gitCommandKnown && startsWithAnyArgument(gitArgs, "diff", "log"):
+		add(Warn, "Git "+gitArgs[0]+" arguments may write output or dispatch an external program.")
+	case base == "date" && !dateReadOnly(args):
+		add(Warn, "Date arguments may set the system clock.")
+	case base == "hostname" && !hostnameReadOnly(args):
+		add(Warn, "Hostname arguments may change the system hostname.")
+	case base == "ifconfig" && !ifconfigReadOnly(args):
+		add(Warn, "Ifconfig arguments may change network interface state.")
+	case base == "sort" && sortMayWriteOrDispatch(args):
+		add(Warn, "Sort arguments may write output or dispatch an external program.")
+	case base == "printf" && printfMayAssign(args):
+		add(Warn, "Printf arguments may assign a shell variable.")
+	case slices.Contains([]string{"pwd", "ls", "find", "du", "df", "date", "hostname", "ps", "lsof", "printenv", "printf", "ifconfig", "echo", "grep", "wc", "sort", "head", "uniq", "tail"}, base):
 		add(Allow, "Command appears to be read-only.")
 	case base == "docker" && startsWithAnyArgument(args, "ps", "images"):
 		add(Allow, "Command appears to be read-only.")
@@ -116,6 +151,17 @@ func classifyExecutable(resolved shellsyntax.ExecutableResolution, commandIndex,
 		add(Warn, "Command is not recognized by the local safety policy: "+base+".")
 	}
 
+}
+
+func resolveExecutable(command shellsyntax.SimpleCommand) shellsyntax.ExecutableResolution {
+	resolved := shellsyntax.ResolveExecutable(command)
+	if !resolved.Found {
+		resolved = resolveEnvSplitDispatch(command)
+	}
+	if !resolved.Found {
+		resolved = resolveUnsupportedDispatch(command)
+	}
+	return resolved
 }
 
 // resolveEnvSplitDispatch handles env -S/--split-string without invoking env.
@@ -411,13 +457,13 @@ func startsWithAnyArgument(args []string, values ...string) bool {
 	return len(args) > 0 && slices.Contains(values, args[0])
 }
 
-// dispatchesExternalCommand reports whether find arguments hand a command to
+// findDispatchesExternalCommand reports whether find arguments hand a command to
 // find for execution. The dispatched command is find's own argument syntax, so
 // the executable it names is invisible to this policy: `find . -exec rm -rf . \;`
 // resolves to base `find` and would otherwise read as read-only. Such a command
 // warns rather than allows; it is not blocked, because the dispatched name is
 // not analyzed and a block would have to be speculative.
-func dispatchesExternalCommand(args []string) bool {
+func findDispatchesExternalCommand(args []string) bool {
 	for _, value := range args {
 		switch value {
 		case "-exec", "-execdir", "-ok", "-okdir":

@@ -13,7 +13,7 @@ func TestEvaluateBraceDataAndDispatch(t *testing.T) {
 	}{
 		// A brace pair in argument position is data, so the decision comes from
 		// the real executable and nothing else.
-		{name: "unrecognized executable with brace arguments warns", command: `xargs -I{} du -h {}`, decision: Warn},
+		{name: "read-only dispatched executable with brace arguments allows", command: `xargs -I{} du -h {}`, decision: Allow},
 		{name: "read-only executable with brace argument allows", command: `echo -I{}x`, decision: Allow},
 		{name: "brace inside a word allows", command: `echo a{}b`, decision: Allow},
 		{name: "brace in a leading assignment allows", command: `FOO={} echo ok`, decision: Allow},
@@ -66,6 +66,8 @@ func TestEvaluateFindExternalDispatch(t *testing.T) {
 		{name: "find execdir warns", command: `find . -execdir rm {} \;`, decision: Warn},
 		{name: "find ok warns", command: `find . -ok rm {} \;`, decision: Warn},
 		{name: "find okdir warns", command: `find . -okdir rm {} \;`, decision: Warn},
+		{name: "find delete warns", command: `find . -delete`, decision: Warn},
+		{name: "find fprint warns", command: `find . -fprint results.txt`, decision: Warn},
 		// The flag is matched as a whole argument, so lookalike values do not
 		// trigger it.
 		{name: "find with exec-like filename allows", command: `find . -name -exec-notes`, decision: Allow},

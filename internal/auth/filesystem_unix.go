@@ -47,15 +47,15 @@ type credentialFileSnapshot struct {
 }
 
 type credentialOperation struct {
-	directories                  []*credentialDirectory
-	locks                        []*credentialLock
-	snapshots                    []*credentialFileSnapshot
-	tempDirectory                *credentialDirectory
-	temp                         *os.File
-	tempName                     string
-	tempExists                   bool
-	installed                    bool
-	preserveInstalledOnBodyError bool
+	directories                 []*credentialDirectory
+	locks                       []*credentialLock
+	snapshots                   []*credentialFileSnapshot
+	tempDirectory               *credentialDirectory
+	temp                        *os.File
+	tempName                    string
+	tempInfo                    os.FileInfo
+	tempExists                  bool
+	installedVerificationFailed bool
 }
 
 func secureReadCredentialFiles(locations credentialFileLocations, provider string) (string, error) {
@@ -182,7 +182,7 @@ func removeStaleCredentialTemp(directory *credentialDirectory, locks []*credenti
 	file := os.NewFile(uintptr(fd), name)
 	defer func() {
 		if file != nil {
-			retErr = errors.Join(retErr, closeTempFile(file))
+			retErr = errors.Join(retErr, file.Close())
 		}
 	}()
 	info, err := file.Stat()
@@ -317,7 +317,6 @@ func secureCredentialFileOperation(
 	// At this point the preferred inode has been verified and its directory
 	// synced. A deterministic interruption now leaves a valid preferred file and
 	// the legacy source; retry observes preferred authority and finishes cleanup.
-	operation.preserveInstalledOnBodyError = true
 	if hook := credentialFilesystemHooks.afterPreferredInstallBeforeLegacyUnlink; hook != nil {
 		if err := hook(locations); err != nil {
 			return nil, fmt.Errorf("run post-install credential checkpoint: %w", err)
@@ -544,6 +543,7 @@ func installCredentialFile(
 	if err != nil {
 		return err
 	}
+	operation.tempInfo = tempInfo
 	operation.tempExists = true
 	if _, err := operation.temp.Write(out); err != nil {
 		return fmt.Errorf("write credential temporary file: %w", err)
@@ -570,19 +570,21 @@ func installCredentialFile(
 		return fmt.Errorf("replace credential file: %w", err)
 	}
 	operation.tempExists = false
-	operation.installed = true
 	if hook := credentialFilesystemHooks.afterRenameBeforeVerification; hook != nil {
 		if err := hook(directory.appPath, locations.preferred); err != nil {
 			return err
 		}
 	}
 	if err := verifyLockedCredentialState([]*credentialDirectory{directory}, operation.locks); err != nil {
+		operation.installedVerificationFailed = true
 		return err
 	}
 	if err := verifyNamedFile(directory.app, fileName, tempInfo, false); err != nil {
+		operation.installedVerificationFailed = true
 		return fmt.Errorf("verify replaced credential file: %w", err)
 	}
 	if err := verifyCredentialLinkCount(operation.temp, 1); err != nil {
+		operation.installedVerificationFailed = true
 		return fmt.Errorf("verify replaced credential link count: %w", err)
 	}
 	if err := syncCredentialDirectory(int(directory.app.Fd())); err != nil {
@@ -698,38 +700,27 @@ func (operation *credentialOperation) finalize(bodyErr error) error {
 		if err := unlinkTempFile(int(operation.tempDirectory.app.Fd()), operation.tempName); err != nil {
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove credential temporary file: %w", err))
 		}
-		cleanupErr = errors.Join(cleanupErr, closeTempFile(operation.temp))
+		cleanupErr = errors.Join(cleanupErr, operation.temp.Close())
 		operation.temp = nil
 		cleanupErr = errors.Join(cleanupErr, releaseOrderedCredentialLocks(operation.locks))
 		cleanupErr = errors.Join(cleanupErr, closeCredentialDirectories(operation.directories))
 		return errors.Join(bodyErr, cleanupErr)
 	}
 
-	var stable *os.File
-	fd, duplicateErr := unix.Dup(int(operation.temp.Fd()))
-	if duplicateErr != nil {
-		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("duplicate replaced credential descriptor: %w", duplicateErr))
-		stable = operation.temp
-	} else {
-		stable = os.NewFile(uintptr(fd), "replaced-credential")
-		cleanupErr = errors.Join(cleanupErr, closeTempFile(operation.temp))
-		operation.temp = nil
-	}
-	cleanupErr = errors.Join(cleanupErr, releaseOrderedCredentialLocks(operation.locks))
-	cleanupErr = errors.Join(cleanupErr, closeCredentialDirectories(operation.directories))
-
-	shouldErase := operation.installed && (cleanupErr != nil || (bodyErr != nil && !operation.preserveInstalledOnBodyError))
-	if shouldErase {
-		cleanupErr = errors.Join(cleanupErr, eraseCredentialFile(stable))
-	}
-	if stable != nil {
-		if stable == operation.temp {
-			cleanupErr = errors.Join(cleanupErr, closeTempFile(stable))
-			operation.temp = nil
-		} else {
-			cleanupErr = errors.Join(cleanupErr, stable.Close())
+	if operation.installedVerificationFailed {
+		// Keep erasure tied to the installed inode: truncate it through the held
+		// descriptor, then remove the name only if it still identifies that inode.
+		// Descriptor-cleanup errors below are surfaced without changing this policy.
+		eraseErr := eraseCredentialFile(operation.temp)
+		cleanupErr = errors.Join(cleanupErr, eraseErr)
+		if eraseErr == nil {
+			cleanupErr = errors.Join(cleanupErr, unlinkInstalledCredentialFile(operation.tempDirectory.app, operation.tempInfo))
 		}
 	}
+	cleanupErr = errors.Join(cleanupErr, operation.temp.Close())
+	operation.temp = nil
+	cleanupErr = errors.Join(cleanupErr, releaseOrderedCredentialLocks(operation.locks))
+	cleanupErr = errors.Join(cleanupErr, closeCredentialDirectories(operation.directories))
 	return errors.Join(bodyErr, cleanupErr)
 }
 
@@ -865,11 +856,7 @@ func (directory *credentialDirectory) close() error {
 		directory.app = nil
 	}
 	if directory.base != nil {
-		if hook := credentialFilesystemHooks.closeBaseDirectory; hook != nil {
-			baseErr = hook(directory.base)
-		} else {
-			baseErr = directory.base.Close()
-		}
+		baseErr = directory.base.Close()
 		directory.base = nil
 	}
 	if appErr != nil {
@@ -970,13 +957,6 @@ func closeCredentialFile(file *os.File) error {
 	return file.Close()
 }
 
-func closeTempFile(file *os.File) error {
-	if hook := credentialFilesystemHooks.closeTemp; hook != nil {
-		return hook(file)
-	}
-	return file.Close()
-}
-
 func createCredentialTemp(dir *os.File) (*os.File, string, os.FileInfo, error) {
 	for range 32 {
 		var random [12]byte
@@ -1020,6 +1000,19 @@ func eraseCredentialFile(file *os.File) error {
 		syncErr = file.Sync()
 	}
 	return errors.Join(truncateErr, syncErr)
+}
+
+func unlinkInstalledCredentialFile(dir *os.File, expected os.FileInfo) error {
+	if err := verifyNamedFile(dir, fileName, expected, false); err != nil {
+		return fmt.Errorf("verify erased credential file before removal: %w", err)
+	}
+	if err := unix.Unlinkat(int(dir.Fd()), fileName, 0); err != nil {
+		return fmt.Errorf("remove erased credential file: %w", err)
+	}
+	if err := syncCredentialDirectory(int(dir.Fd())); err != nil {
+		return fmt.Errorf("sync erased credential removal: %w", err)
+	}
+	return nil
 }
 
 func verifyNamedFile(dir *os.File, name string, expected os.FileInfo, lock bool) (retErr error) {

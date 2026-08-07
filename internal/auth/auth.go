@@ -68,9 +68,7 @@ type filesystemHooks struct {
 	unlockLock                              func(fd int) error
 	closeLock                               func(file *os.File) error
 	closeCredential                         func(file *os.File) error
-	closeTemp                               func(file *os.File) error
 	closeAppDirectory                       func(file *os.File) error
-	closeBaseDirectory                      func(file *os.File) error
 	syncDirectory                           func(fd int) error
 }
 

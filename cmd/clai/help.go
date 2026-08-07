@@ -30,6 +30,7 @@ Options must follow the subcommand and use the documented space-separated form.
 
 Subcommands:
   login      Sign in (OpenRouter browser flow, or paste an API key)
+             OpenAI credentials can be stored, but the provider is not usable yet.
   status     Show whether credentials are configured and their source
   logout     Remove stored credentials
 
@@ -174,7 +175,7 @@ Flags:
 Environment:
   CLAI_PROVIDER      default provider: rules | openrouter | anthropic
   CLAI_MODEL         default model for LLM providers
-  CLAI_DELIVERY      default delivery: clipboard | stdout | insert
+  CLAI_DELIVERY      default delivery: clipboard | stdout
 
 Flags override environment variables; both override config.json.
 

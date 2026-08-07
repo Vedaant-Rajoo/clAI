@@ -256,6 +256,9 @@ func (c cli) authLogin(provider string) int {
 		}
 		return c.storeKey(provider, key)
 	case "anthropic", "openai":
+		if provider == "openai" {
+			fmt.Fprintln(c.stdout, "OpenAI credentials can be stored, but the provider is not usable yet.")
+		}
 		fmt.Fprintf(c.stdout, "Paste your %s API key: ", provider)
 		key, err := readKey()
 		if err != nil {

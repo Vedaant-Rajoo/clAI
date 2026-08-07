@@ -191,11 +191,34 @@ func (c cli) runInteractive(args []string) int {
 	// user actually passed (CONF-03 adjacency edge).
 	explicit := map[string]bool{}
 	fs.Visit(func(fl *flag.Flag) { explicit[fl.Name] = true })
+	if explicit["provider"] {
+		if err := validateProviderName(*f.providerName); err != nil {
+			fmt.Fprintf(c.stderr, "clai: %v\nRun 'clai help' for usage.\n", err)
+			return exitUsage
+		}
+	}
 
-	// A standalone version request consumes no configuration. Keep combinations
-	// with other explicit flags on the normal validation path so invocation-local
-	// usage errors still take precedence over the version shortcut.
-	if *f.showVersion && len(explicit) == 1 {
+	// A version request consumes no configuration, credentials, or TUI state.
+	// Validate the invocation-local option relationships first so usage errors
+	// still take precedence when --version is combined with other flags.
+	if *f.showVersion {
+		resolvedProvider := *f.providerName
+		if resolvedProvider == "" {
+			resolvedProvider = "rules"
+		}
+		if err := validateProviderName(resolvedProvider); err != nil {
+			fmt.Fprintf(c.stderr, "clai: %v\nRun 'clai help' for usage.\n", err)
+			return exitUsage
+		}
+		devEndpoint, err := f.devEndpointOption(resolvedProvider)
+		if err != nil {
+			fmt.Fprintf(c.stderr, "clai: %v\nRun 'clai help' for usage.\n", err)
+			return exitUsage
+		}
+		if _, _, err := f.contextOptions(devEndpoint, resolvedProvider); err != nil {
+			fmt.Fprintf(c.stderr, "clai: %v\nRun 'clai help' for usage.\n", err)
+			return exitUsage
+		}
 		migrateLegacyConfigForRequestedOutput()
 		fmt.Fprintln(c.stdout, version)
 		return exitOK
@@ -205,7 +228,6 @@ func (c cli) runInteractive(args []string) int {
 	// config-selected provider validates --dev-endpoint and defaults the
 	// context policy exactly like a flag-selected one (CONF-03).
 	cfg, resolvedProvider, resolvedModel := c.resolveSettings(f.providerFlags)
-
 	// The endpoint is validated first because the context policy defaults on
 	// endpoint classification (REQ-CONTEXT-003, REQ-DEVENDPOINT-004).
 	devEndpoint, err := f.devEndpointOption(resolvedProvider)
@@ -269,6 +291,18 @@ func (c cli) runWidget(args []string) int {
 	if fs.NArg() != 0 || !shellinit.Supported(*f.shell) || *f.resultFile == "" {
 		fmt.Fprintln(c.stderr, "usage: clai widget --shell <fish|bash|zsh> --result-file <path>\nRun 'clai widget help' for usage.")
 		return exitUsage
+	}
+	explicitProvider := false
+	fs.Visit(func(fl *flag.Flag) {
+		if fl.Name == "provider" {
+			explicitProvider = true
+		}
+	})
+	if explicitProvider {
+		if err := validateProviderName(*f.providerName); err != nil {
+			fmt.Fprintf(c.stderr, "clai widget: %v\nRun 'clai widget help' for usage.\n", err)
+			return exitUsage
+		}
 	}
 	// The widget path performs the identical provider and model resolution as
 	// the interactive path (CONF-03) — skipping it here would silently break
@@ -692,7 +726,16 @@ func selectProvider(name, model, apiKey string, fallbackRules bool, policy machi
 	case "openai":
 		return nil, fmt.Errorf("provider %q is not implemented yet; use anthropic, openrouter, or rules", name)
 	default:
-		return nil, fmt.Errorf("unknown provider %q (known: rules, openrouter, anthropic)", name)
+		return nil, validateProviderName(name)
+	}
+}
+
+func validateProviderName(name string) error {
+	switch name {
+	case "", "rules", "openrouter", "anthropic", "openai":
+		return nil
+	default:
+		return fmt.Errorf("unknown provider %q (known: rules, openrouter, anthropic)", name)
 	}
 }
 

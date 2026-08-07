@@ -866,6 +866,43 @@ func TestAuthStatusExplicitKeyUsesStdoutWithoutDisclosure(t *testing.T) {
 	}
 }
 
+func TestAuthLoginOpenAIWarnsProviderIsNotUsable(t *testing.T) {
+	const secret = "openai-test-secret"
+	c, out, errOut := captureCLI()
+	c.authReadLine = func() (string, error) { return secret, nil }
+	c.authStore = func(providerName, key string) error {
+		if providerName != "openai" || key != secret {
+			t.Fatalf("store arguments = %q, %q", providerName, key)
+		}
+		return nil
+	}
+	c.authSourceWithError = func(providerName, explicit string) (string, error) {
+		if providerName != "openai" || explicit != "" {
+			t.Fatalf("source arguments = %q, %q", providerName, explicit)
+		}
+		return "config file", nil
+	}
+
+	if got := c.run([]string{"auth", "login", "--provider", "openai"}); got != exitOK {
+		t.Fatalf("exit = %d, want %d; stderr: %s", got, exitOK, errOut.String())
+	}
+	if errOut.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", errOut.String())
+	}
+	for _, want := range []string{
+		"OpenAI credentials can be stored, but the provider is not usable yet.",
+		"Paste your openai API key:",
+		"Stored openai credentials (config file).",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("stdout = %q, want to contain %q", out.String(), want)
+		}
+	}
+	if strings.Contains(out.String(), secret) {
+		t.Fatal("login output disclosed API key")
+	}
+}
+
 func TestAuthStatusNotAuthenticatedIncludesLoginHint(t *testing.T) {
 	c, out, errOut := captureCLI()
 	c.authSourceWithError = func(providerName, explicit string) (string, error) {

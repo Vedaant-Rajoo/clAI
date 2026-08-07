@@ -78,6 +78,7 @@ func TestMainHelpContent(t *testing.T) {
 		"--api-key", "--fallback-rules", "--context-policy", "--share-context", "--version",
 		"rules", "openrouter", "anthropic",
 		"clai help storage",
+		"CLAI_DELIVERY      default delivery: clipboard | stdout",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("main help missing %q", want)
@@ -85,6 +86,9 @@ func TestMainHelpContent(t *testing.T) {
 	}
 	if strings.Contains(out, "widget") {
 		t.Error("main help should not list the internal widget command")
+	}
+	if strings.Contains(out, "clipboard | stdout | insert") {
+		t.Error("main help documents the unsupported CLAI_DELIVERY=insert value")
 	}
 }
 
@@ -104,6 +108,7 @@ func TestAuthHelpContent(t *testing.T) {
 		"space-separated",
 		"--help",
 		"clai help storage",
+		"OpenAI credentials can be stored, but the provider is not usable yet.",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("auth help missing %q", want)

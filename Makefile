@@ -26,7 +26,11 @@ vet:
 	go vet ./...
 
 acceptance:
-	go run ./cmd/acceptance-check --spec .local/SPECIFICATION.md --manifest .local/acceptance-manifest.yaml --artifacts .local/artifacts.yaml
+	@if [ ! -d .local ]; then \
+		echo "==> acceptance skipped (.local/ inputs are not present)"; \
+	else \
+		go run ./cmd/acceptance-check --spec .local/SPECIFICATION.md --manifest .local/acceptance-manifest.yaml --artifacts .local/artifacts.yaml; \
+	fi
 
 check: acceptance
 	@echo "==> gofmt"

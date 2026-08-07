@@ -113,6 +113,10 @@ type Model struct {
 	// "?" and "c" respectively.
 	whyExpanded     bool
 	contextExpanded bool
+	// notice is a terminal-safe-on-render explanation of the most recent input
+	// refusal. Limit notices contain only fixed application text and counters;
+	// other errors are passed through textsafe.Visible before display.
+	notice string
 }
 
 func New() Model {
@@ -134,12 +138,16 @@ func NewWithProviderAndShell(p provider.Provider, shell string) Model {
 func NewFromDeps(deps Deps) Model {
 	input := textinput.New()
 	input.Placeholder = "Describe what you want to do..."
+	// CharLimit is an additional rune-count backstop. updateBoundedInput applies
+	// the authoritative byte-aware limit before every user insertion.
+	input.CharLimit = MaxIntentBytes
 	configureCursor(&input)
 	input.Focus()
 
 	commandInput := textinput.New()
 	commandInput.Placeholder = "Edit command..."
 	commandInput.Prompt = "$ "
+	commandInput.CharLimit = validate.MaxCommandBytes
 	configureCursor(&commandInput)
 
 	sp := spinner.New()
@@ -184,7 +192,10 @@ type compileResult struct {
 // compile runs context collection and the provider off the UI goroutine so a
 // slow network call never freezes the TUI.
 func (m Model) compile(ctx context.Context, requestID uint64) tea.Cmd {
-	intent := m.intent
+	// The input event path already enforces this bound. Reapply it at the
+	// provider boundary as defense in depth for programmatically constructed
+	// models and future callers.
+	intent, _ := completeRunePrefix(m.intent, MaxIntentBytes)
 	shell := m.activeShell
 	p := m.provider
 	inventorySource := m.inventorySource
@@ -219,6 +230,7 @@ func (m *Model) startCompile() tea.Cmd {
 	}
 	m.nextRequest++
 	m.activeRequest = m.nextRequest
+	m.intent, _ = completeRunePrefix(m.intent, MaxIntentBytes)
 	// A generous client deadline bounds a hung provider; cancel is still stored in
 	// m.cancelCompile and invoked on the normal result path, on supersede, and on
 	// esc/ctrl+c, so the timer is always released and the context never leaks.
@@ -231,6 +243,7 @@ func (m *Model) startCompile() tea.Cmd {
 	m.explanation = ""
 	m.applicability = applicability.Result{}
 	m.err = nil
+	m.notice = ""
 	// A new suggestion starts from the collapsed default so disclosure state
 	// never leaks across intents.
 	m.whyExpanded = false
@@ -254,6 +267,7 @@ func (m *Model) returnToInput() {
 	m.accepted = false
 	m.edited = false
 	m.applicability = applicability.Result{}
+	m.notice = ""
 	m.input.SetValue(m.intent)
 	m.input.CursorEnd()
 	m.input.Focus()
@@ -308,6 +322,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.cancelCompile = nil
 		m.activeRequest = 0
+		m.notice = ""
 		m.context = msg.context
 		m.inventory = msg.inventory
 		if msg.err != nil {
@@ -348,6 +363,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.screen = screenReview
 		return m, nil
 	case tea.KeyMsg:
+		// SetValue is used only for bounded application-owned values in production,
+		// but white-box callers can construct an oversize multibyte buffer despite
+		// CharLimit's rune semantics. Bound it before handling any subsequent key
+		// and require another action so truncation is never mistaken for submission.
+		if m.screen == screenInput && m.boundActiveInput(&m.input, MaxIntentBytes) {
+			return m, nil
+		}
+		if m.screen == screenEditCommand && m.boundActiveInput(&m.commandInput, validate.MaxCommandBytes) {
+			return m, nil
+		}
+
 		switch msg.String() {
 		case "ctrl+c":
 			m.cancelActiveCompile()
@@ -355,6 +381,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "esc":
 			if m.screen == screenEditCommand {
 				m.commandInput.Blur()
+				m.notice = ""
 				m.screen = screenReview
 				return m, nil
 			}
@@ -379,6 +406,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			if m.screen == screenInput {
 				m.intent = m.input.Value()
+				m.notice = ""
 				return m, m.startCompile()
 			}
 
@@ -401,6 +429,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.validation = validate.Command(m.command)
 				m.applicability = applicability.EvaluateEdited(m.command, m.inventory)
 				m.commandInput.Blur()
+				m.notice = ""
 				m.screen = screenReview
 				return m, nil
 			}
@@ -419,7 +448,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// text and drop terminal control characters. The transformation is
 				// one-way: the edit buffer can never reconstruct the original
 				// prohibited rune, and validation rejects control characters.
-				m.commandInput.SetValue(textsafe.EditableCommand(m.command))
+				editable, refusal := editableCommand(m.command)
+				if refusal != "" {
+					m.notice = refusal
+					return m, nil
+				}
+				m.commandInput.SetValue(editable)
+				m.commandInput.CursorEnd()
+				m.notice = ""
 				cmd := m.commandInput.Focus()
 				m.screen = screenEditCommand
 				return m, cmd
@@ -438,9 +474,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	if m.screen == screenInput {
-		m.input, cmd = m.input.Update(msg)
+		m.input, cmd, m.notice = updateBoundedInput(m.input, msg, MaxIntentBytes, m.notice)
 	} else if m.screen == screenEditCommand {
-		m.commandInput, cmd = m.commandInput.Update(msg)
+		m.commandInput, cmd, m.notice = updateBoundedInput(m.commandInput, msg, validate.MaxCommandBytes, m.notice)
 	}
 
 	return m, cmd
@@ -521,6 +557,9 @@ func (m Model) inputView() string {
 	if m.err != nil {
 		sections = append(sections, blockStyle.Render("Error: "+textsafe.Visible(m.err.Error())))
 	}
+	if m.notice != "" {
+		sections = append(sections, warnStyle.Render(textsafe.Visible(m.notice)))
+	}
 	sections = append(sections, mutedStyle.Render("enter submit · esc/ctrl+c quit"))
 	return m.fitSections(sections)
 }
@@ -555,7 +594,12 @@ func (m Model) devEndpointBanner() string {
 func (m Model) reviewView() string {
 	command := commandStyle.Render(textsafe.Visible(m.command))
 	status := statusLine(m.validation, m.safety, m.applicability)
-	actions := mutedStyle.Render(reviewActions(m.safety.Decision, m.validation.Class, m.applicability.Decision, m.whyExpanded, m.contextExpanded))
+	_, editRefusal := editableCommand(m.command)
+	actions := mutedStyle.Render(reviewActions(m.safety.Decision, m.validation.Class, m.applicability.Decision, editRefusal == "", m.whyExpanded, m.contextExpanded))
+	notice := ""
+	if m.notice != "" {
+		notice = warnStyle.Render(textsafe.Visible(m.notice))
+	}
 
 	reasons := reviewReasons(m.validation, m.safety, m.applicability)
 	why := ""
@@ -581,6 +625,9 @@ func (m Model) reviewView() string {
 
 	banner := m.devEndpointBanner()
 	used := measure(command) + measure(status) + measure(actions)
+	if notice != "" {
+		used += measure(notice)
+	}
 	if banner != "" {
 		used += measure(banner)
 	}
@@ -614,6 +661,9 @@ func (m Model) reviewView() string {
 		rows = append(rows, banner)
 	}
 	rows = append(rows, command, status)
+	if notice != "" {
+		rows = append(rows, notice)
+	}
 	for _, key := range []string{"reasons", "why", "context", "intent"} {
 		if body, ok := selected[key]; ok {
 			rows = append(rows, body)
@@ -646,11 +696,15 @@ func (m Model) rowMeasurer() func(string) int {
 }
 
 func (m Model) editCommandView() string {
-	return m.fitSections(m.withDevBanner([]string{
+	sections := []string{
 		headerStyle.Render("Edit command"),
 		m.commandInput.View(),
-		mutedStyle.Render("enter save · esc discard · ctrl+c quit"),
-	}))
+	}
+	if m.notice != "" {
+		sections = append(sections, warnStyle.Render(textsafe.Visible(m.notice)))
+	}
+	sections = append(sections, mutedStyle.Render("enter save · esc discard · ctrl+c quit"))
+	return m.fitSections(m.withDevBanner(sections))
 }
 
 // withDevBanner prefixes the development-endpoint label when one is active.
@@ -867,8 +921,12 @@ func acceptVerb(decision safety.Decision, validity validate.Class, appDecision a
 // consequence of pressing enter is legible without color, and the "?"/"c" hints
 // reflect whether each disclosure section is currently open. Esc returns to the
 // input screen; Ctrl-C remains the review-screen quit action.
-func reviewActions(decision safety.Decision, validity validate.Class, appDecision applicability.Decision, whyExpanded, contextExpanded bool) string {
+func reviewActions(decision safety.Decision, validity validate.Class, appDecision applicability.Decision, canEdit, whyExpanded, contextExpanded bool) string {
 	verb, _ := acceptVerb(decision, validity, appDecision)
+	edit := "e edit"
+	if !canEdit {
+		edit = "e edit unavailable"
+	}
 
 	why := "? why"
 	if whyExpanded {
@@ -882,7 +940,7 @@ func reviewActions(decision safety.Decision, validity validate.Class, appDecisio
 
 	return strings.Join([]string{
 		"enter " + verb,
-		"e edit",
+		edit,
 		why,
 		usedContext,
 		"b/esc back",

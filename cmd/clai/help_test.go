@@ -84,6 +84,22 @@ func TestMainHelpContent(t *testing.T) {
 			t.Errorf("main help missing %q", want)
 		}
 	}
+
+	// The --copy entry is pinned as one contiguous rendered block rather than
+	// as separate substrings: the retention warning is only truthful while it
+	// stays attached to --copy and in this order. The block states the
+	// accepted-command scope, how clipboard delivery is selected, that the
+	// copied command persists until overwritten and may be retained by other
+	// desktop software, and that clai never clears it automatically.
+	const copyBlock = `  --copy             copy the accepted command to the clipboard
+                     (or choose clipboard delivery in config.json)
+                     it remains until overwritten; desktop software may retain it
+                     clai does not clear it automatically
+`
+	if !strings.Contains(out, copyBlock) {
+		t.Errorf("main help does not render the --copy block contiguously.\nwant block:\n%s\ngot help:\n%s", copyBlock, out)
+	}
+
 	if strings.Contains(out, "widget") {
 		t.Error("main help should not list the internal widget command")
 	}

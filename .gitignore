@@ -183,4 +183,5 @@ tmp
 
 # Local binary
 /clai
-.claude/plans
+.claude/
+.planning/

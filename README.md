@@ -55,6 +55,19 @@ automatically, so you can inspect or edit it before pressing Enter.
 - [Bash setup](docs/shell/bash.md)
 - [Zsh setup](docs/shell/zsh.md)
 
+## Trust and retention
+
+clai presents generated commands for review, or inserts them into your editable
+shell prompt; it never runs them automatically. Clipboard delivery is opt-in,
+and a copied command remains available until another clipboard write overwrites
+it.
+
+Intent pasted into clai follows the same data-flow rules as typed intent. If
+you selected a remote provider, submitting it may send it to that provider.
+
+For the full widget and clipboard trust and retention contract, see
+[docs/privacy.md](docs/privacy.md).
+
 ## Providers
 
 Local `rules` by default; the LLM providers `openrouter` and direct `anthropic`

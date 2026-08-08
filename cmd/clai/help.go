@@ -156,7 +156,9 @@ Commands:
 	fmt.Fprint(w, `
 Flags:
   --copy             copy the accepted command to the clipboard
-                     (or delivery setting in config.json)
+                     (or choose clipboard delivery in config.json)
+                     it remains until overwritten; desktop software may retain it
+                     clai does not clear it automatically
   --print-command    print the accepted command to stdout
                      (or delivery setting in config.json)
   --provider name    provider: rules | openrouter | anthropic

@@ -124,8 +124,16 @@ func blockStop(index int) string {
 	return sseEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, index))
 }
 
+func messageDeltaData(stopReasonJSON string, outputTokens int) string {
+	return fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":%s,"stop_sequence":null},"usage":{"output_tokens":%d}}`, stopReasonJSON, outputTokens)
+}
+
+func messageDeltaWithUsage(stopReasonJSON string, outputTokens int) string {
+	return sseEvent("message_delta", messageDeltaData(stopReasonJSON, outputTokens))
+}
+
 func messageDelta(stopReason string) string {
-	return sseEvent("message_delta", fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":%s,"stop_sequence":null},"usage":{"output_tokens":12}}`, jsonStr(stopReason)))
+	return messageDeltaWithUsage(jsonStr(stopReason), 12)
 }
 
 func messageStop() string {
@@ -213,6 +221,30 @@ type closeErrorBody struct {
 }
 
 func (b closeErrorBody) Close() error { return b.err }
+
+// chunkedBody returns at most one scripted chunk per Read. Tests use the chunk
+// index to prove Compile stopped consuming the stream as soon as a cumulative
+// bound was crossed rather than merely rejecting the fully accumulated result.
+type chunkedBody struct {
+	chunks  [][]byte
+	current []byte
+	next    int
+}
+
+func (b *chunkedBody) Read(p []byte) (int, error) {
+	if len(b.current) == 0 {
+		if b.next == len(b.chunks) {
+			return 0, io.EOF
+		}
+		b.current = b.chunks[b.next]
+		b.next++
+	}
+	n := copy(p, b.current)
+	b.current = b.current[n:]
+	return n, nil
+}
+
+func (b *chunkedBody) Close() error { return nil }
 
 const validCandidate = `{"command":"ls -la","explanation":"lists files in long format"}`
 
@@ -489,6 +521,41 @@ func TestStreamSuccessCandidateSplitAcrossManyDeltas(t *testing.T) {
 	}
 }
 
+func TestStreamAcceptsMultipleMessageDeltas(t *testing.T) {
+	firstDelta := messageDeltaData("null", 7)
+	finalDelta := messageDeltaData(jsonStr("end_turn"), 12)
+	body := messageStart() + textBlockStart(0) + textDelta(0, validCandidate) + blockStop(0) +
+		messageDeltaWithUsage("null", 7) + messageDeltaWithUsage(jsonStr("end_turn"), 12) + messageStop()
+
+	candidates, err := remoteProvider(stringTransport(body), nil).Compile(context.Background(), remoteRequest())
+	if err != nil {
+		t.Fatalf("compile legal multi-delta stream: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].Command != "ls -la" {
+		t.Fatalf("candidates = %+v, want one fully accumulated candidate", candidates)
+	}
+
+	// Pin the SDK fields whose successive accumulation makes repeated deltas
+	// meaningful: the final delta supplies the stop reason and cumulative usage.
+	lifecycle := streamLifecycle{messageStarted: true, openBlocks: map[int64]bool{}}
+	message := sdk.Message{}
+	for _, data := range []string{firstDelta, finalDelta} {
+		var event sdk.MessageStreamEventUnion
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			t.Fatalf("decode message_delta fixture: %v", err)
+		}
+		if err := lifecycle.observe(event); err != nil {
+			t.Fatalf("observe repeated message_delta: %v", err)
+		}
+		if err := message.Accumulate(event); err != nil {
+			t.Fatalf("accumulate repeated message_delta: %v", err)
+		}
+	}
+	if message.StopReason != sdk.StopReasonEndTurn || message.Usage.OutputTokens != 12 {
+		t.Fatalf("accumulated stop/usage = %q/%d, want end_turn/12", message.StopReason, message.Usage.OutputTokens)
+	}
+}
+
 func TestStreamThinkingInterleavedBeforeText(t *testing.T) {
 	var b strings.Builder
 	b.WriteString(messageStart())
@@ -515,17 +582,27 @@ func TestStreamThinkingInterleavedBeforeText(t *testing.T) {
 }
 
 func TestStreamErrorBeforeFirstDelta(t *testing.T) {
-	body := messageStart() + textBlockStart(0) + errorEvent("overloaded_error", "SENTINEL overloaded")
-	ft := stringTransport(body)
-	candidates, err := remoteProvider(ft, nil).Compile(context.Background(), remoteRequest())
-	if candidates != nil {
-		t.Fatalf("candidates = %+v, want none", candidates)
-	}
-	if !errors.Is(err, ErrIncompleteResponse) {
-		t.Fatalf("err = %v, want ErrIncompleteResponse", err)
-	}
-	if strings.Contains(err.Error(), "SENTINEL") {
-		t.Fatalf("upstream error text leaked: %v", err)
+	for _, tt := range []struct {
+		name      string
+		errorType string
+		want      error
+	}{
+		{name: "overloaded", errorType: "overloaded_error", want: ErrServer},
+		{name: "rate_limited", errorType: "rate_limit_error", want: ErrRateLimited},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			body := messageStart() + textBlockStart(0) + errorEvent(tt.errorType, "SENTINEL hostile upstream text")
+			candidates, err := remoteProvider(stringTransport(body), nil).Compile(context.Background(), remoteRequest())
+			if candidates != nil {
+				t.Fatalf("candidates = %+v, want none", candidates)
+			}
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("err = %v, want %v", err, tt.want)
+			}
+			if strings.Contains(err.Error(), "SENTINEL") || strings.Contains(err.Error(), "hostile") {
+				t.Fatalf("upstream error text leaked: %v", err)
+			}
+		})
 	}
 }
 
@@ -536,8 +613,8 @@ func TestStreamErrorAfterPartialJSON(t *testing.T) {
 	if candidates != nil {
 		t.Fatalf("candidates = %+v, want none (partial JSON must never surface)", candidates)
 	}
-	if !errors.Is(err, ErrIncompleteResponse) {
-		t.Fatalf("err = %v, want ErrIncompleteResponse", err)
+	if !errors.Is(err, ErrServer) {
+		t.Fatalf("err = %v, want ErrServer", err)
 	}
 	if strings.Contains(err.Error(), "SENTINEL") || strings.Contains(err.Error(), "ls") {
 		t.Fatalf("partial or upstream text leaked: %v", err)
@@ -764,6 +841,37 @@ func TestStreamOutputExceedsBound(t *testing.T) {
 	}
 	if !errors.Is(err, ErrIncompleteResponse) {
 		t.Fatalf("err = %v, want ErrIncompleteResponse", err)
+	}
+}
+
+func TestStreamOutputBoundAbortsDuringAccumulation(t *testing.T) {
+	chunks := [][]byte{
+		[]byte(messageStart()),
+		[]byte(textBlockStart(0)),
+	}
+	for range maxCandidateBytes/1024 + 1 {
+		chunks = append(chunks, []byte(textDelta(0, strings.Repeat("x", 1024))))
+	}
+	firstUnread := len(chunks)
+	chunks = append(chunks,
+		[]byte(blockStop(0)),
+		[]byte(messageDelta("end_turn")),
+		[]byte(messageStop()),
+	)
+	body := &chunkedBody{chunks: chunks}
+	ft := &fakeTransport{handler: func(req *http.Request, _ []byte) (*http.Response, error) {
+		return sseResponse(req, body), nil
+	}}
+
+	candidates, err := remoteProvider(ft, nil).Compile(context.Background(), remoteRequest())
+	if candidates != nil {
+		t.Fatalf("candidates = %+v, want none (over cumulative output bound)", candidates)
+	}
+	if !errors.Is(err, ErrIncompleteResponse) {
+		t.Fatalf("err = %v, want ErrIncompleteResponse", err)
+	}
+	if body.next > firstUnread {
+		t.Fatalf("stream consumed chunk %d after cumulative size failure at %d", body.next, firstUnread)
 	}
 }
 
@@ -1383,6 +1491,10 @@ func TestCompileTimeout(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
 	}
+	const want = "anthropic: request timed out after 30ms: context deadline exceeded"
+	if err.Error() != want {
+		t.Fatalf("err = %q, want %q", err, want)
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -1391,24 +1503,39 @@ func TestCompileTimeout(t *testing.T) {
 
 func TestClassifyStreamErrorStatuses(t *testing.T) {
 	tests := []struct {
-		status   int
-		sentinel error
+		status    int
+		errorType sdk.ErrorType
+		sentinel  error
 	}{
-		{http.StatusUnauthorized, ErrAuth},
-		{http.StatusForbidden, ErrAuth},
-		{http.StatusBadRequest, ErrInvalidRequest},
-		{http.StatusNotFound, ErrInvalidRequest},
-		{http.StatusUnprocessableEntity, ErrInvalidRequest},
-		{http.StatusTooManyRequests, ErrRateLimited},
-		{http.StatusInternalServerError, ErrServer},
-		{http.StatusBadGateway, ErrServer},
-		{529, ErrServer},
-		{http.StatusOK, ErrIncompleteResponse}, // mid-stream error event
+		{status: http.StatusUnauthorized, sentinel: ErrAuth},
+		{status: http.StatusForbidden, sentinel: ErrAuth},
+		{status: http.StatusBadRequest, sentinel: ErrInvalidRequest},
+		{status: http.StatusNotFound, sentinel: ErrInvalidRequest},
+		{status: http.StatusUnprocessableEntity, sentinel: ErrInvalidRequest},
+		{status: http.StatusTooManyRequests, sentinel: ErrRateLimited},
+		{status: http.StatusInternalServerError, sentinel: ErrServer},
+		{status: http.StatusBadGateway, sentinel: ErrServer},
+		{status: 529, sentinel: ErrServer},
+		{status: http.StatusOK, errorType: sdk.ErrorTypeRateLimitError, sentinel: ErrRateLimited},
+		{status: http.StatusOK, errorType: sdk.ErrorTypeOverloadedError, sentinel: ErrServer},
+		{status: http.StatusOK, errorType: sdk.ErrorTypeAPIError, sentinel: ErrServer},
+		{status: http.StatusOK, errorType: sdk.ErrorType("unknown_hostile_type"), sentinel: ErrIncompleteResponse},
 	}
 	for _, tt := range tests {
-		err := classifyStreamError(&sdk.Error{StatusCode: tt.status})
+		apiErr := &sdk.Error{}
+		if tt.errorType != "" {
+			raw := fmt.Sprintf(`{"error":{"type":%s,"message":"SENTINEL hostile detail"}}`, jsonStr(string(tt.errorType)))
+			if err := json.Unmarshal([]byte(raw), apiErr); err != nil {
+				t.Fatalf("unmarshal sdk error fixture: %v", err)
+			}
+		}
+		apiErr.StatusCode = tt.status
+		err := classifyStreamError(apiErr)
 		if !errors.Is(err, tt.sentinel) {
-			t.Errorf("status %d: err = %v, want errors.Is %v", tt.status, err, tt.sentinel)
+			t.Errorf("status/type %d/%q: err = %v, want errors.Is %v", tt.status, tt.errorType, err, tt.sentinel)
+		}
+		if strings.Contains(err.Error(), "SENTINEL") || strings.Contains(err.Error(), "hostile") {
+			t.Errorf("status/type %d/%q reflected upstream text: %v", tt.status, tt.errorType, err)
 		}
 	}
 	// A non-API transport error never echoes its text and maps to incomplete.

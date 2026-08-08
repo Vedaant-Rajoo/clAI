@@ -363,7 +363,7 @@ func parseTokens(tokens []token, issues *[]Issue) List {
 	var command SimpleCommand
 	lastWasOperator := false
 
-	finishCommand := func(at Span) bool {
+	finishCommand := func() bool {
 		if len(command.Words) == 0 && len(command.Redirects) == 0 {
 			return false
 		}
@@ -371,7 +371,6 @@ func parseTokens(tokens []token, issues *[]Issue) List {
 		command.Span = commandSpan(command)
 		pipeline.Commands = append(pipeline.Commands, command)
 		command = SimpleCommand{}
-		_ = at
 		return true
 	}
 	finishPipeline := func() bool {
@@ -390,25 +389,20 @@ func parseTokens(tokens []token, issues *[]Issue) List {
 			command.Words = append(command.Words, tok.word)
 			lastWasOperator = false
 		case tokenRedirect:
-			r := tok.redirect
-			if !r.Duplicate && !r.CloseFD {
-				// A redirect target may be adjacent or whitespace-separated, so it
-				// is attached when the following word token arrives.
-				command.Redirects = append(command.Redirects, r)
-			} else {
-				command.Redirects = append(command.Redirects, r)
-			}
+			// A redirect target may be adjacent or whitespace-separated, so it
+			// is attached when the following word token arrives.
+			command.Redirects = append(command.Redirects, tok.redirect)
 			lastWasOperator = false
 		case tokenPipe:
 			attachRedirectTargets(&command, issues)
-			if !finishCommand(tok.span) {
+			if !finishCommand() {
 				*issues = append(*issues, Issue{Code: "empty-pipeline-command", Kind: Malformed, Span: tok.span, Message: "pipeline contains an empty command"})
 			}
 			pipeline.Pipes = append(pipeline.Pipes, tok.span)
 			lastWasOperator = true
 		case tokenList:
 			attachRedirectTargets(&command, issues)
-			if !finishCommand(tok.span) {
+			if !finishCommand() {
 				*issues = append(*issues, Issue{Code: "empty-list-segment", Kind: Malformed, Span: tok.span, Message: "list operator has no command on its left"})
 			}
 			finishPipeline()
@@ -420,7 +414,7 @@ func parseTokens(tokens []token, issues *[]Issue) List {
 		}
 	}
 	attachRedirectTargets(&command, issues)
-	finishCommand(Span{Start: len(list.Pipelines), End: len(list.Pipelines)})
+	finishCommand()
 	finishPipeline()
 	if lastWasOperator && len(tokens) > 0 {
 		span := tokens[len(tokens)-1].span
@@ -470,23 +464,30 @@ func assignmentName(word Word) (string, bool) {
 		return "", false
 	}
 	raw := word.Parts[0]
-	if raw.Kind != UnquotedPart {
+	if raw.Kind != UnquotedPart || !IsAssignment(raw.Value) {
 		return "", false
 	}
-	eq := strings.IndexByte(raw.Value, '=')
+	return raw.Value[:strings.IndexByte(raw.Value, '=')], true
+}
+
+// IsAssignment reports whether value has the shape NAME=... with a valid
+// shell variable name. It is shared with policy packages so the assignment
+// grammar cannot drift between the parser and its consumers.
+func IsAssignment(value string) bool {
+	eq := strings.IndexByte(value, '=')
 	if eq < 1 {
-		return "", false
+		return false
 	}
-	name := raw.Value[:eq]
+	name := value[:eq]
 	if !isNameStart(name[0]) {
-		return "", false
+		return false
 	}
 	for i := 1; i < len(name); i++ {
 		if !isNameChar(name[i]) && !isDigit(name[i]) {
-			return "", false
+			return false
 		}
 	}
-	return name, true
+	return true
 }
 
 func commandSpan(command SimpleCommand) Span {

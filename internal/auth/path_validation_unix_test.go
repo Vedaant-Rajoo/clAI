@@ -6,8 +6,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
+	"github.com/Vedaant-Rajoo/clai/internal/config"
 	"github.com/Vedaant-Rajoo/clai/internal/configroot"
 	"github.com/zalando/go-keyring"
 )
@@ -149,6 +151,110 @@ func TestCredentialRootSymlinkPolicy(t *testing.T) {
 	}
 }
 
+func TestConfigAuthCanonicalRootAgreementWithSymlinkedParent(t *testing.T) {
+	tests := []struct {
+		name  string
+		roots func(base, canonicalParent, linkedParent string) (home, xdg, canonicalRoot string)
+	}{
+		{
+			name: "XDG_CONFIG_HOME parent",
+			roots: func(base, canonicalParent, linkedParent string) (string, string, string) {
+				home := filepath.Join(base, "home")
+				if err := os.Mkdir(home, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				return home, filepath.Join(linkedParent, "xdg"), filepath.Join(canonicalParent, "xdg")
+			},
+		},
+		{
+			name: "HOME parent",
+			roots: func(_ string, canonicalParent, linkedParent string) (string, string, string) {
+				canonicalHome := filepath.Join(canonicalParent, "home")
+				if err := os.Mkdir(canonicalHome, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if runtime.GOOS == "darwin" {
+					legacy := filepath.Join(canonicalHome, "Library", "Application Support")
+					if err := os.MkdirAll(legacy, 0o700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return filepath.Join(linkedParent, "home"), "", filepath.Join(canonicalHome, ".config")
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			base, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			canonicalParent := filepath.Join(base, "canonical-parent")
+			if err := os.Mkdir(canonicalParent, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			linkedParent := filepath.Join(base, "linked-parent")
+			if err := os.Symlink(canonicalParent, linkedParent); err != nil {
+				t.Fatal(err)
+			}
+			home, xdg, canonicalRoot := tc.roots(base, canonicalParent, linkedParent)
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", xdg)
+			t.Setenv("OPENROUTER_API_KEY", "")
+
+			oldKeyring, oldRoots := credentialKeyring, resolveConfigRoots
+			credentialKeyring = &fakeKeyring{
+				getErr:    keyring.ErrNotFound,
+				setErr:    errors.New("keyring unavailable"),
+				deleteErr: keyring.ErrNotFound,
+			}
+			resolveConfigRoots = configroot.Resolve
+			t.Cleanup(func() {
+				credentialKeyring = oldKeyring
+				resolveConfigRoots = oldRoots
+			})
+
+			wantConfig := config.Config{Provider: "openrouter", Model: "test-model", Delivery: "stdout"}
+			if err := config.Save(wantConfig); err != nil {
+				t.Fatalf("config Save through symlinked parent: %v", err)
+			}
+			if err := Store("openrouter", "file-secret"); err != nil {
+				t.Fatalf("auth Store through symlinked parent: %v", err)
+			}
+
+			for _, name := range []string{"config.json", fileName} {
+				path := filepath.Join(canonicalRoot, "clai", name)
+				if _, err := os.Stat(path); err != nil {
+					t.Fatalf("shared canonical file %q: %v", path, err)
+				}
+			}
+			gotConfig, err := config.Load()
+			if err != nil {
+				t.Fatalf("config Load through symlinked parent: %v", err)
+			}
+			if gotConfig.Provider != wantConfig.Provider || gotConfig.Model != wantConfig.Model || gotConfig.Delivery != wantConfig.Delivery {
+				t.Fatalf("config Load = %+v, want provider/model/delivery from %+v", gotConfig, wantConfig)
+			}
+			key, err := Resolve("openrouter", "")
+			if err != nil || key != "file-secret" {
+				t.Fatalf("auth Resolve through symlinked parent = %q, %v", key, err)
+			}
+			source, err := SourceWithError("openrouter", "")
+			if err != nil || source != "config file" {
+				t.Fatalf("auth SourceWithError through symlinked parent = %q, %v", source, err)
+			}
+			if err := Delete("openrouter"); err != nil {
+				t.Fatalf("auth Delete through symlinked parent: %v", err)
+			}
+			key, err = Resolve("openrouter", "")
+			if err != nil || key != "" {
+				t.Fatalf("auth Resolve after Delete through symlinked parent = %q, %v", key, err)
+			}
+		})
+	}
+}
+
 func TestCredentialBelowRootSymlinksRejectedAfterCreation(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -231,22 +337,6 @@ func TestCredentialBelowRootSymlinksRejected(t *testing.T) {
 					t.Fatal(err)
 				}
 				if err := os.Symlink(target, filepath.Join(root, "clai", lockName)); err != nil {
-					t.Fatal(err)
-				}
-			},
-		},
-		{
-			name: "temporary symlink",
-			setup: func(t *testing.T, root string) {
-				dir := filepath.Join(root, "clai")
-				if err := os.Mkdir(dir, 0o700); err != nil {
-					t.Fatal(err)
-				}
-				target := filepath.Join(t.TempDir(), "temp-target")
-				if err := os.WriteFile(target, []byte("attacker-secret"), 0o600); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Symlink(target, filepath.Join(dir, ".credentials-00112233445566778899aabb.tmp")); err != nil {
 					t.Fatal(err)
 				}
 			},

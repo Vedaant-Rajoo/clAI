@@ -31,10 +31,11 @@ import (
 )
 
 var (
-	version        = "dev"
-	executeTUI     = runTUI
-	loadConfig     = config.Load
-	clipboardWrite = clipboard.WriteAll
+	version           = "dev"
+	executeTUI        = runTUI
+	loadConfig        = config.Load
+	resolveCredential = auth.Resolve
+	clipboardWrite    = clipboard.WriteAll
 )
 
 const (
@@ -59,6 +60,7 @@ type cli struct {
 	authRuntime         authRuntime
 	authReadLine        func() (string, error)
 	authStore           func(provider, key string) error
+	authStoreDetailed   func(provider, key string) (auth.StoreResult, error)
 	authDelete          func(provider string) error
 	authSourceWithError func(provider, explicit string) (string, error)
 }
@@ -78,7 +80,7 @@ func (c cli) run(args []string) int {
 			return c.runWidget(args[1:])
 		default:
 			if !strings.HasPrefix(args[0], "-") {
-				fmt.Fprintf(c.stderr, "clai: unknown command %q\nRun 'clai help' for usage.\n", args[0])
+				fmt.Fprintf(c.stderr, "clai: unknown command %q\nTo compile a request, run 'clai' and type your intent inside the interactive screen.\nRun 'clai help' for usage.\n", args[0])
 				return exitUsage
 			}
 		}
@@ -89,7 +91,7 @@ func (c cli) run(args []string) int {
 
 // runAuthCommand routes the strict `clai auth <verb> [options]` grammar.
 func (c cli) runAuthCommand(args []string) int {
-	if len(args) == 1 && args[0] == "help" {
+	if authHelpRequested(args) {
 		return c.runHelp([]string{"auth"})
 	}
 	command, err := parseAuthArgs(args)
@@ -98,6 +100,18 @@ func (c cli) runAuthCommand(args []string) int {
 		return exitUsage
 	}
 	return c.runAuth(command)
+}
+
+// authHelpRequested honors flag-style help anywhere in the auth grammar and
+// the command-style spelling when it is the trailing argument. It runs before
+// strict auth parsing so requesting help never performs credential I/O.
+func authHelpRequested(args []string) bool {
+	for _, arg := range args {
+		if arg == "-h" || arg == "--help" {
+			return true
+		}
+	}
+	return len(args) > 0 && args[len(args)-1] == "help"
 }
 
 func (c cli) runVersion(args []string) int {
@@ -178,11 +192,34 @@ func (c cli) runInteractive(args []string) int {
 	// user actually passed (CONF-03 adjacency edge).
 	explicit := map[string]bool{}
 	fs.Visit(func(fl *flag.Flag) { explicit[fl.Name] = true })
+	if explicit["provider"] {
+		if err := validateProviderName(*f.providerName); err != nil {
+			fmt.Fprintf(c.stderr, "clai: %v\nRun 'clai help' for usage.\n", err)
+			return exitUsage
+		}
+	}
 
-	// A standalone version request consumes no configuration. Keep combinations
-	// with other explicit flags on the normal validation path so invocation-local
-	// usage errors still take precedence over the version shortcut.
-	if *f.showVersion && len(explicit) == 1 {
+	// A version request consumes no configuration, credentials, or TUI state.
+	// Validate the invocation-local option relationships first so usage errors
+	// still take precedence when --version is combined with other flags.
+	if *f.showVersion {
+		resolvedProvider := *f.providerName
+		if resolvedProvider == "" {
+			resolvedProvider = "rules"
+		}
+		if err := validateProviderName(resolvedProvider); err != nil {
+			fmt.Fprintf(c.stderr, "clai: %v\nRun 'clai help' for usage.\n", err)
+			return exitUsage
+		}
+		devEndpoint, err := f.devEndpointOption(resolvedProvider)
+		if err != nil {
+			fmt.Fprintf(c.stderr, "clai: %v\nRun 'clai help' for usage.\n", err)
+			return exitUsage
+		}
+		if _, _, err := f.contextOptions(devEndpoint, resolvedProvider); err != nil {
+			fmt.Fprintf(c.stderr, "clai: %v\nRun 'clai help' for usage.\n", err)
+			return exitUsage
+		}
 		migrateLegacyConfigForRequestedOutput()
 		fmt.Fprintln(c.stdout, version)
 		return exitOK
@@ -192,7 +229,6 @@ func (c cli) runInteractive(args []string) int {
 	// config-selected provider validates --dev-endpoint and defaults the
 	// context policy exactly like a flag-selected one (CONF-03).
 	cfg, resolvedProvider, resolvedModel := c.resolveSettings(f.providerFlags)
-
 	// The endpoint is validated first because the context policy defaults on
 	// endpoint classification (REQ-CONTEXT-003, REQ-DEVENDPOINT-004).
 	devEndpoint, err := f.devEndpointOption(resolvedProvider)
@@ -206,7 +242,7 @@ func (c cli) runInteractive(args []string) int {
 		return exitUsage
 	}
 
-	p, err := selectProvider(resolvedProvider, resolvedModel, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint)
+	p, err := selectProvider(resolvedProvider, resolvedModel, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint, c.stderr)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai: %v\n", err)
 		return exitError
@@ -253,9 +289,21 @@ func (c cli) runWidget(args []string) int {
 		fmt.Fprintf(c.stderr, "clai widget: %v\nRun 'clai widget help' for usage.\n", err)
 		return exitUsage
 	}
-	if fs.NArg() != 0 || !validShell(*f.shell) || *f.resultFile == "" {
+	if fs.NArg() != 0 || !shellinit.Supported(*f.shell) || *f.resultFile == "" {
 		fmt.Fprintln(c.stderr, "usage: clai widget --shell <fish|bash|zsh> --result-file <path>\nRun 'clai widget help' for usage.")
 		return exitUsage
+	}
+	explicitProvider := false
+	fs.Visit(func(fl *flag.Flag) {
+		if fl.Name == "provider" {
+			explicitProvider = true
+		}
+	})
+	if explicitProvider {
+		if err := validateProviderName(*f.providerName); err != nil {
+			fmt.Fprintf(c.stderr, "clai widget: %v\nRun 'clai widget help' for usage.\n", err)
+			return exitUsage
+		}
 	}
 	// The widget path performs the identical provider and model resolution as
 	// the interactive path (CONF-03) — skipping it here would silently break
@@ -290,7 +338,7 @@ func (c cli) runWidget(args []string) int {
 		}
 	}()
 
-	p, err := selectProvider(resolvedProvider, resolvedModel, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint)
+	p, err := selectProvider(resolvedProvider, resolvedModel, *f.apiKey, *f.fallbackRules, policy, sharedFields, devEndpoint, c.stderr)
 	if err != nil {
 		fmt.Fprintf(c.stderr, "clai widget: %v\n", err)
 		return exitError
@@ -544,15 +592,6 @@ func runTUI(p provider.Provider, inventory *capability.Cached, activeShell, devE
 	return result.Outcome(), nil
 }
 
-func validShell(shell string) bool {
-	switch shell {
-	case "fish", "bash", "zsh":
-		return true
-	default:
-		return false
-	}
-}
-
 func inspectWidgetResult(path string) (os.FileInfo, error) {
 	if path == "" {
 		return nil, errors.New("result file path is empty")
@@ -647,14 +686,21 @@ func (f fallback) Compile(ctx context.Context, request provider.Request) ([]prov
 	return rules.Provider{}.Compile(ctx, request)
 }
 
-func selectProvider(name, model, apiKey string, fallbackRules bool, policy machinecontext.Policy, sharedFields []string, devEndpoint string) (provider.Provider, error) {
+func selectProvider(name, model, apiKey string, fallbackRules bool, policy machinecontext.Policy, sharedFields []string, devEndpoint string, notices io.Writer) (provider.Provider, error) {
 	switch name {
 	case "rules", "":
 		return rules.Provider{}, nil
 	case "openrouter":
-		key, err := auth.Resolve("openrouter", apiKey)
+		key, err := resolveCredential("openrouter", apiKey)
 		if err != nil {
 			return nil, err
+		}
+		if key == "" {
+			if fallbackRules {
+				printMissingKeyFallbackNotice(notices, "openrouter")
+				return rules.Provider{}, nil
+			}
+			return nil, missingAPIKeyError("openrouter")
 		}
 		var p provider.Provider = openrouter.Provider{APIKey: key, Model: model, Policy: policy, SharedFields: sharedFields, DevEndpoint: devEndpoint}
 		if fallbackRules {
@@ -662,9 +708,16 @@ func selectProvider(name, model, apiKey string, fallbackRules bool, policy machi
 		}
 		return p, nil
 	case "anthropic":
-		key, err := auth.Resolve("anthropic", apiKey)
+		key, err := resolveCredential("anthropic", apiKey)
 		if err != nil {
 			return nil, err
+		}
+		if key == "" {
+			if fallbackRules {
+				printMissingKeyFallbackNotice(notices, "anthropic")
+				return rules.Provider{}, nil
+			}
+			return nil, missingAPIKeyError("anthropic")
 		}
 		var p provider.Provider = anthropic.Provider{APIKey: key, Model: model, Policy: policy, SharedFields: sharedFields, DevEndpoint: devEndpoint}
 		if fallbackRules {
@@ -674,6 +727,26 @@ func selectProvider(name, model, apiKey string, fallbackRules bool, policy machi
 	case "openai":
 		return nil, fmt.Errorf("provider %q is not implemented yet; use anthropic, openrouter, or rules", name)
 	default:
-		return nil, fmt.Errorf("unknown provider %q (known: rules, openrouter, anthropic)", name)
+		return nil, validateProviderName(name)
 	}
+}
+
+func validateProviderName(name string) error {
+	switch name {
+	case "", "rules", "openrouter", "anthropic", "openai":
+		return nil
+	default:
+		return fmt.Errorf("unknown provider %q (known: rules, openrouter, anthropic)", name)
+	}
+}
+
+// missingAPIKeyError mirrors the actionable error produced by each remote
+// provider's compile setup so selecting it fails with the same next steps
+// before the interactive screen opens.
+func missingAPIKeyError(name string) error {
+	return fmt.Errorf("%s: no API key (run `clai auth login --provider %s` or set %s)", name, name, auth.EnvVarFor(name))
+}
+
+func printMissingKeyFallbackNotice(w io.Writer, name string) {
+	fmt.Fprintf(w, "clai: no %s API key; using rules fallback; run `clai auth login --provider %s`\n", name, name)
 }

@@ -22,6 +22,10 @@ const (
 type Result struct {
 	Decision Decision
 	Reasons  []string
+	// Tools lists the executables resolved from an edited command in
+	// first-seen order. Only EvaluateEdited populates it, so renderers can
+	// reuse the resolution walk instead of re-parsing the command.
+	Tools []string
 }
 
 // Inventory is the read-only capability surface needed by the gate.
@@ -107,7 +111,12 @@ func evaluateKind(kind capability.RequirementKind, requirements []capability.Req
 func evaluateTools(requirements []capability.Requirement, inventory Inventory) (bool, []string) {
 	for _, requirement := range requirements {
 		fact, known := inventory.LookupTool(requirement.Name)
-		if !known || !fact.Present {
+		// The bounded inventory makes no claim about tools it did not probe. An
+		// unprobed OR alternative therefore cannot honestly be marked missing.
+		if !known {
+			return true, nil
+		}
+		if !fact.Present {
 			continue
 		}
 		if !requirement.MinVersion.Known() || fact.Version.Known() && fact.Version.Compare(requirement.MinVersion) >= 0 {
@@ -120,7 +129,9 @@ func evaluateTools(requirements []capability.Requirement, inventory Inventory) (
 		fact, known := inventory.LookupTool(requirement.Name)
 		switch {
 		case !known:
-			reasons = append(reasons, fmt.Sprintf("tool %s: may not work (outside capability inventory)", requirement.Name))
+			// The first pass returns before reaching this branch. Keep it explicit
+			// so a future refactor cannot turn "not probed" into "absent".
+			continue
 		case !fact.Present:
 			reasons = append(reasons, fmt.Sprintf("tool %s: may not work (not installed)", requirement.Name))
 		case requirement.MinVersion.Known() && !fact.Version.Known():

@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"io"
 	"strings"
 	"testing"
 
@@ -165,7 +166,7 @@ func TestDevEndpointForwardedToRemoteProviders(t *testing.T) {
 	t.Setenv("OPENROUTER_API_KEY", "sk-or-test")
 	const endpoint = "http://127.0.0.1:8747"
 
-	p, err := selectProvider("anthropic", "", "", false, "", nil, endpoint)
+	p, err := selectProvider("anthropic", "", "", false, "", nil, endpoint, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +174,7 @@ func TestDevEndpointForwardedToRemoteProviders(t *testing.T) {
 		t.Fatalf("anthropic DevEndpoint = %q, want %q", got, endpoint)
 	}
 
-	p, err = selectProvider("openrouter", "", "", false, "", nil, endpoint)
+	p, err = selectProvider("openrouter", "", "", false, "", nil, endpoint, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +183,7 @@ func TestDevEndpointForwardedToRemoteProviders(t *testing.T) {
 	}
 
 	// A normal session leaves it empty so the pinned production endpoint applies.
-	p, err = selectProvider("anthropic", "", "", false, "", nil, "")
+	p, err = selectProvider("anthropic", "", "", false, "", nil, "", io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}

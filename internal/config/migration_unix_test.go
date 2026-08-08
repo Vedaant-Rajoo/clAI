@@ -249,6 +249,87 @@ func useConfigFilesystemTestHooks(t *testing.T, hooks configFilesystemHooks) {
 	t.Cleanup(func() { configHooks = old })
 }
 
+func TestPermissiveConfigSelfHealsWithPathedWarning(t *testing.T) {
+	for _, operation := range []struct {
+		name string
+		run  func(Config) error
+	}{
+		{name: "load", run: func(Config) error { _, err := Load(); return err }},
+		{name: "save", run: Save},
+	} {
+		t.Run(operation.name, func(t *testing.T) {
+			preferred, _ := useMigrationRoots(t)
+			path := writeConfigFixture(t, preferred, []byte(`{"contract":"config-file/v1","provider":"rules","init_completed":true}`))
+			if err := os.Chmod(path, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var warnings []string
+			useConfigFilesystemTestHooks(t, configFilesystemHooks{
+				warn: func(message string) { warnings = append(warnings, message) },
+			})
+
+			if err := operation.run(Config{Provider: "rules", InitCompleted: true}); err != nil {
+				t.Fatalf("%s permissive config: %v", operation.name, err)
+			}
+			if len(warnings) != 1 || !strings.Contains(warnings[0], path) || !strings.Contains(warnings[0], "chmod 600") {
+				t.Fatalf("warnings = %#v, want one warning with path and chmod remedy", warnings)
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := info.Mode().Perm(); got != 0o600 {
+				t.Fatalf("config mode = %o, want 600", got)
+			}
+		})
+	}
+}
+
+func TestForeignConfigTransientIsRemovedWithoutBlockingLoad(t *testing.T) {
+	preferred, _ := useMigrationRoots(t)
+	dir := filepath.Join(preferred, "clai")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	foreign := filepath.Join(dir, ".config-foreign-name.tmp")
+	if err := os.WriteFile(foreign, []byte("foreign"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg, err := Load(); err != nil || cfg != (Config{}) {
+		t.Fatalf("Load with foreign transient = %+v, %v", cfg, err)
+	}
+	if _, err := os.Lstat(foreign); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("foreign transient remains: %v", err)
+	}
+}
+
+func TestConfigLockTimeoutNamesPathAndSafeRetry(t *testing.T) {
+	preferred, _ := useMigrationRoots(t)
+	directory, err := openConfigDirectory(preferred, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := acquireConfigLock(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = releaseConfigLock(lock)
+		_ = directory.close()
+	})
+
+	err = Save(Config{Provider: "rules"})
+	if err == nil {
+		t.Fatal("Save unexpectedly passed a held config lock")
+	}
+	for _, want := range []string{filepath.Join(preferred, "clai", lockName), "another clai", "retrying is safe"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Save lock-timeout error = %q, want %q", err, want)
+		}
+	}
+}
+
 func assertNoConfigLitter(t *testing.T, preferred, legacy string) {
 	t.Helper()
 	configFiles := 0

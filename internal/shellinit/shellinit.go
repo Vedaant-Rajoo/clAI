@@ -16,6 +16,13 @@ var scriptFiles = map[string]string{
 	"zsh":  "scripts/clai.zsh",
 }
 
+// Supported reports whether shell has a shipped adapter script. It is the
+// single source of truth for the supported-shell set.
+func Supported(shell string) bool {
+	_, ok := scriptFiles[shell]
+	return ok
+}
+
 // Script returns the initialization script for shell.
 func Script(shell string) (string, error) {
 	name, ok := scriptFiles[shell]

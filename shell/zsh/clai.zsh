@@ -59,5 +59,5 @@ if [[ -o interactive ]]; then
         print -u2 -r -- "clai: Zsh binding $__clai_zsh_binding is already in use; set CLAI_ZSH_BINDING to another sequence"
     fi
 
-    unset __clai_zsh_existing_binding
+    unset __clai_zsh_binding __clai_zsh_existing_binding
 fi

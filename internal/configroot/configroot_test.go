@@ -1,9 +1,11 @@
 package configroot
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -53,7 +55,7 @@ func TestResolveMatrix(t *testing.T) {
 			goos: "freebsd", platformConfig: platform,
 			want: Roots{Preferred: platform},
 		},
-		{name: "relative xdg is rejected without fallback", goos: "linux", xdg: "relative", home: home, wantErr: true},
+		{name: "relative xdg is rejected by low-level policy", goos: "linux", xdg: "relative", home: home, wantErr: true},
 		{name: "dot xdg is rejected", goos: "linux", xdg: xdg + separator + ".." + separator + "escape", home: home, wantErr: true},
 		{name: "relative fallback home is rejected", goos: "linux", home: "relative", wantErr: true},
 		{name: "dot fallback home is rejected", goos: "linux", home: home + separator + "." + separator + "child", wantErr: true},
@@ -91,6 +93,45 @@ func TestResolveMatrix(t *testing.T) {
 	}
 	if got := (Roots{Preferred: xdg}).LegacyPath("config.json"); got != "" {
 		t.Errorf("empty LegacyPath = %q, want empty", got)
+	}
+}
+
+func TestResolveIgnoresRelativeXDGAndWarnsOnce(t *testing.T) {
+	oldGOOS := currentGOOS
+	oldLookupEnv := lookupEnv
+	oldUserHomeDir := userHomeDir
+	oldWarn := warnRelativeXDG
+	t.Cleanup(func() {
+		currentGOOS = oldGOOS
+		lookupEnv = oldLookupEnv
+		userHomeDir = oldUserHomeDir
+		warnRelativeXDG = oldWarn
+		relativeXDGWarningOnce = sync.Once{}
+	})
+
+	home := filepath.Join(t.TempDir(), "home")
+	currentGOOS = "linux"
+	lookupEnv = func(string) (string, bool) { return "relative/config", true }
+	userHomeDir = func() (string, error) { return home, nil }
+	relativeXDGWarningOnce = sync.Once{}
+	var warnings bytes.Buffer
+	warnRelativeXDG = func(value string) {
+		warnings.WriteString(value)
+		warnings.WriteByte('\n')
+	}
+
+	for range 2 {
+		got, err := Resolve()
+		if err != nil {
+			t.Fatalf("Resolve with relative XDG_CONFIG_HOME: %v", err)
+		}
+		want := Roots{Preferred: filepath.Join(home, ".config")}
+		if got != want {
+			t.Fatalf("Resolve = %+v, want %+v", got, want)
+		}
+	}
+	if got := warnings.String(); got != "relative/config\n" {
+		t.Fatalf("warnings = %q, want one warning naming the ignored value", got)
 	}
 }
 

@@ -13,7 +13,6 @@ import (
 	"github.com/Vedaant-Rajoo/clai/internal/provider"
 	"github.com/Vedaant-Rajoo/clai/internal/provider/rules"
 	"github.com/Vedaant-Rajoo/clai/internal/safety"
-	"github.com/Vedaant-Rajoo/clai/internal/shellsyntax"
 	"github.com/Vedaant-Rajoo/clai/internal/textsafe"
 	"github.com/Vedaant-Rajoo/clai/internal/validate"
 	"github.com/charmbracelet/bubbles/cursor"
@@ -114,6 +113,10 @@ type Model struct {
 	// "?" and "c" respectively.
 	whyExpanded     bool
 	contextExpanded bool
+	// notice is a terminal-safe-on-render explanation of the most recent input
+	// refusal. Limit notices contain only fixed application text and counters;
+	// other errors are passed through textsafe.Visible before display.
+	notice string
 }
 
 func New() Model {
@@ -135,12 +138,16 @@ func NewWithProviderAndShell(p provider.Provider, shell string) Model {
 func NewFromDeps(deps Deps) Model {
 	input := textinput.New()
 	input.Placeholder = "Describe what you want to do..."
+	// CharLimit is an additional rune-count backstop. updateBoundedInput applies
+	// the authoritative byte-aware limit before every user insertion.
+	input.CharLimit = MaxIntentBytes
 	configureCursor(&input)
 	input.Focus()
 
 	commandInput := textinput.New()
 	commandInput.Placeholder = "Edit command..."
 	commandInput.Prompt = "$ "
+	commandInput.CharLimit = validate.MaxCommandBytes
 	configureCursor(&commandInput)
 
 	sp := spinner.New()
@@ -185,12 +192,23 @@ type compileResult struct {
 // compile runs context collection and the provider off the UI goroutine so a
 // slow network call never freezes the TUI.
 func (m Model) compile(ctx context.Context, requestID uint64) tea.Cmd {
-	intent := m.intent
+	// The input event path already enforces this bound. Reapply it at the
+	// provider boundary as defense in depth for programmatically constructed
+	// models and future callers.
+	intent, _ := completeRunePrefix(m.intent, MaxIntentBytes)
 	shell := m.activeShell
 	p := m.provider
 	inventorySource := m.inventorySource
 	return func() tea.Msg {
-		collected := machinecontext.CollectWithShell(shell)
+		if err := ctx.Err(); err != nil {
+			return compileResult{requestID: requestID, err: err}
+		}
+
+		collected := machinecontext.CollectContext(ctx, shell)
+		if err := ctx.Err(); err != nil {
+			return compileResult{requestID: requestID, context: collected, err: err}
+		}
+
 		inventory := inventorySource.Inventory(ctx)
 		if err := ctx.Err(); err != nil {
 			return compileResult{requestID: requestID, context: collected, inventory: inventory, err: err}
@@ -212,6 +230,7 @@ func (m *Model) startCompile() tea.Cmd {
 	}
 	m.nextRequest++
 	m.activeRequest = m.nextRequest
+	m.intent, _ = completeRunePrefix(m.intent, MaxIntentBytes)
 	// A generous client deadline bounds a hung provider; cancel is still stored in
 	// m.cancelCompile and invoked on the normal result path, on supersede, and on
 	// esc/ctrl+c, so the timer is always released and the context never leaks.
@@ -224,6 +243,7 @@ func (m *Model) startCompile() tea.Cmd {
 	m.explanation = ""
 	m.applicability = applicability.Result{}
 	m.err = nil
+	m.notice = ""
 	// A new suggestion starts from the collapsed default so disclosure state
 	// never leaks across intents.
 	m.whyExpanded = false
@@ -238,6 +258,20 @@ func (m *Model) cancelActiveCompile() {
 	}
 	m.cancelCompile = nil
 	m.activeRequest = 0
+}
+
+func (m *Model) returnToInput() {
+	m.candidate = provider.Candidate{}
+	m.command = ""
+	m.explanation = ""
+	m.accepted = false
+	m.edited = false
+	m.applicability = applicability.Result{}
+	m.notice = ""
+	m.input.SetValue(m.intent)
+	m.input.CursorEnd()
+	m.input.Focus()
+	m.screen = screenInput
 }
 
 func configureCursor(input *textinput.Model) {
@@ -257,9 +291,9 @@ func (m Model) Outcome() Outcome {
 	return outcome
 }
 
-func (m Model) Accepted() bool { return m.Outcome().Accepted }
+func (m Model) Accepted() bool { return m.accepted }
 
-func (m Model) Command() string { return m.Outcome().Command }
+func (m Model) Command() string { return m.command }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
@@ -288,6 +322,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.cancelCompile = nil
 		m.activeRequest = 0
+		m.notice = ""
 		m.context = msg.context
 		m.inventory = msg.inventory
 		if msg.err != nil {
@@ -300,9 +335,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input.Focus()
 			if !errors.Is(msg.err, context.Canceled) {
 				m.err = msg.err
-				if errors.Is(msg.err, context.DeadlineExceeded) {
+				if msg.err == context.DeadlineExceeded {
 					// Keep the deadline in the error chain (errors.Is still matches)
 					// while giving the user a plain-language reason on the input screen.
+					// A provider-labeled inner deadline stays intact instead of being
+					// misleadingly relabeled with the outer compile timeout.
 					m.err = fmt.Errorf("compile timed out after %s: %w", compileTimeout, msg.err)
 				}
 			}
@@ -326,6 +363,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.screen = screenReview
 		return m, nil
 	case tea.KeyMsg:
+		// SetValue is used only for bounded application-owned values in production,
+		// but white-box callers can construct an oversize multibyte buffer despite
+		// CharLimit's rune semantics. Bound it before handling any subsequent key
+		// and require another action so truncation is never mistaken for submission.
+		if m.screen == screenInput && m.boundActiveInput(&m.input, MaxIntentBytes) {
+			return m, nil
+		}
+		if m.screen == screenEditCommand && m.boundActiveInput(&m.commandInput, validate.MaxCommandBytes) {
+			return m, nil
+		}
+
 		switch msg.String() {
 		case "ctrl+c":
 			m.cancelActiveCompile()
@@ -333,6 +381,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "esc":
 			if m.screen == screenEditCommand {
 				m.commandInput.Blur()
+				m.notice = ""
 				m.screen = screenReview
 				return m, nil
 			}
@@ -348,11 +397,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.screen = screenInput
 				return m, nil
 			}
+			if m.screen == screenReview || m.screen == screenNoSuggestion {
+				m.returnToInput()
+				return m, nil
+			}
 
 			return m, tea.Quit
 		case "enter":
 			if m.screen == screenInput {
 				m.intent = m.input.Value()
+				m.notice = ""
 				return m, m.startCompile()
 			}
 
@@ -361,7 +415,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			if m.screen == screenReview {
-				if m.safety.Decision == safety.Block || !m.validation.Valid || m.applicability.Decision == applicability.Rejected {
+				if _, canAccept := acceptVerb(m.safety.Decision, m.validation.Class, m.applicability.Decision); !canAccept {
 					return m, nil
 				}
 				m.accepted = true
@@ -375,21 +429,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.validation = validate.Command(m.command)
 				m.applicability = applicability.EvaluateEdited(m.command, m.inventory)
 				m.commandInput.Blur()
+				m.notice = ""
 				m.screen = screenReview
 				return m, nil
 			}
 		case "b":
 			if m.screen == screenReview || m.screen == screenNoSuggestion {
-				m.candidate = provider.Candidate{}
-				m.command = ""
-				m.explanation = ""
-				m.accepted = false
-				m.edited = false
-				m.applicability = applicability.Result{}
-				m.input.SetValue(m.intent)
-				m.input.CursorEnd()
-				m.input.Focus()
-				m.screen = screenInput
+				m.returnToInput()
 				return m, nil
 			}
 		case "r":
@@ -402,7 +448,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// text and drop terminal control characters. The transformation is
 				// one-way: the edit buffer can never reconstruct the original
 				// prohibited rune, and validation rejects control characters.
-				m.commandInput.SetValue(textsafe.EditableCommand(m.command))
+				editable, refusal := editableCommand(m.command)
+				if refusal != "" {
+					m.notice = refusal
+					return m, nil
+				}
+				m.commandInput.SetValue(editable)
+				m.commandInput.CursorEnd()
+				m.notice = ""
 				cmd := m.commandInput.Focus()
 				m.screen = screenEditCommand
 				return m, cmd
@@ -421,9 +474,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	if m.screen == screenInput {
-		m.input, cmd = m.input.Update(msg)
+		m.input, cmd, m.notice = updateBoundedInput(m.input, msg, MaxIntentBytes, m.notice)
 	} else if m.screen == screenEditCommand {
-		m.commandInput, cmd = m.commandInput.Update(msg)
+		m.commandInput, cmd, m.notice = updateBoundedInput(m.commandInput, msg, validate.MaxCommandBytes, m.notice)
 	}
 
 	return m, cmd
@@ -504,7 +557,10 @@ func (m Model) inputView() string {
 	if m.err != nil {
 		sections = append(sections, blockStyle.Render("Error: "+textsafe.Visible(m.err.Error())))
 	}
-	sections = append(sections, mutedStyle.Render("enter submit · esc quit"))
+	if m.notice != "" {
+		sections = append(sections, warnStyle.Render(textsafe.Visible(m.notice)))
+	}
+	sections = append(sections, mutedStyle.Render("enter submit · esc/ctrl+c quit"))
 	return m.fitSections(sections)
 }
 
@@ -513,6 +569,7 @@ func (m Model) loadingView() string {
 		headerStyle.Render("What do you want to do?"),
 		textsafe.Visible(m.intent),
 		m.spinner.View() + mutedStyle.Render("Compiling suggestion..."),
+		mutedStyle.Render("esc cancel · ctrl+c quit"),
 	})
 }
 
@@ -537,16 +594,25 @@ func (m Model) devEndpointBanner() string {
 func (m Model) reviewView() string {
 	command := commandStyle.Render(textsafe.Visible(m.command))
 	status := statusLine(m.validation, m.safety, m.applicability)
-	actions := mutedStyle.Render(reviewActions(m.safety.Decision, m.validation.Valid, m.applicability.Decision, m.whyExpanded, m.contextExpanded))
+	_, editRefusal := editableCommand(m.command)
+	actions := mutedStyle.Render(reviewActions(m.safety.Decision, m.validation.Class, m.applicability.Decision, editRefusal == "", m.whyExpanded, m.contextExpanded))
+	notice := ""
+	if m.notice != "" {
+		notice = warnStyle.Render(textsafe.Visible(m.notice))
+	}
 
 	reasons := reviewReasons(m.validation, m.safety, m.applicability)
 	why := ""
 	if m.whyExpanded {
-		why = section("Why", textsafe.Visible(m.explanation))
+		title := "Why"
+		if m.edited {
+			title = "Explanation for the original suggestion"
+		}
+		why = section(title, textsafe.Visible(m.explanation))
 	}
 	usedContext := ""
 	if m.contextExpanded {
-		usedContext = section("Context used", strings.Join(contextLines(m.context, m.inventory, m.candidate.Requirements, m.edited, m.command), "\n"))
+		usedContext = section("Context used", strings.Join(contextLines(m.context, m.inventory, m.candidate.Requirements, m.edited, m.applicability.Tools), "\n"))
 	}
 	intent := mutedStyle.Render("intent: " + textsafe.Visible(m.intent))
 
@@ -559,6 +625,9 @@ func (m Model) reviewView() string {
 
 	banner := m.devEndpointBanner()
 	used := measure(command) + measure(status) + measure(actions)
+	if notice != "" {
+		used += measure(notice)
+	}
 	if banner != "" {
 		used += measure(banner)
 	}
@@ -592,6 +661,9 @@ func (m Model) reviewView() string {
 		rows = append(rows, banner)
 	}
 	rows = append(rows, command, status)
+	if notice != "" {
+		rows = append(rows, notice)
+	}
 	for _, key := range []string{"reasons", "why", "context", "intent"} {
 		if body, ok := selected[key]; ok {
 			rows = append(rows, body)
@@ -624,11 +696,15 @@ func (m Model) rowMeasurer() func(string) int {
 }
 
 func (m Model) editCommandView() string {
-	return m.fitSections(m.withDevBanner([]string{
+	sections := []string{
 		headerStyle.Render("Edit command"),
 		m.commandInput.View(),
-		mutedStyle.Render("enter save · esc discard"),
-	}))
+	}
+	if m.notice != "" {
+		sections = append(sections, warnStyle.Render(textsafe.Visible(m.notice)))
+	}
+	sections = append(sections, mutedStyle.Render("enter save · esc discard · ctrl+c quit"))
+	return m.fitSections(m.withDevBanner(sections))
 }
 
 // withDevBanner prefixes the development-endpoint label when one is active.
@@ -645,7 +721,7 @@ func (m Model) noSuggestionView() string {
 		headerStyle.Render("No suggestion"),
 		section("Intent", textsafe.Visible(m.intent)),
 		"The provider returned no command candidate.",
-		mutedStyle.Render("enter/r retry · b back · esc cancel"),
+		mutedStyle.Render("enter/r retry · b/esc back · ctrl+c quit"),
 	}))
 }
 
@@ -653,7 +729,7 @@ func section(title, body string) string {
 	return headerStyle.Render(title) + "\n" + body
 }
 
-func contextLines(c machinecontext.Context, inventory applicability.Inventory, requirements []capability.Requirement, edited bool, command string) []string {
+func contextLines(c machinecontext.Context, inventory applicability.Inventory, requirements []capability.Requirement, edited bool, editedTools []string) []string {
 	gitRepo := "no"
 	if c.GitRepository {
 		gitRepo = "yes"
@@ -676,7 +752,7 @@ func contextLines(c machinecontext.Context, inventory applicability.Inventory, r
 	for _, line := range lines {
 		seen[line] = true
 	}
-	for _, line := range relevantCapabilityLines(inventory, requirements, edited, command) {
+	for _, line := range relevantCapabilityLines(inventory, requirements, edited, editedTools) {
 		if !seen[line] {
 			lines = append(lines, line)
 			seen[line] = true
@@ -687,12 +763,16 @@ func contextLines(c machinecontext.Context, inventory applicability.Inventory, r
 
 // relevantCapabilityLines exposes only facts used by the current applicability
 // decision. It never includes inventory paths, probe output, or unrelated tools.
-func relevantCapabilityLines(inventory applicability.Inventory, requirements []capability.Requirement, edited bool, command string) []string {
+func relevantCapabilityLines(inventory applicability.Inventory, requirements []capability.Requirement, edited bool, editedTools []string) []string {
 	if inventory == nil {
 		return nil
 	}
 	if edited {
-		return editedCapabilityLines(inventory, command)
+		lines := make([]string, 0, len(editedTools))
+		for _, name := range editedTools {
+			lines = append(lines, toolCapabilityLine(inventory, name))
+		}
+		return lines
 	}
 
 	seen := make(map[string]bool)
@@ -723,29 +803,12 @@ func relevantCapabilityLines(inventory applicability.Inventory, requirements []c
 	return lines
 }
 
-func editedCapabilityLines(inventory applicability.Inventory, command string) []string {
-	parsed := shellsyntax.Parse(command)
-	if !parsed.Supported() {
-		return nil
-	}
-	seen := make(map[string]bool)
-	var lines []string
-	for _, pipeline := range parsed.List.Pipelines {
-		for _, simple := range pipeline.Commands {
-			resolved := shellsyntax.ResolveExecutable(simple)
-			if !resolved.Found || resolved.Base == "" || seen[resolved.Base] {
-				continue
-			}
-			seen[resolved.Base] = true
-			lines = append(lines, toolCapabilityLine(inventory, resolved.Base))
-		}
-	}
-	return lines
-}
-
 func toolCapabilityLine(inventory applicability.Inventory, name string) string {
-	status := "absent"
-	if fact, known := inventory.LookupTool(name); known && fact.Present {
+	fact, known := inventory.LookupTool(name)
+	status := "not probed (outside the fixed inventory)"
+	if known && !fact.Present {
+		status = "absent"
+	} else if known {
 		status = "present"
 		if fact.Version.Known() {
 			status += " " + fact.Version.String()
@@ -772,9 +835,12 @@ func cloneCandidate(candidate provider.Candidate) provider.Candidate {
 // statusLine names all three independent gates in words so the review remains
 // understandable without color; styling only reinforces those words.
 func statusLine(validation validate.Result, result safety.Result, appResult applicability.Result) string {
-	validity := allowStyle.Render("valid")
-	if !validation.Valid {
-		validity = blockStyle.Render("invalid")
+	validity := blockStyle.Render(string(validate.Invalid))
+	switch validation.Class {
+	case validate.Valid:
+		validity = allowStyle.Render(string(validate.Valid))
+	case validate.Warning:
+		validity = warnStyle.Render(string(validate.Warning))
 	}
 	decision := decisionStyle(result.Decision).Render(string(result.Decision))
 	appWord := "applicable"
@@ -790,12 +856,12 @@ func statusLine(validation validate.Result, result safety.Result, appResult appl
 	return strings.Join([]string{validity, decision, appStyle.Render(appWord)}, mutedStyle.Render(" · "))
 }
 
-// reviewReasons renders the sanitized reasons behind a non-allow or invalid
-// decision, validation reasons first. It returns an empty string when the
-// command is both valid and allowed, keeping the default review screen minimal.
+// reviewReasons renders the sanitized reasons behind a non-allow, validation
+// warning/invalidity, or applicability mark, with validation reasons first. It
+// returns an empty string only when every gate has no reason to show.
 func reviewReasons(validation validate.Result, result safety.Result, appResult applicability.Result) string {
 	var reasons []string
-	if !validation.Valid {
+	if validation.Class != validate.Valid {
 		reasons = append(reasons, validation.Reasons...)
 	}
 	if result.Decision != safety.Allow {
@@ -835,19 +901,31 @@ func decisionStyle(decision safety.Decision) lipgloss.Style {
 	}
 }
 
+// acceptVerb names the outcome of pressing enter on the review screen and
+// reports whether accepting is permitted. The enter gate and the action hint
+// both derive from it, so the two can never drift.
+func acceptVerb(decision safety.Decision, validity validate.Class, appDecision applicability.Decision) (string, bool) {
+	switch {
+	case validity != validate.Valid && validity != validate.Warning:
+		return "invalid", false
+	case decision == safety.Block:
+		return "blocked", false
+	case appDecision == applicability.Rejected:
+		return "inapplicable", false
+	}
+	return "accept", true
+}
+
 // reviewActions builds the single action hint line. The leading "enter <verb>"
 // token names the accept outcome in words (accept/blocked/invalid) so the
 // consequence of pressing enter is legible without color, and the "?"/"c" hints
-// reflect whether each disclosure section is currently open.
-func reviewActions(decision safety.Decision, valid bool, appDecision applicability.Decision, whyExpanded, contextExpanded bool) string {
-	verb := "accept"
-	switch {
-	case !valid:
-		verb = "invalid"
-	case decision == safety.Block:
-		verb = "blocked"
-	case appDecision == applicability.Rejected:
-		verb = "inapplicable"
+// reflect whether each disclosure section is currently open. Esc returns to the
+// input screen; Ctrl-C remains the review-screen quit action.
+func reviewActions(decision safety.Decision, validity validate.Class, appDecision applicability.Decision, canEdit, whyExpanded, contextExpanded bool) string {
+	verb, _ := acceptVerb(decision, validity, appDecision)
+	edit := "e edit"
+	if !canEdit {
+		edit = "e edit unavailable"
 	}
 
 	why := "? why"
@@ -862,10 +940,10 @@ func reviewActions(decision safety.Decision, valid bool, appDecision applicabili
 
 	return strings.Join([]string{
 		"enter " + verb,
-		"e edit",
+		edit,
 		why,
 		usedContext,
-		"b back",
-		"esc cancel",
+		"b/esc back",
+		"ctrl+c quit",
 	}, " · ")
 }

@@ -11,6 +11,7 @@ require (
 	github.com/creack/pty v1.1.24
 	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/sys v0.38.0
+	golang.org/x/term v0.37.0
 )
 
 require (

@@ -56,9 +56,9 @@ const (
 
 // Sentinel errors classify Anthropic failures so callers can react with
 // errors.Is without matching on message text. They carry no upstream-controlled
-// data and stay prefixed "anthropic:". Cancellation and deadline errors are
-// returned unwrapped (context.Canceled / context.DeadlineExceeded) so the app's
-// existing errors.Is checks keep working.
+// data and stay prefixed "anthropic:". Caller cancellation and deadlines are
+// returned as their context sentinels; the provider's inner deadline adds a
+// stable label while preserving errors.Is(context.DeadlineExceeded).
 var (
 	// ErrAuth reports a rejected credential (HTTP 401/403).
 	ErrAuth = errors.New("anthropic: authentication error")
@@ -154,7 +154,7 @@ func (s *streamLifecycle) observe(event sdk.MessageStreamEventUnion) error {
 		}
 		delete(s.openBlocks, event.Index)
 	case "message_delta":
-		if !s.messageStarted || s.messageDelta || len(s.openBlocks) != 0 {
+		if !s.messageStarted || len(s.openBlocks) != 0 {
 			return errors.New("invalid message_delta position")
 		}
 		s.messageDelta = true
@@ -181,34 +181,18 @@ func (p Provider) Compile(ctx context.Context, request provider.Request) ([]prov
 		return nil, err
 	}
 
-	// Precedence: the unexported test seam, then the loopback-gated development
-	// override, then the pinned production endpoint. Both overrides are still
-	// classified lexically below, so neither can reach a remote host under a
-	// local-only policy or carry userinfo credentials.
-	baseURL := p.baseURL
-	if baseURL == "" {
-		baseURL = p.DevEndpoint
-	}
-	if baseURL == "" {
-		baseURL = defaultEndpoint
-	}
-	class, err := machinecontext.ClassifyEndpoint(baseURL)
+	baseURL, class, selection, err := provider.ResolveCompileSetup(provider.CompileSetup{
+		Name:            "anthropic",
+		TestEndpoint:    p.baseURL,
+		DevEndpoint:     p.DevEndpoint,
+		DefaultEndpoint: defaultEndpoint,
+		Policy:          p.Policy,
+		SharedFields:    p.SharedFields,
+		APIKey:          p.APIKey,
+		KeyHint:         "run `clai auth login --provider anthropic` or set ANTHROPIC_API_KEY",
+	}, request)
 	if err != nil {
-		return nil, fmt.Errorf("anthropic: %w", err)
-	}
-	policy := p.Policy
-	if policy == "" {
-		policy = machinecontext.DefaultPolicy(false, class)
-	}
-	if policy == machinecontext.PolicyLocalOnly && class == machinecontext.EndpointRemote {
-		return nil, errors.New("anthropic: local-only context policy prohibits a remote endpoint")
-	}
-	selection, err := machinecontext.Select(request.Context, request.Capabilities, policy, p.SharedFields)
-	if err != nil {
-		return nil, fmt.Errorf("anthropic: context policy: %w", err)
-	}
-	if p.APIKey == "" {
-		return nil, errors.New("anthropic: no API key (run `clai auth login --provider anthropic` or set ANTHROPIC_API_KEY)")
+		return nil, err
 	}
 
 	model := p.Model
@@ -266,10 +250,11 @@ func (p Provider) Compile(ctx context.Context, request provider.Request) ([]prov
 		timeout = defaultTimeout
 	}
 	// The context deadline is the single authoritative request bound, so a
-	// cancellation or timeout surfaces cleanly through requestCtx.Err() below.
+	// cancellation or timeout surfaces cleanly through context.Cause below.
 	// The SDK's own WithRequestTimeout is intentionally not set to avoid a second
 	// racing deadline that would muddy classification.
-	requestCtx, cancel := context.WithTimeout(ctx, timeout)
+	timeoutErr := fmt.Errorf("anthropic: request timed out after %s: %w", timeout, context.DeadlineExceeded)
+	requestCtx, cancel := context.WithTimeoutCause(ctx, timeout, timeoutErr)
 	defer cancel()
 
 	client := sdk.NewClient(
@@ -285,31 +270,36 @@ func (p Provider) Compile(ctx context.Context, request provider.Request) ([]prov
 
 	message := sdk.Message{}
 	lifecycle := streamLifecycle{}
+	candidateBytes := 0
 	for stream.Next() {
 		// Cancellation and deadline always win, including when the current event is
 		// malformed and would otherwise be classified as a provider failure.
-		if ctxErr := requestCtx.Err(); ctxErr != nil {
+		if ctxErr := context.Cause(requestCtx); ctxErr != nil {
 			return nil, ctxErr
 		}
 		event := stream.Current()
 		if err := lifecycle.observe(event); err != nil {
-			if ctxErr := requestCtx.Err(); ctxErr != nil {
+			if ctxErr := context.Cause(requestCtx); ctxErr != nil {
 				return nil, ctxErr
 			}
 			return nil, fmt.Errorf("%w: invalid stream lifecycle", ErrIncompleteResponse)
 		}
+		if added := candidateTextBytes(event); added > maxCandidateBytes-candidateBytes {
+			return nil, fmt.Errorf("%w: response text exceeds size limit", ErrIncompleteResponse)
+		} else {
+			candidateBytes += added
+		}
 		if err := message.Accumulate(event); err != nil {
-			if ctxErr := requestCtx.Err(); ctxErr != nil {
+			if ctxErr := context.Cause(requestCtx); ctxErr != nil {
 				return nil, ctxErr
 			}
 			// A malformed event invalidates the whole accumulation.
 			return nil, fmt.Errorf("%w: accumulate", ErrIncompleteResponse)
 		}
 	}
-	// Cancellation and deadline take precedence over any stream error text and
-	// are returned unwrapped so the app suppresses / re-labels them as it does
-	// for every provider.
-	if ctxErr := requestCtx.Err(); ctxErr != nil {
+	// Cancellation and deadlines take precedence over any stream error text.
+	// Caller causes remain unchanged; the inner deadline retains its safe label.
+	if ctxErr := context.Cause(requestCtx); ctxErr != nil {
 		return nil, ctxErr
 	}
 	if err := stream.Err(); err != nil {
@@ -333,6 +323,32 @@ func (p Provider) Compile(ctx context.Context, request provider.Request) ([]prov
 		return nil, fmt.Errorf("%w: candidate decode failed", ErrIncompleteResponse)
 	}
 	return []provider.Candidate{candidate}, nil
+}
+
+// candidateTextBytes returns the candidate-bearing text introduced by one
+// event. The caller checks the cumulative total before passing the event to the
+// SDK accumulator, so a stream cannot grow the assembled candidate past the
+// package's 64 KiB bound.
+func candidateTextBytes(event sdk.MessageStreamEventUnion) int {
+	switch event.Type {
+	case "message_start":
+		total := 0
+		for _, block := range event.Message.Content {
+			if block.Type == "text" {
+				total += len(block.Text)
+			}
+		}
+		return total
+	case "content_block_start":
+		if event.ContentBlock.Type == "text" {
+			return len(event.ContentBlock.Text)
+		}
+	case "content_block_delta":
+		if event.Delta.Type == "text_delta" {
+			return len(event.Delta.Text)
+		}
+	}
+	return 0
 }
 
 // buildUserContent marshals the intent plus only the policy-selected context
@@ -389,9 +405,10 @@ func singleTextPayload(message sdk.Message) (string, error) {
 }
 
 // classifyStreamError maps a non-context stream error to a differentiated,
-// wrappable sentinel. For an *sdk.Error only the numeric status is reflected;
-// the upstream body, reason phrase, and any mid-stream error text are never
-// echoed, so a hostile upstream cannot inject text into the error.
+// wrappable sentinel. For an *sdk.Error only its recognized Type and numeric
+// status affect classification; the upstream body, reason phrase, unknown type,
+// and mid-stream error text are never echoed, so a hostile upstream cannot
+// inject text into the error.
 func classifyStreamError(err error) error {
 	var apiErr *sdk.Error
 	if errors.As(err, &apiErr) {
@@ -405,8 +422,22 @@ func classifyStreamError(err error) error {
 		case status == 529 || (status >= 500 && status <= 599):
 			return fmt.Errorf("%w (HTTP %d): transient upstream failure, retry later", ErrServer, status)
 		}
-		// A mid-stream error event carries the 200 response status; treat any
-		// other status as an incomplete response without echoing upstream text.
+		// A mid-stream error event carries the original 200 response status, so
+		// its recognized error type supplies the missing class.
+		if apiErr.StatusCode == http.StatusOK {
+			switch apiErr.Type() {
+			case sdk.ErrorTypeAuthenticationError, sdk.ErrorTypePermissionError:
+				return fmt.Errorf("%w: re-authenticate or check the API key (run `clai auth login --provider anthropic` or set ANTHROPIC_API_KEY)", ErrAuth)
+			case sdk.ErrorTypeInvalidRequestError, sdk.ErrorTypeNotFoundError, sdk.ErrorTypeBillingError:
+				return fmt.Errorf("%w: the request or model was rejected", ErrInvalidRequest)
+			case sdk.ErrorTypeRateLimitError:
+				return fmt.Errorf("%w: back off before retrying", ErrRateLimited)
+			case sdk.ErrorTypeOverloadedError, sdk.ErrorTypeTimeoutError, sdk.ErrorTypeAPIError:
+				return fmt.Errorf("%w: transient upstream failure, retry later", ErrServer)
+			}
+		}
+		// Any unrecognized status/type combination is incomplete without echoing
+		// either upstream-controlled field.
 		return fmt.Errorf("%w: stream reported an error", ErrIncompleteResponse)
 	}
 	// Transport / decode error: never echo raw text (the response is
@@ -417,23 +448,9 @@ func classifyStreamError(err error) error {
 // classifyProxyMode reports "direct", "configured-proxy", or "unknown" for the
 // base transport. It never reveals a proxy URL or credentials.
 func classifyProxyMode(base http.RoundTripper, endpoint string) string {
-	httpTransport, ok := base.(*http.Transport)
-	if !ok {
-		return "unknown"
-	}
-	if httpTransport.Proxy == nil {
-		return "direct"
-	}
 	req, err := http.NewRequest(http.MethodPost, endpoint, nil)
 	if err != nil {
 		return "unknown"
 	}
-	proxyURL, err := httpTransport.Proxy(req)
-	if err != nil {
-		return "unknown"
-	}
-	if proxyURL == nil {
-		return "direct"
-	}
-	return "configured-proxy"
+	return provider.ProxyMode(base, req)
 }

@@ -17,7 +17,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestIntermediateConfigComponentSymlinkRejected(t *testing.T) {
+func TestIntermediateConfigComponentSymlinkCanonicalized(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -32,8 +32,11 @@ func TestIntermediateConfigComponentSymlinkRejected(t *testing.T) {
 	}
 	useTestBackendsAt(t, &fakeKeyring{setErr: errors.New("unavailable")}, filepath.Join(link, "config"))
 
-	if err := Store("openrouter", "secret-value"); err == nil || !strings.Contains(err.Error(), "securely traverse") {
-		t.Fatalf("Store error = %v, want intermediate symlink rejection", err)
+	if err := Store("openrouter", "secret-value"); err != nil {
+		t.Fatalf("Store through intermediate config symlink: %v", err)
+	}
+	if got := readCredentialMapFixture(t, realBase)["openrouter"]; got != "secret-value" {
+		t.Fatalf("stored credential = %q, want secret-value", got)
 	}
 }
 
@@ -63,7 +66,7 @@ func TestIntermediateConfigComponentSubstitutionFailsClosed(t *testing.T) {
 	assertNoCredentialTemps(t, root)
 }
 
-func TestPostRenameDirectorySyncFailureErasesCredential(t *testing.T) {
+func TestPostRenameDirectorySyncFailurePreservesCredential(t *testing.T) {
 	syncErr := errors.New("injected directory sync failure")
 	kr := &fakeKeyring{setErr: errors.New("unavailable")}
 	base := useTestBackends(t, kr)
@@ -75,23 +78,18 @@ func TestPostRenameDirectorySyncFailureErasesCredential(t *testing.T) {
 	if !errors.Is(err, syncErr) {
 		t.Fatalf("Store error = %v, want sync failure", err)
 	}
-	_, path := credentialPaths(base)
-	content, readErr := os.ReadFile(path)
-	if readErr != nil {
-		t.Fatalf("read erased credential: %v", readErr)
-	}
-	if len(content) != 0 {
-		t.Fatalf("credential retained secret after fsync failure: %q", content)
+	if got := readCredentialMapFixture(t, base)["openrouter"]; got != "secret-value" {
+		t.Fatalf("credential after fsync failure = %q, want installed value", got)
 	}
 }
 
-func TestPostRenameFinalizationFailuresEraseMovedCredential(t *testing.T) {
+func TestCleanupErrorAfterInstallPreservesCredential(t *testing.T) {
 	tests := []struct {
 		name  string
 		apply func(*filesystemHooks, error)
 	}{
-		{name: "temp close", apply: func(hooks *filesystemHooks, injected error) {
-			hooks.closeTemp = func(file *os.File) error { return errors.Join(file.Close(), injected) }
+		{name: "credential close", apply: func(hooks *filesystemHooks, injected error) {
+			hooks.closeCredential = func(file *os.File) error { return errors.Join(file.Close(), injected) }
 		}},
 		{name: "unlock", apply: func(hooks *filesystemHooks, injected error) {
 			hooks.unlockLock = func(fd int) error { return errors.Join(unix.Flock(fd, unix.LOCK_UN), injected) }
@@ -102,23 +100,14 @@ func TestPostRenameFinalizationFailuresEraseMovedCredential(t *testing.T) {
 		{name: "app directory close", apply: func(hooks *filesystemHooks, injected error) {
 			hooks.closeAppDirectory = func(file *os.File) error { return errors.Join(file.Close(), injected) }
 		}},
-		{name: "base directory close", apply: func(hooks *filesystemHooks, injected error) {
-			hooks.closeBaseDirectory = func(file *os.File) error { return errors.Join(file.Close(), injected) }
-		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			injected := errors.New("injected " + test.name + " failure")
 			kr := &fakeKeyring{setErr: errors.New("unavailable")}
 			base := useTestBackends(t, kr)
-			hooks := filesystemHooks{
-				afterRenameBeforeVerification: func(_ string, path string) error {
-					if err := os.Rename(path, path+".moved"); err != nil {
-						return err
-					}
-					return os.WriteFile(path, []byte(`{"openrouter":"substitute"}`), 0o600)
-				},
-			}
+			writeCredentialFixture(t, base, `{"openrouter":"old-value"}`)
+			hooks := filesystemHooks{}
 			test.apply(&hooks, injected)
 			useFilesystemHooks(t, hooks)
 
@@ -126,15 +115,63 @@ func TestPostRenameFinalizationFailuresEraseMovedCredential(t *testing.T) {
 			if !errors.Is(err, injected) {
 				t.Fatalf("Store error = %v, want injected finalization failure", err)
 			}
-			_, path := credentialPaths(base)
-			content, readErr := os.ReadFile(path + ".moved")
-			if readErr != nil {
-				t.Fatalf("read moved credential inode: %v", readErr)
-			}
-			if len(content) != 0 {
-				t.Fatalf("moved credential retained secret bytes: %q", content)
+			if got := readCredentialMapFixture(t, base)["openrouter"]; got != "secret-value" {
+				t.Fatalf("credential after cleanup failure = %q, want installed value", got)
 			}
 		})
+	}
+}
+
+func TestIntegrityFailureErasesAndUnlinksCredential(t *testing.T) {
+	kr := &fakeKeyring{setErr: errors.New("unavailable")}
+	base := useTestBackends(t, kr)
+	var retainedPath string
+	useFilesystemHooks(t, filesystemHooks{
+		afterRenameBeforeVerification: func(_ string, path string) error {
+			retainedPath = path + ".retained"
+			return os.Link(path, retainedPath)
+		},
+	})
+
+	err := Store("openrouter", "secret-value")
+	if err == nil || !strings.Contains(err.Error(), "link count") {
+		t.Fatalf("Store error = %v, want installed link-count rejection", err)
+	}
+	_, path := credentialPaths(base)
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("installed credential remains after integrity failure: %v", err)
+	}
+	content, err := os.ReadFile(retainedPath)
+	if err != nil {
+		t.Fatalf("read retained credential inode: %v", err)
+	}
+	if len(content) != 0 {
+		t.Fatalf("retained credential inode contains secret bytes: %q", content)
+	}
+}
+
+func TestResolveAfterIntegrityEraseReportsNotConfigured(t *testing.T) {
+	kr := &fakeKeyring{setErr: errors.New("unavailable")}
+	base := useTestBackends(t, kr)
+	useFilesystemHooks(t, filesystemHooks{
+		afterRenameBeforeVerification: func(_ string, path string) error {
+			return os.Link(path, path+".retained")
+		},
+	})
+
+	if err := Store("openrouter", "secret-value"); err == nil {
+		t.Fatal("Store unexpectedly accepted installed link-count change")
+	}
+	_, path := credentialPaths(base)
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("installed credential remains after integrity failure: %v", err)
+	}
+	key, err := Resolve("openrouter", "")
+	if err != nil {
+		t.Fatalf("Resolve after integrity erase: %v", err)
+	}
+	if key != "" {
+		t.Fatalf("Resolve after integrity erase = %q, want not configured", key)
 	}
 }
 
@@ -296,6 +333,11 @@ func TestCredentialLockTimeoutIsBoundedAndReleasesDescriptors(t *testing.T) {
 	elapsed := time.Since(start)
 	if err == nil || !strings.Contains(err.Error(), "timed out acquiring credential lock") {
 		t.Fatalf("Store error = %v, want lock timeout", err)
+	}
+	for _, want := range []string{filepath.Join(dir, lockName), "another clai", "retrying is safe"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Store lock-timeout error = %q, want %q", err, want)
+		}
 	}
 	if elapsed < credentialLockTimeout || elapsed > credentialLockTimeout+time.Second {
 		t.Fatalf("lock timeout elapsed %v, want [%v,%v]", elapsed, credentialLockTimeout, credentialLockTimeout+time.Second)

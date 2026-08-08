@@ -4,6 +4,7 @@ package auth
 
 import (
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -92,6 +93,63 @@ func TestDirectorySubstitutionAfterTempCreationCleansTemp(t *testing.T) {
 		t.Fatalf("Store error = %v, want directory substitution rejection", err)
 	}
 	assertNoCredentialTemps(t, base)
+}
+
+func TestForeignCredentialTransientIsErasedAndRemovedWithoutBlockingRead(t *testing.T) {
+	kr := &fakeKeyring{getErr: keyring.ErrNotFound}
+	base := useTestBackends(t, kr)
+	dir, _ := credentialPaths(base)
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, ".credentials-foreign.tmp")
+	if err := os.WriteFile(path, []byte("stale-secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	held, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+
+	if key, err := Resolve("openrouter", ""); err != nil || key != "" {
+		t.Fatalf("Resolve with foreign transient = %q, %v", key, err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("foreign credential transient remains: %v", err)
+	}
+	if _, err := held.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(held)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != 0 {
+		t.Fatalf("held stale transient still contains %d bytes", len(data))
+	}
+}
+
+func TestReadOnlyCredentialDirectoryFallsBackToLocklessPreferredRead(t *testing.T) {
+	kr := &fakeKeyring{getErr: keyring.ErrNotFound}
+	base := useTestBackends(t, kr)
+	path := writeCredentialFixture(t, base, `{"openrouter":"stored-secret"}`)
+	dir := filepath.Dir(path)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	key, err := Resolve("openrouter", "")
+	if err != nil {
+		t.Fatalf("Resolve from read-only credential directory: %v", err)
+	}
+	if key != "stored-secret" {
+		t.Fatalf("Resolve = %q, want stored-secret", key)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, lockName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("lock was created in read-only directory: %v", err)
+	}
 }
 
 func TestDestinationSubstitutionAfterRenameFailsVerification(t *testing.T) {

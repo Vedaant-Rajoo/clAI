@@ -26,8 +26,12 @@ func TestHelpRouting(t *testing.T) {
 		{"top --help", []string{"--help"}, exitOK},
 		{"help auth", []string{"help", "auth"}, exitOK},
 		{"auth help", []string{"auth", "help"}, exitOK},
-		{"auth -h rejected before verb", []string{"auth", "-h"}, exitUsage},
-		{"auth --help rejected before verb", []string{"auth", "--help"}, exitUsage},
+		{"auth -h before verb", []string{"auth", "-h"}, exitOK},
+		{"auth --help before verb", []string{"auth", "--help"}, exitOK},
+		{"auth login -h", []string{"auth", "login", "-h"}, exitOK},
+		{"auth login --help", []string{"auth", "login", "--help"}, exitOK},
+		{"auth flag then --help", []string{"auth", "status", "--provider", "anthropic", "--help"}, exitOK},
+		{"auth trailing help", []string{"auth", "status", "--provider", "anthropic", "help"}, exitOK},
 		{"help init", []string{"help", "init"}, exitOK},
 		{"init help", []string{"init", "help"}, exitOK},
 		{"init -h", []string{"init", "-h"}, exitOK},
@@ -35,6 +39,7 @@ func TestHelpRouting(t *testing.T) {
 		{"version help", []string{"version", "help"}, exitOK},
 		{"help version", []string{"help", "version"}, exitOK},
 		{"help widget", []string{"help", "widget"}, exitOK},
+		{"help storage", []string{"help", "storage"}, exitOK},
 		{"widget help", []string{"widget", "help"}, exitOK},
 		{"widget -h", []string{"widget", "-h"}, exitOK},
 		{"help unknown", []string{"help", "bogus"}, exitUsage},
@@ -72,13 +77,34 @@ func TestMainHelpContent(t *testing.T) {
 		"--copy", "--print-command", "--provider", "--model",
 		"--api-key", "--fallback-rules", "--context-policy", "--share-context", "--version",
 		"rules", "openrouter", "anthropic",
+		"clai help storage",
+		"CLAI_DELIVERY      default delivery: clipboard | stdout",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("main help missing %q", want)
 		}
 	}
+
+	// The --copy entry is pinned as one contiguous rendered block rather than
+	// as separate substrings: the retention warning is only truthful while it
+	// stays attached to --copy and in this order. The block states the
+	// accepted-command scope, how clipboard delivery is selected, that the
+	// copied command persists until overwritten and may be retained by other
+	// desktop software, and that clai never clears it automatically.
+	const copyBlock = `  --copy             copy the accepted command to the clipboard
+                     (or choose clipboard delivery in config.json)
+                     it remains until overwritten; desktop software may retain it
+                     clai does not clear it automatically
+`
+	if !strings.Contains(out, copyBlock) {
+		t.Errorf("main help does not render the --copy block contiguously.\nwant block:\n%s\ngot help:\n%s", copyBlock, out)
+	}
+
 	if strings.Contains(out, "widget") {
 		t.Error("main help should not list the internal widget command")
+	}
+	if strings.Contains(out, "clipboard | stdout | insert") {
+		t.Error("main help documents the unsupported CLAI_DELIVERY=insert value")
 	}
 }
 
@@ -96,6 +122,9 @@ func TestAuthHelpContent(t *testing.T) {
 		"clai auth status [--provider <name>] [--api-key <value>]",
 		"clai auth logout [--provider <name>]",
 		"space-separated",
+		"--help",
+		"clai help storage",
+		"OpenAI credentials can be stored, but the provider is not usable yet.",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("auth help missing %q", want)
@@ -104,7 +133,7 @@ func TestAuthHelpContent(t *testing.T) {
 }
 
 func TestLookupCommand(t *testing.T) {
-	for _, name := range []string{"auth", "init", "version", "widget"} {
+	for _, name := range []string{"auth", "init", "version", "storage", "widget"} {
 		if _, ok := lookupCommand(name); !ok {
 			t.Errorf("lookupCommand(%q) not found", name)
 		}
@@ -114,14 +143,24 @@ func TestLookupCommand(t *testing.T) {
 	}
 }
 
-func TestMainHelpConfigRoot(t *testing.T) {
+func TestStorageHelpConfigRoot(t *testing.T) {
 	var buf bytes.Buffer
 	printMainHelp(&buf)
-	help := buf.String()
+	mainHelp := buf.String()
+	if !strings.Contains(mainHelp, "clai help storage") {
+		t.Fatal("main help does not route detailed storage guidance")
+	}
+	if strings.Contains(mainHelp, "$XDG_CONFIG_HOME/clai/config.json") {
+		t.Fatal("main help still front-loads detailed storage paths")
+	}
+
+	help := commandLong("storage")
 
 	for _, want := range []string{
 		"$XDG_CONFIG_HOME/clai/config.json",
+		"$XDG_CONFIG_HOME/clai/credentials.json",
 		"$HOME/.config/clai/config.json",
+		"$HOME/.config/clai/credentials.json",
 		"XDG_CONFIG_HOME must be absolute",
 		"A relative XDG_CONFIG_HOME is invalid",
 		"Windows keeps its platform user configuration directory",
@@ -137,18 +176,13 @@ func TestMainHelpConfigRoot(t *testing.T) {
 	}
 }
 
-func TestAuthHelpConfigRoot(t *testing.T) {
+func TestAuthHelpRoutesStorageDetails(t *testing.T) {
 	authHelp := commandLong("auth")
-	for _, want := range []string{
-		"$XDG_CONFIG_HOME/clai/credentials.json",
-		"$HOME/.config/clai/credentials.json",
-		"OS keychain entries do not move",
-		"Windows keeps its platform user configuration directory",
-		"old-only macOS Application Support state migrates one way",
-	} {
-		if !strings.Contains(authHelp, want) {
-			t.Errorf("auth help missing config-root contract %q", want)
-		}
+	if !strings.Contains(authHelp, "clai help storage") {
+		t.Fatal("auth help does not route detailed storage guidance")
+	}
+	if strings.Contains(authHelp, "$XDG_CONFIG_HOME/clai/credentials.json") {
+		t.Fatal("auth help still front-loads detailed storage paths")
 	}
 
 	docsPath := filepath.Join("..", "..", "docs", "providers.md")

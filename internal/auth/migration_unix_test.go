@@ -449,6 +449,37 @@ func TestCredentialMigrationInterruptedRecovery(t *testing.T) {
 	assertNoCredentialTemps(t, legacy)
 }
 
+func TestCredentialMigrationCleanupFailurePreservesPreferredAfterLegacyRemoval(t *testing.T) {
+	preferred, legacy := useCredentialMigrationRoots(t, &fakeKeyring{getErr: keyring.ErrNotFound})
+	writeCredentialMapFixture(t, legacy, map[string]string{
+		"openrouter": "legacy-openrouter-secret",
+		"anthropic":  "legacy-anthropic-secret",
+	})
+	closeErr := errors.New("injected post-migration directory close failure")
+	useFilesystemHooks(t, filesystemHooks{
+		closeAppDirectory: func(file *os.File) error {
+			actual := file.Close()
+			_, preferredErr := os.Stat(credentialFileAt(preferred))
+			_, legacyErr := os.Stat(credentialFileAt(legacy))
+			if preferredErr == nil && errors.Is(legacyErr, os.ErrNotExist) {
+				return errors.Join(actual, closeErr)
+			}
+			return actual
+		},
+	})
+
+	if _, err := Resolve("openrouter", ""); !errors.Is(err, closeErr) {
+		t.Fatalf("Resolve migration error = %v, want cleanup failure", err)
+	}
+	credentials := readCredentialMapFixture(t, preferred)
+	if len(credentials) != 2 ||
+		credentials["openrouter"] != "legacy-openrouter-secret" ||
+		credentials["anthropic"] != "legacy-anthropic-secret" {
+		t.Fatalf("preferred credentials after cleanup failure = %#v", credentials)
+	}
+	assertLegacyCredentialRemoved(t, legacy)
+}
+
 func TestCredentialMigrationConcurrent(t *testing.T) {
 	t.Run("goroutines acquire canonical order", func(t *testing.T) {
 		root, err := filepath.EvalSymlinks(t.TempDir())

@@ -44,7 +44,7 @@ func ResolveExecutable(command SimpleCommand) ExecutableResolution {
 			})
 			return resolution
 		}
-		base := executableBase(word.Value)
+		base := ExecutableBase(word.Value)
 		switch base {
 		case "env":
 			wrapper := Wrapper{Name: "env", Word: word}
@@ -140,7 +140,10 @@ func ResolveExecutable(command SimpleCommand) ExecutableResolution {
 	return resolution
 }
 
-func executableBase(value string) string {
+// ExecutableBase returns the base name of an executable word after trimming
+// trailing slashes. It is shared with policy packages that classify
+// executables without re-deriving the parser's notion of a base name.
+func ExecutableBase(value string) string {
 	value = strings.TrimRight(value, "/")
 	if value == "" {
 		return ""

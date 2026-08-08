@@ -305,6 +305,10 @@ func TestCompileTimeout(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
 	}
+	const want = "openrouter: request timed out after 20ms: context deadline exceeded"
+	if err.Error() != want {
+		t.Fatalf("err = %q, want %q", err, want)
+	}
 }
 
 func TestRemoteMinimalGoldenBodyHashAndForbiddenAbsence(t *testing.T) {
@@ -716,6 +720,12 @@ func TestCompileClassifiesHTTPErrors(t *testing.T) {
 			[]string{"openrouter:", "authentication error", "HTTP 401", "re-authenticate"}, nil},
 		{"forbidden", http.StatusForbidden, "", ErrAuth,
 			[]string{"authentication error", "HTTP 403"}, nil},
+		{"bad-request", http.StatusBadRequest, "", ErrInvalidRequest,
+			[]string{"invalid request", "HTTP 400", "check --model"}, nil},
+		{"not-found", http.StatusNotFound, "", ErrInvalidRequest,
+			[]string{"invalid request", "HTTP 404", "check --model"}, nil},
+		{"unprocessable", http.StatusUnprocessableEntity, "", ErrInvalidRequest,
+			[]string{"invalid request", "HTTP 422", "check --model"}, nil},
 		{"rate-limited-with-retry-after", http.StatusTooManyRequests, "42", ErrRateLimited,
 			[]string{"rate limited", "HTTP 429", "retry after 42", "back off"}, nil},
 		{"rate-limited-no-retry-after", http.StatusTooManyRequests, "", ErrRateLimited,
@@ -766,7 +776,7 @@ func TestCompileClassifiesHTTPErrors(t *testing.T) {
 }
 
 func TestCompileGenericStatusFallback(t *testing.T) {
-	for _, status := range []int{http.StatusBadRequest, http.StatusNotFound, http.StatusTeapot} {
+	for _, status := range []int{http.StatusMovedPermanently, http.StatusTeapot} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(status)
@@ -780,7 +790,7 @@ func TestCompileGenericStatusFallback(t *testing.T) {
 			if err == nil || err.Error() != want {
 				t.Fatalf("err = %v, want %q", err, want)
 			}
-			if errors.Is(err, ErrAuth) || errors.Is(err, ErrRateLimited) || errors.Is(err, ErrServer) {
+			if errors.Is(err, ErrAuth) || errors.Is(err, ErrInvalidRequest) || errors.Is(err, ErrRateLimited) || errors.Is(err, ErrServer) {
 				t.Fatalf("generic status %d matched a specific sentinel: %v", status, err)
 			}
 		})

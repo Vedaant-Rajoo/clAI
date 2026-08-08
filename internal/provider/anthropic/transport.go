@@ -2,8 +2,6 @@ package anthropic
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -71,26 +69,8 @@ func captureBody(req *http.Request) ([]byte, error) {
 }
 
 // makeReceipt builds the provider-neutral receipt over the exact body bytes.
-// Its shape and hashing mirror the OpenRouter provider so both emit the same
+// The shared constructor guarantees both remote providers emit the same
 // request-receipt/v1 record.
 func makeReceipt(model, endpoint string, class machinecontext.EndpointClass, proxyMode string, selection machinecontext.Selection, body []byte) provider.RequestReceipt {
-	sum := sha256.Sum256(body)
-	receipt := provider.RequestReceipt{
-		Version: "request-receipt/v1", Provider: "anthropic", Model: model,
-		EffectiveEndpoint: endpoint, EndpointClassification: class, ProxyMode: proxyMode,
-		ContextPolicy: selection.Policy, SelectorVersion: machinecontext.SelectorVersion,
-		RequestBody:     append([]byte(nil), body...),
-		RequestBodyHash: provider.BodyHash{Algorithm: "sha256", Value: hex.EncodeToString(sum[:])},
-	}
-	for _, field := range selection.Capsule.Fields {
-		switch field.Sharing {
-		case machinecontext.SharingSelected:
-			receipt.SelectedFields = append(receipt.SelectedFields, field)
-		case machinecontext.SharingRedacted:
-			receipt.RedactedFields = append(receipt.RedactedFields, field)
-		case machinecontext.SharingOmitted:
-			receipt.OmittedFields = append(receipt.OmittedFields, field)
-		}
-	}
-	return receipt
+	return provider.NewReceipt("anthropic", model, endpoint, class, proxyMode, selection, body)
 }

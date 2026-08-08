@@ -16,6 +16,7 @@ func EvaluateEdited(command string, inventory Inventory) Result {
 	}
 
 	seen := make(map[string]bool)
+	var tools []string
 	var missing []string
 	for _, pipeline := range parsed.List.Pipelines {
 		for _, simple := range pipeline.Commands {
@@ -24,19 +25,20 @@ func EvaluateEdited(command string, inventory Inventory) Result {
 				continue
 			}
 			seen[resolved.Base] = true
+			tools = append(tools, resolved.Base)
 			fact, known := inventory.LookupTool(resolved.Base)
-			if !known || !fact.Present {
+			if known && !fact.Present {
 				missing = append(missing, resolved.Base)
 			}
 		}
 	}
 
 	if len(missing) == 0 {
-		return Result{Decision: Applicable}
+		return Result{Decision: Applicable, Tools: tools}
 	}
 	reasons := make([]string, len(missing))
 	for index, name := range missing {
-		reasons[index] = fmt.Sprintf("tool %s: may not work (not present in capability inventory)", name)
+		reasons[index] = fmt.Sprintf("tool %s: may not work (not installed)", name)
 	}
-	return Result{Decision: Marked, Reasons: reasons}
+	return Result{Decision: Marked, Reasons: reasons, Tools: tools}
 }

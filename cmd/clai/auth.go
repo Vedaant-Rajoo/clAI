@@ -23,6 +23,12 @@ import (
 	"unicode/utf8"
 
 	"github.com/Vedaant-Rajoo/clai/internal/auth"
+	"golang.org/x/term"
+)
+
+var (
+	stdinIsTerminal    = term.IsTerminal
+	readTerminalSecret = term.ReadPassword
 )
 
 const (
@@ -229,7 +235,7 @@ func (c cli) runAuth(command authCommand) int {
 func (c cli) authLogin(provider string) int {
 	readKey := c.authReadLine
 	if readKey == nil {
-		readKey = readLine
+		readKey = func() (string, error) { return readLine(os.Stdin, c.stdout) }
 	}
 	switch provider {
 	case "openrouter":
@@ -250,6 +256,9 @@ func (c cli) authLogin(provider string) int {
 		}
 		return c.storeKey(provider, key)
 	case "anthropic", "openai":
+		if provider == "openai" {
+			fmt.Fprintln(c.stdout, "OpenAI credentials can be stored, but the provider is not usable yet.")
+		}
 		fmt.Fprintf(c.stdout, "Paste your %s API key: ", provider)
 		key, err := readKey()
 		if err != nil {
@@ -267,13 +276,22 @@ func (c cli) authLogin(provider string) int {
 }
 
 func (c cli) storeKey(provider, key string) int {
-	store := c.authStore
-	if store == nil {
-		store = auth.Store
+	var result auth.StoreResult
+	var err error
+	switch {
+	case c.authStoreDetailed != nil:
+		result, err = c.authStoreDetailed(provider, key)
+	case c.authStore != nil:
+		err = c.authStore(provider, key)
+	default:
+		result, err = auth.StoreDetailed(provider, key)
 	}
-	if err := store(provider, key); err != nil {
+	if err != nil {
 		fmt.Fprintf(c.stderr, "clai auth login: store key: %v\n", err)
 		return exitError
+	}
+	if result.Warning != nil {
+		fmt.Fprintf(c.stderr, "clai auth login: warning: %v\n", result.Warning)
 	}
 	sourceWithError := c.authSourceWithError
 	if sourceWithError == nil {
@@ -299,7 +317,7 @@ func (c cli) authStatus(provider, explicit string) int {
 		return exitError
 	}
 	if source == "none" {
-		fmt.Fprintf(c.stdout, "%s: not authenticated\n", provider)
+		fmt.Fprintf(c.stdout, "%s: not authenticated; run `clai auth login --provider %s`\n", provider, provider)
 		return exitError
 	}
 	fmt.Fprintf(c.stdout, "%s: authenticated (%s)\n", provider, source)
@@ -319,8 +337,19 @@ func (c cli) authLogout(provider string) int {
 	return exitOK
 }
 
-func readLine() (string, error) {
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+func readLine(input *os.File, output io.Writer) (string, error) {
+	if stdinIsTerminal(int(input.Fd())) {
+		line, err := readTerminalSecret(int(input.Fd()))
+		// ReadPassword disables terminal echo, including the newline. Move the
+		// next status or error message onto a fresh line after input completes.
+		fmt.Fprintln(output)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(line)), nil
+	}
+
+	line, err := bufio.NewReader(input).ReadString('\n')
 	if err != nil && !(errors.Is(err, io.EOF) && line != "") {
 		if errors.Is(err, io.EOF) {
 			return "", errors.New("end of input")

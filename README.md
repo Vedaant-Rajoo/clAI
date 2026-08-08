@@ -2,6 +2,37 @@
 
 Local-first command compiler TUI.
 
+## Install
+
+clai requires Go 1.26.2 or newer. Install the latest release directly:
+
+```sh
+go install github.com/Vedaant-Rajoo/clai/cmd/clai@latest
+```
+
+Or install from a cloned checkout:
+
+```sh
+git clone https://github.com/Vedaant-Rajoo/clai.git
+cd clai
+make install
+```
+
+Both commands install `clai` into Go's binary directory. Make sure `GOBIN` (or
+`$(go env GOPATH)/bin` when `GOBIN` is unset) is on your `PATH`.
+
+## Quickstart
+
+1. Run `clai` to open the interactive screen.
+2. Describe the task you want the shell to perform in plain language, such as
+   `run the project tests`.
+3. Review the suggested command, then accept it only when you are comfortable
+   running it.
+
+For a prompt widget, run `clai init <shell>` with `fish`, `bash`, or `zsh`, then
+follow the matching [shell setup guide](docs/shell/README.md). The widget inserts
+accepted commands for review; it never runs them automatically.
+
 ## Commands
 
 - `clai auth` — manage provider credentials (login, status, logout)
@@ -23,6 +54,19 @@ automatically, so you can inspect or edit it before pressing Enter.
 - [Fish setup](docs/shell/fish.md)
 - [Bash setup](docs/shell/bash.md)
 - [Zsh setup](docs/shell/zsh.md)
+
+## Trust and retention
+
+clai presents generated commands for review, or inserts them into your editable
+shell prompt; it never runs them automatically. Clipboard delivery is opt-in,
+and a copied command remains available until another clipboard write overwrites
+it.
+
+Intent pasted into clai follows the same data-flow rules as typed intent. If
+you selected a remote provider, submitting it may send it to that provider.
+
+For the full widget and clipboard trust and retention contract, see
+[docs/privacy.md](docs/privacy.md).
 
 ## Providers
 

@@ -13,42 +13,69 @@ var placeholderPattern = regexp.MustCompile(`<[^<>[:space:]][^<>]*>`)
 
 const MaxCommandBytes = 8 * 1024
 
+// Class distinguishes commands clai can fully validate, commands containing
+// well-formed syntax outside its non-evaluating parser subset, and commands
+// that must not be accepted or exported.
+type Class string
+
+const (
+	Valid   Class = "valid"
+	Warning Class = "warning"
+	Invalid Class = "invalid"
+)
+
 type Result struct {
+	Class Class
+	// Valid reports export eligibility. Warning-class results remain eligible;
+	// callers that render validation details should also inspect Class.
 	Valid   bool
 	Reasons []string
 }
 
 // Command validates whether command belongs to the bounded common shell subset
-// eligible for review and export. It rejects malformed and unsupported syntax;
-// it never repairs, strips, expands, or evaluates command text.
+// eligible for review and export. Unsupported but well-formed syntax produces a
+// visible warning; malformed syntax, prohibited bytes/format characters,
+// unresolved placeholders, and the byte limit remain invalid. It never repairs,
+// strips, expands, or evaluates command text.
 func Command(command string) Result {
+	class := Valid
 	var reasons []string
-	addReason := func(reason string) {
+	addReason := func(next Class, reason string) {
 		for _, existing := range reasons {
 			if existing == reason {
+				if next == Invalid {
+					class = Invalid
+				} else if class == Valid {
+					class = next
+				}
 				return
 			}
 		}
 		reasons = append(reasons, reason)
+		if next == Invalid {
+			class = Invalid
+		} else if class == Valid {
+			class = next
+		}
 	}
 
 	if strings.TrimSpace(command) == "" {
-		addReason("Command is empty.")
+		addReason(Invalid, "Command is empty.")
 	}
 	if strings.ContainsAny(command, "\r\n") {
-		addReason("Command must be a single record without CR or LF.")
+		addReason(Invalid, "Command must be a single record without CR or LF.")
 	}
 	if strings.ContainsRune(command, '\x00') {
-		addReason("Command contains a NUL byte.")
+		addReason(Invalid, "Command contains a NUL byte.")
 	}
 	if hasOtherControl(command) {
-		addReason("Command contains a terminal control character.")
+		addReason(Invalid, "Command contains a terminal control character.")
 	}
 	if textsafe.ContainsProhibitedCommandFormat(command) {
-		addReason("Command contains a prohibited invisible or bidirectional format character.")
+		addReason(Invalid, "Command contains a prohibited invisible or bidirectional format character.")
 	}
 	if len(command) > MaxCommandBytes {
-		addReason("Command exceeds the maximum size of 8192 bytes.")
+		addReason(Invalid, "Command exceeds the maximum size of 8192 bytes.")
 	}
 
 	// Parsing is deliberately bounded. Oversize input is already ineligible and
@@ -56,23 +83,28 @@ func Command(command string) Result {
 	if len(command) <= MaxCommandBytes {
 		parsed := shellsyntax.Parse(command)
 		if hasUnresolvedPlaceholder(parsed) {
-			addReason("Command contains an unresolved placeholder.")
+			addReason(Invalid, "Command contains an unresolved placeholder.")
 		}
 		for _, issue := range parsed.Issues {
+			if issue.Kind == shellsyntax.Unsupported {
+				addReason(Warning, "Command uses shell syntax outside clai's review subset: "+issue.Message+".")
+				continue
+			}
+
 			switch issue.Code {
 			case "empty-command":
-				addReason("Command is empty.")
+				addReason(Invalid, "Command is empty.")
 			case "trailing-operator":
-				addReason("Command ends with an incomplete shell operator.")
+				addReason(Invalid, "Command ends with an incomplete shell operator.")
 			case "unclosed-single-quote", "unclosed-double-quote":
-				addReason("Command contains an unclosed quote.")
+				addReason(Invalid, "Command contains an unclosed quote.")
 			default:
-				addReason("Command has invalid or unsupported shell syntax: " + issue.Message + ".")
+				addReason(Invalid, "Command has invalid shell syntax: "+issue.Message+".")
 			}
 		}
 	}
 
-	return Result{Valid: len(reasons) == 0, Reasons: reasons}
+	return Result{Class: class, Valid: class != Invalid, Reasons: reasons}
 }
 
 func hasOtherControl(command string) bool {

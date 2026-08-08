@@ -21,6 +21,8 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // scenario is one scripted provider behavior.
@@ -144,11 +146,41 @@ func main() {
 func pick(intent string) scenario {
 	lowered := strings.ToLower(intent)
 	for _, s := range scenarios {
-		if strings.Contains(lowered, s.name) {
+		if containsWord(lowered, s.name) {
 			return s
 		}
 	}
 	return scenarios[0]
+}
+
+func containsWord(text, word string) bool {
+	for offset := 0; offset <= len(text)-len(word); {
+		index := strings.Index(text[offset:], word)
+		if index < 0 {
+			return false
+		}
+		start := offset + index
+		end := start + len(word)
+		leftBoundary := start == 0
+		if !leftBoundary {
+			left, _ := utf8.DecodeLastRuneInString(text[:start])
+			leftBoundary = !scenarioWordRune(left)
+		}
+		rightBoundary := end == len(text)
+		if !rightBoundary {
+			right, _ := utf8.DecodeRuneInString(text[end:])
+			rightBoundary = !scenarioWordRune(right)
+		}
+		if leftBoundary && rightBoundary {
+			return true
+		}
+		offset = start + 1
+	}
+	return false
+}
+
+func scenarioWordRune(r rune) bool {
+	return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)
 }
 
 // intentFromBody extracts the intent out of whatever request shape arrived. The

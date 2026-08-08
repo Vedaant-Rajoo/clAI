@@ -51,7 +51,7 @@ func TestDevEndpointEndToEnd(t *testing.T) {
 		},
 		{
 			// The review screen refuses acceptance outright, so Enter does
-			// nothing and the trailing Escape cancels (exit 3). The command is
+			// nothing and the trailing Ctrl-C cancels (exit 3). The command is
 			// structurally valid and safety-allowed, so applicability alone is
 			// what keeps it from ever reaching the transport boundary; the
 			// widget-boundary rerun is covered by the cmd/clai unit tests.
@@ -224,10 +224,11 @@ func runWidget(t *testing.T, binary, endpoint, resultFile, intent string) (int, 
 		t.Fatal("TUI never left the loading state")
 	}
 	_, _ = ptmx.WriteString("\r")
-	// Escape guarantees the process exits even from a non-accepting state. Give
-	// an accepted command a moment to reach the transport first.
+	// Ctrl-C guarantees the process exits even from a non-accepting state; Escape
+	// now returns review to input. Give an accepted command a moment to reach the
+	// transport first.
 	time.Sleep(300 * time.Millisecond)
-	_, _ = ptmx.WriteString("\x1b")
+	_, _ = ptmx.WriteString("\x03")
 
 	err = cmd.Wait()
 	exitCode := 0

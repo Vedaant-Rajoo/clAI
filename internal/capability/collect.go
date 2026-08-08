@@ -225,10 +225,13 @@ func parseVersionMatch(matches []string) (Version, bool) {
 	return ParseVersion(matches[1])
 }
 
-// Cached collects at most one inventory and returns immutable copies of that
-// same invocation-scoped snapshot to all callers.
+// Cached commits the first inventory collected without cancellation and returns
+// immutable copies of that invocation-scoped snapshot to later callers. A
+// cancelled collection remains retryable so it cannot permanently erase tool
+// versions from the process-wide snapshot.
 type Cached struct {
-	once      sync.Once
+	mu        sync.Mutex
+	ready     bool
 	collect   func(context.Context) Inventory
 	inventory Inventory
 }
@@ -245,10 +248,18 @@ func newCached(collect func(context.Context) Inventory) *Cached {
 }
 
 func (cached *Cached) Inventory(ctx context.Context) Inventory {
-	cached.once.Do(func() {
-		cached.inventory = cloneInventory(cached.collect(ctx))
-	})
-	return cloneInventory(cached.inventory)
+	cached.mu.Lock()
+	defer cached.mu.Unlock()
+	if cached.ready {
+		return cloneInventory(cached.inventory)
+	}
+
+	inventory := cloneInventory(cached.collect(ctx))
+	if ctx.Err() == nil {
+		cached.inventory = inventory
+		cached.ready = true
+	}
+	return cloneInventory(inventory)
 }
 
 func cloneInventory(inventory Inventory) Inventory {

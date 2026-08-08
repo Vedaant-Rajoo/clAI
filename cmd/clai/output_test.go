@@ -15,6 +15,7 @@ import (
 // a future refactor silently swapping the streams.
 
 func TestOutputStreamRouting(t *testing.T) {
+	t.Setenv("CLAI_PROVIDER", "")
 	original := loadConfig
 	loadConfig = func() (config.Config, error) { return config.Config{}, nil }
 	t.Cleanup(func() { loadConfig = original })
@@ -41,6 +42,13 @@ func TestOutputStreamRouting(t *testing.T) {
 			wantStderr: "",
 		},
 		{
+			name:       "--version with copy flag to stdout",
+			args:       []string{"--version", "--copy"},
+			wantCode:   exitOK,
+			wantStdout: version,
+			wantStderr: "",
+		},
+		{
 			name:       "top-level help to stdout",
 			args:       []string{"help"},
 			wantCode:   exitOK,
@@ -55,6 +63,13 @@ func TestOutputStreamRouting(t *testing.T) {
 			wantStderr: "",
 		},
 		{
+			name:       "auth flag help to stdout",
+			args:       []string{"auth", "login", "--help"},
+			wantCode:   exitOK,
+			wantStdout: "clai auth login",
+			wantStderr: "",
+		},
+		{
 			name:       "init script to stdout",
 			args:       []string{"init", "fish"},
 			wantCode:   exitOK,
@@ -66,7 +81,7 @@ func TestOutputStreamRouting(t *testing.T) {
 			args:       []string{"bogus"},
 			wantCode:   exitUsage,
 			wantStdout: "",
-			wantStderr: "unknown command",
+			wantStderr: "type your intent inside the interactive screen",
 		},
 		{
 			name:       "unknown flag to stderr",
@@ -74,6 +89,13 @@ func TestOutputStreamRouting(t *testing.T) {
 			wantCode:   exitUsage,
 			wantStdout: "",
 			wantStderr: "clai:",
+		},
+		{
+			name:       "unknown provider is a usage error",
+			args:       []string{"--provider", "ruls"},
+			wantCode:   exitUsage,
+			wantStdout: "",
+			wantStderr: "Run 'clai help' for usage.",
 		},
 		{
 			name:       "auth without verb to stderr",
@@ -142,6 +164,7 @@ func TestRequestedOutputConfigMigrationContract(t *testing.T) {
 		wantCalls int
 	}{
 		{name: "version flag", args: []string{"--version"}, want: version, wantCalls: versionCalls},
+		{name: "version flag with copy", args: []string{"--version", "--copy"}, want: version, wantCalls: versionCalls},
 		{name: "version command", args: []string{"version"}, want: version, wantCalls: versionCalls},
 		{name: "help command", args: []string{"help"}, want: "Usage:"},
 		{name: "help flag", args: []string{"--help"}, want: "Usage:"},
@@ -159,6 +182,33 @@ func TestRequestedOutputConfigMigrationContract(t *testing.T) {
 			}
 			assertStream(t, "stdout", out.String(), tc.want)
 			assertStream(t, "stderr", errBuf.String(), "")
+		})
+	}
+}
+
+func TestVersionUsageErrorsTakePrecedence(t *testing.T) {
+	t.Setenv("CLAI_PROVIDER", "")
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "unknown provider", args: []string{"--version", "--provider", "ruls"}, want: "unknown provider"},
+		{name: "invalid context combination", args: []string{"--version", "--context-policy", "remote-explicit"}, want: "requires at least one --share-context"},
+		{name: "invalid development endpoint provider", args: []string{"--version", "--dev-endpoint", "http://127.0.0.1:8747"}, want: "not valid for provider"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, out, errBuf := captureCLI()
+			if code := c.run(tc.args); code != exitUsage {
+				t.Fatalf("run(%v) = %d, want %d", tc.args, code, exitUsage)
+			}
+			if out.Len() != 0 {
+				t.Fatalf("stdout = %q, want empty", out.String())
+			}
+			if !strings.Contains(errBuf.String(), tc.want) || !strings.Contains(errBuf.String(), "Run 'clai help' for usage.") {
+				t.Fatalf("stderr = %q, want usage error containing %q", errBuf.String(), tc.want)
+			}
 		})
 	}
 }

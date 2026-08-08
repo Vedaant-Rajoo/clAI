@@ -86,3 +86,29 @@ insert the accepted command at the current cursor without executing it. Existing
 prompt text on both sides of the cursor remains editable. Bash 3.2 reaches the
 same cursor splice through a Readline kill-ring macro because its Readline does
 not expose a writable cursor to shell functions.
+
+### Trust and retention
+
+The result file is private and short-lived: under normal operation it is
+created, written once, read, and removed within the same invocation.
+
+Your OS user account is the trust boundary. Mode `0600` under a normally
+configured sticky `/tmp` reduces ordinary access by *other* OS users, but any
+process already running under your UID is trusted by design. `clai widget`
+does not verify the file's owner UID or its link count, so it does not prevent
+a same-UID process from mutating the file or replacing the pathname during the
+handoff window. clai's checks — that the path is absolute, regular, private,
+and empty before the TUI starts, and still the same file before the write —
+narrow that window and catch ordinary mistakes. They are not a security
+guarantee against a same-UID adversary, and clai's threat model does not posit
+one.
+
+Cleanup is best-effort. A crash, a `SIGKILL`, a closed terminal, or a killed
+shell can leave a mode-`0600` file holding one command in `/tmp`, subject only
+to your system's ordinary `/tmp` cleanup. clai promises neither guaranteed
+deletion nor secure erasure.
+
+The shell inserts the accepted command into your editable prompt and never
+submits it: clai does not send Enter and does not execute anything.
+
+The complete trust and retention contract is in [privacy.md](../privacy.md).

@@ -64,6 +64,16 @@ executable paths, raw probe output, and parse errors are never transmitted.
 remotes, host or user identity, shell history, prior command output, environment
 dumps, repository contents, or credentials.
 
+Pasted intent is treated exactly like typed intent; pasting creates no privacy
+exemption and transmits nothing by itself. If you selected a remote provider,
+submitting the intent may transmit it under that invocation's privacy rules
+and that provider's privacy policy. The context policies above govern the
+surrounding machine and repository context, not the intent itself — the intent
+is what you are submitting, so it reaches whichever provider you selected.
+What the provider then retains is governed by that provider, not by clai.
+
+The full data-flow and retention contract is in [privacy.md](privacy.md).
+
 ## Testing against a local endpoint
 
 `--dev-endpoint <url>` redirects a remote provider's requests to a loopback
